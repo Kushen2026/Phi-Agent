@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="zh">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<meta name="color-scheme" content="dark" />
+	<title>Φ · Phi Web 界面</title>
+	<!-- The server stamps data-theme on <html> (and rewrites the color-scheme
+	     meta below) with the saved theme, so the first paint is already themed.
+	     The inline script at the top of <body> only needs to cover the remaining
+	     case where the injection is missing (e.g. opening ui/index.html straight
+	     from disk): it falls back to localStorage. -->
+	<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2315151e'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='bold' fill='%238abeb7' text-anchor='middle'%3E%CE%A6%3C/text%3E%3C/svg%3E" />
+	<!-- 不在此处引入远程 webfont：跨域 stylesheet 会阻塞渲染，若 fonts.googleapis.com 不可达（离线/防火墙），首帧会一直等到请求超时——每次启动都会白屏数秒。styles.css 已把 "JetBrains Mono" 放在首位并回退到 ui-monospace / Cascadia Mono / Consolas，本机安装了该字体仍会生效，启动时不再发起任何外部请求。 -->
+	<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+	<script>
+	// theme injected by server via window.__PHI_THEME__ (and already stamped on
+	// <html> by the server); falls back to localStorage. Applied to both <html>
+	// and <body> so the :root-level variables are correct before first paint.
+	try {
+	  const s = JSON.parse(localStorage.getItem("phi.appearance") || "{}");
+	  const theme = window.__PHI_THEME__ || (s && s.theme);
+	  if (theme) {
+	    document.documentElement.dataset.theme = theme;
+	    document.body.dataset.theme = theme;
+	  }
+	} catch {}
+	</script>
+	<div id="app" class="app">
+		<!-- ═══════════════ Top bar ═══════════════ -->
+		<header class="topbar" id="topbar">
+			<div class="brand">
+				<svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+					<rect width="32" height="32" rx="7" fill="var(--bg-elevated)" stroke="var(--border-strong)" />
+					<text x="16" y="23" font-family="JetBrains Mono, monospace" font-size="20" font-weight="600" fill="var(--accent)" text-anchor="middle">Φ</text>
+				</svg>
+				<div class="brand-meta">
+					<button class="session-name" id="session-name" type="button" title="重命名会话">phi 会话</button>
+					<button class="cwd" id="cwd" type="button" title="切换工作目录">
+						<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+						<span id="cwd-text">—</span>
+					</button>
+				</div>
+				<span class="phase-badge" id="phase-badge" data-phase="idle" role="status" aria-live="polite">
+					<svg class="phase-spinner" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+					<span id="phase-badge-text">空闲</span>
+				</span>
+			</div>
+
+			<div class="topbar-actions">
+				<button class="btn btn-icon" id="config-btn" type="button" aria-label="打开设置" title="设置 (Ctrl+Shift+C)">
+					<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01c.27.62.88 1.02 1.56 1.02H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+					<span class="badge-dot" id="config-dot" hidden></span>
+				</button>
+
+				<button class="btn btn-icon" id="skills-btn" type="button" aria-label="切换技能面板" title="技能 (Ctrl+B)">
+					<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6.5a4.5 4.5 0 0 1 4.5 4.5c0 1.4-.6 2.6-1.6 3.4l.6 4.6h-7l.6-4.6a4.5 4.5 0 0 1-1.6-3.4A4.5 4.5 0 0 1 12 6.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 2.5v2.2M4.7 5.8l1.6 1.6M19.3 5.8l-1.6 1.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+					<span class="badge-dot" id="skills-dot" hidden></span>
+				</button>
+
+				<button class="btn btn-ghost" id="new-session-btn" type="button" title="开始新会话">
+					<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+					<span>新会话</span>
+				</button>
+
+			</div>
+		</header>
+
+		<!-- 提示横幅：固定悬浮在窗口正上方，不参与文档流，发送栏因此恒定不动 -->
+		<div class="banner" id="banner" role="status" aria-live="polite" hidden></div>
+
+		<!-- ═══════════════ Main ═══════════════ -->
+		<main class="main">
+			<!-- ═══════════════ Settings (full-window) ═══════════════ -->
+			<div class="settings-overlay" id="settings-overlay" hidden>
+				<div class="settings-window" role="dialog" aria-modal="true" aria-label="设置">
+					<aside class="settings-nav">
+						<div class="settings-brand">
+							<svg class="settings-brand-logo" viewBox="0 0 32 32" aria-hidden="true">
+								<rect width="32" height="32" rx="7" fill="var(--bg-panel)" stroke="var(--border-strong)" />
+								<text x="16" y="23" font-family="JetBrains Mono, monospace" font-size="20" font-weight="600" fill="var(--accent)" text-anchor="middle">Φ</text>
+							</svg>
+							<div class="settings-brand-meta">
+								<div class="settings-brand-title">设置</div>
+								<div class="settings-brand-sub">Phi Web 界面</div>
+							</div>
+						</div>
+
+						<nav class="settings-menu" id="settings-menu">
+							<button class="settings-menu-item" data-page="api" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01c.27.62.88 1.02 1.56 1.02H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+								<span>API 配置</span>
+							</button>
+							<button class="settings-menu-item" data-page="tools" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14.7 6.3a4.2 4.2 0 0 0-5.6 5.2L3 17.6V21h3.4l.9-.9v-1.8h1.8l1.3-1.3a4.2 4.2 0 0 0 5.2-5.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="m14.5 9.5 5.6-5.6M17 3.5 20.5 7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+								<span>工具设置</span>
+							</button>
+							<button class="settings-menu-item" data-page="hotkeys" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7.5 14h9" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+								<span>快捷键</span>
+							</button>
+							<button class="settings-menu-item" data-page="appearance" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3a9 9 0 0 0 0 18c1.2 0 2-.9 2-2 0-.6-.2-1-.5-1.4-.3-.4-.5-.8-.5-1.3 0-1.1.9-2 2-2h2.4c1.9 0 3.6-1.5 3.6-3.4C21 6.5 17 3 12 3z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="7.5" cy="10.5" r="1.2" fill="currentColor"/><circle cx="12" cy="7.5" r="1.2" fill="currentColor"/><circle cx="16.5" cy="10.5" r="1.2" fill="currentColor"/></svg>
+								<span>界面风格</span>
+							</button>
+							<button class="settings-menu-item" data-page="general" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 11v5M12 8v.5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+								<span>通用</span>
+							</button>
+							<button class="settings-menu-item" data-page="about" type="button">
+								<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h14v17H6a2 2 0 0 0-2 2V5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M4 20a2 2 0 0 1 2-2h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+								<span>关于</span>
+							</button>
+						</nav>
+
+						<div class="settings-nav-foot">
+							<button class="btn" id="settings-cancel" type="button">取消</button>
+							<button class="btn btn-primary" id="settings-close" type="button">保存</button>
+						</div>
+					</aside>
+
+					<div class="settings-content" id="settings-content">
+
+						<!-- ── Page: API 配置 ────────────────────────────── -->
+						<!-- 不要在这里硬编码 active：分区的显隐和菜单的高亮都由 SettingsPanel.showPage()
+						     唯一决定（见 app.js）。两边都给初始值就会出现「正文可见、左侧没有一项
+						     选中」这种不同步。整个 overlay 默认 hidden，首次打开一定会先走
+						     showPage()，所以去掉后不会白屏。 -->
+						<section class="settings-page" data-page="api">
+							<header class="settings-page-head">
+								<h2>API 配置</h2>
+								<p>管理模型接入：请求地址、密钥、模型与子代理网关。点击列表中的配置即可激活。</p>
+							</header>
+
+							<div class="settings-page-body">
+								<div class="config-profiles" id="config-profiles"></div>
+								<button class="btn btn-ghost config-new-btn" id="config-new-btn" type="button">
+									<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+									<span>新建配置</span>
+								</button>
+
+								<form class="config-form" id="config-form" hidden>
+									<div class="config-form-title" id="config-form-title">新建配置</div>
+									<label class="config-field">
+										<span>配置名称</span>
+										<input id="config-name" type="text" maxlength="40" autocomplete="off" spellcheck="false" placeholder="例如：DeepSeek" />
+									</label>
+									<label class="config-field">
+										<span>请求地址</span>
+										<input id="config-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="https://api.deepseek.com/anthropic" required />
+									</label>
+									<label class="config-field">
+										<span>API 格式</span>
+										<select id="config-apiformat">
+											<option value="anthropic-messages">Anthropic 兼容 (anthropic-messages)</option>
+											<option value="openai-completions">OpenAI 兼容 (openai-completions)</option>
+										</select>
+									</label>
+									<div class="config-field">
+										<span>模型</span>
+										<div class="config-model-row">
+											<select id="config-model"></select>
+											<button class="btn" id="config-fetch-models" type="button" title="从请求地址获取可用模型列表">
+												<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 4v7h-7M4 20v-7h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+												<span>获取模型列表</span>
+											</button>
+										</div>
+
+										<small class="config-key-hint">点击「获取模型列表」从请求地址拉取可用模型。</small>
+									</div>
+									<label class="config-field">
+										<span>API 密钥</span>
+										<div class="config-key-wrap">
+											<input id="config-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 API 密钥" />
+											<button class="btn btn-icon btn-xs key-toggle" id="config-key-toggle" type="button" tabindex="-1" title="显示密钥" aria-label="显示密钥">
+												<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+											</button>
+										</div>
+										<small class="config-key-hint" id="config-key-hint" hidden>留空则保持原密钥</small>
+									</label>
+									<label class="config-field">
+										<span>系统提示词语言</span>
+										<select id="config-lang">
+											<option value="zh">中文</option>
+											<option value="en">English</option>
+										</select>
+									</label>
+
+									<div class="config-section-title">子代理模型（可选）</div>
+									<label class="config-field">
+										<span>子代理请求地址</span>
+										<input id="subagent-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="https://apihub.agnes-ai.com/v1" />
+									</label>
+									<label class="config-field">
+										<span>子代理 API 格式</span>
+										<select id="subagent-apiformat">
+											<option value="anthropic-messages">Anthropic 兼容 (anthropic-messages)</option>
+											<option value="openai-completions">OpenAI 兼容 (openai-completions)</option>
+										</select>
+									</label>
+									<div class="config-field">
+										<span>子代理模型</span>
+										<div class="config-model-row">
+											<select id="subagent-model"></select>
+											<button class="btn" id="subagent-fetch-models" type="button" title="从子代理请求地址获取可用模型列表">
+												<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 4v7h-7M4 20v-7h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+												<span>获取模型列表</span>
+											</button>
+										</div>
+
+									</div>
+									<label class="config-field">
+										<span>子代理 API 密钥</span>
+										<div class="config-key-wrap">
+											<input id="subagent-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 API 密钥" />
+											<button class="btn btn-icon btn-xs key-toggle" id="subagent-key-toggle" type="button" tabindex="-1" title="显示密钥" aria-label="显示密钥">
+												<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+											</button>
+										</div>
+										<small class="config-key-hint" id="subagent-key-hint" hidden>留空则保持原密钥</small>
+									</label>
+									<small class="config-subagent-hint">子代理使用独立的模型配置，随本配置一并保存。保存/激活后注册 gw-subagent 网关，重启会话生效。</small>
+
+									<div class="config-form-actions">
+										<button class="btn btn-primary" id="config-save" type="submit">保存</button>
+										<button class="btn" id="config-cancel" type="button">取消</button>
+									</div>
+								</form>
+
+							</div>
+						</section>
+
+						<!-- ── Page: 工具设置 ────────────────────────────── -->
+						<section class="settings-page" data-page="tools">
+							<header class="settings-page-head">
+								<h2>工具设置</h2>
+								<p>控制智能体可用的工具：启用/关闭、访问权限（工作目录内/无限制）、输出截断限制与子代理策略。</p>
+
+							</header>
+
+							<div class="settings-page-body">
+								<div class="settings-group">
+									<div class="settings-group-title">启用与权限</div>
+									<p class="settings-group-desc">「工作目录内」限制该工具只能访问当前工作目录中的路径；「无限制」允许访问任意路径。关闭的工具不会出现在模型可用的工具列表中。</p>
+									<div class="tool-rows" id="tools-perm-list"></div>
+								</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">截断限制</div>
+									<p class="settings-group-desc">工具输出过长时自动截断（保留头尾，中间省略）。滑块控制最大字符数。</p>
+									<div class="tool-rows" id="tools-trunc-list"></div>
+									<p class="settings-group-desc">更改将在点击「保存」时统一生效，之前可随时取消。</p>
+								</div>
+
+
+								<div class="settings-group">
+									<div class="settings-group-title">子代理设置</div>
+										<p class="settings-group-desc">子代理在独立上下文中运行，工具集继承自主会话。此处控制子代理可用的工具。</p>
+										<div class="tool-rows" id="subagent-tools-list"></div>
+									</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">图像生成模型（qwen image 2.1）</div>
+									<p class="settings-group-desc">image_generate 使用的模型（safetensors，精度自适应）。选项是 <code>models/</code> 目录里的所有文件（含后缀），实时读取；留空表示不指定。LoRA 最多 2 个，按顺序应用（后一个叠加在前一个之上）。采样步数默认 25 步，采样器/调度器默认 euler + simple（与 released workflow 一致）。</p>
+									<div class="tool-rows" id="media-image-models-list"></div>
+									<div class="tool-rows" id="media-image-steps-list"></div>
+									<div class="tool-rows" id="media-image-sampler-list"></div>
+									<div class="tool-rows" id="media-image-scheduler-list"></div>
+									<div class="tool-rows" id="media-image-loras-list"></div>
+								</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">视频生成模型（minimax h3）</div>
+									<p class="settings-group-desc">video_generate 使用的模型（safetensors，精度自适应）。选项同样来自 <code>models/</code> 目录。图像与视频的模型、LoRA 各自独立，互不混用。LoRA 最多 2 个，按顺序应用。采样步数默认 20 步，采样器/调度器默认 res_multistep + beta（H3 联合音视频）。</p>
+									<div class="tool-rows" id="media-video-models-list"></div>
+									<div class="tool-rows" id="media-video-steps-list"></div>
+									<div class="tool-rows" id="media-video-sampler-list"></div>
+									<div class="tool-rows" id="media-video-scheduler-list"></div>
+									<div class="tool-rows" id="media-video-loras-list"></div>
+								</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">音乐生成模型（ace-step 1.5）</div>
+									<p class="settings-group-desc">music_generate 使用的模型：DiT、文本/语义码 tower、音频 VAE，各自选择。选项同样是 <code>models/</code> 目录里的所有文件。采样步数默认 50 步（与 ACE-Step-音乐生成.json 一致），采样器/调度器默认 euler + simple。</p>
+									<div class="tool-rows" id="media-music-models-list"></div>
+									<div class="tool-rows" id="media-music-steps-list"></div>
+									<div class="tool-rows" id="media-music-sampler-list"></div>
+									<div class="tool-rows" id="media-music-scheduler-list"></div>
+								</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">语音合成模型（breeze tts 2）</div>
+									<p class="settings-group-desc">tts_speak 使用的模型：主检查点、音频编解码器、分词器 tokenizer.json，以及主模型与编解码器的 config.json（留空则读取权重旁边的 config.json）。只做「音色描述 → 语音」，不含声音克隆。</p>
+									<div class="tool-rows" id="media-tts-models-list"></div>
+								</div>
+
+								<p class="settings-group-desc" id="media-download-status"></p>
+							</div>
+						</section>
+
+						<!-- ── Page: 快捷键 ─────────────────────────────── -->
+						<section class="settings-page" data-page="hotkeys">
+							<header class="settings-page-head">
+								<h2>快捷键</h2>
+								<p>点击绑定框后按下新的组合键即可重新绑定；按 Esc 取消。更改在点击「保存」后同步到服务器，重启不丢失。</p>
+
+							</header>
+							<div class="settings-page-body">
+								<div class="tool-rows" id="hotkeys-list"></div>
+								<p class="settings-group-desc">「发送消息」「输入换行」决定输入框的按键行为；修改后点击「保存」生效，之前可随时取消。</p>
+							</div>
+						</section>
+
+						<!-- ── Page: 界面风格 ───────────────────────────── -->
+						<section class="settings-page" data-page="appearance">
+							<header class="settings-page-head">
+								<h2>界面风格</h2>
+								<p>选择主题与界面细节。所有更改点击「保存」后统一生效。</p>
+								<div class="settings-page-actions"></div>
+							</header>
+							<div class="settings-page-body">
+								<div class="settings-group">
+									<div class="settings-group-title">主题</div>
+									<div class="theme-grid" id="theme-list"></div>
+								</div>
+
+								<div class="settings-group">
+									<div class="settings-group-title">细节</div>
+									<div class="select-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">圆角</span>
+										</div>
+										<select id="appearance-radius" class="inline-select">
+											<option value="none">直角</option>
+											<option value="sm">小圆角</option>
+											<option value="md">默认</option>
+											<option value="lg">大圆角</option>
+										</select>
+									</div>
+									<div class="select-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">消息密度</span>
+										</div>
+										<select id="appearance-density" class="inline-select">
+											<option value="compact">紧凑</option>
+											<option value="cozy">舒适</option>
+										</select>
+									</div>
+									<div class="switch-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">折叠思考</span>
+											<span class="switch-row-desc">思考过程默认收起（重启后仍收起）</span>
+										</div>
+										<label class="switch"><input type="checkbox" id="appearance-collapse-thinking" /><span class="switch-track"></span></label>
+									</div>
+									<div class="switch-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">折叠工具调用</span>
+											<span class="switch-row-desc">工具调用默认收起（重启后仍收起）</span>
+										</div>
+										<label class="switch"><input type="checkbox" id="appearance-collapse-tools" /><span class="switch-track"></span></label>
+									</div>
+									<div class="switch-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">减弱动画</span>
+											<span class="switch-row-desc">禁用过渡与脉冲动画</span>
+										</div>
+										<label class="switch"><input type="checkbox" id="appearance-motion" /><span class="switch-track"></span></label>
+									</div>
+
+								</div>
+							</div>
+						</section>
+
+						<!-- ── Page: 通用 ───────────────────────────────── -->
+						<section class="settings-page" data-page="general">
+							<header class="settings-page-head">
+								<h2>通用</h2>
+								<p>输入行为与本机数据。</p>
+								<div class="settings-page-actions"></div>
+							</header>
+							<div class="settings-page-body">
+								<div class="settings-group">
+									<div class="settings-group-title">输入</div>
+									<div class="switch-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">状态栏显示 token 统计</span>
+										</div>
+										<label class="switch"><input type="checkbox" id="general-status-tokens" /><span class="switch-track"></span></label>
+									</div>
+								</div>
+
+								<div class="settings-group settings-danger">
+									<div class="settings-group-title">重置</div>
+									<div class="path-row">
+										<div class="switch-row-main">
+											<span class="switch-row-name">重置全局设置</span>
+											<span class="switch-row-desc">主题、快捷键、通用选项与工具设置全部恢复默认（不影响 API 配置）</span>
+										</div>
+										<button class="btn" id="general-reset-all" type="button">重置</button>
+									</div>
+								</div>
+							</div>
+						</section>
+
+						<!-- ── Page: 关于 ───────────────────────────────── -->
+						<section class="settings-page" data-page="about">
+							<header class="settings-page-head">
+								<h2>关于</h2>
+								<p>Phi Web 界面 — 本地运行的智能体会话窗口。</p>
+								<div class="settings-page-actions"></div>
+							</header>
+							<div class="settings-page-body">
+								<div class="settings-group">
+									<div class="about-logo">Φ</div>
+									<div class="about-rows" id="about-rows"></div>
+								</div>
+							</div>
+						</section>
+
+					</div>
+				</div>
+			</div>
+
+			<section class="transcript" id="transcript" aria-label="对话记录" aria-live="polite">
+				<div class="empty-state" id="empty-state">
+					<div class="empty-logo">Φ</div>
+					<p class="empty-title">phi agent</p>
+					<p class="empty-sub" id="empty-sub">正在连接…</p>
+				</div>
+			</section>
+
+			<!-- ═══════════════ Right panel ═══════════════ -->
+			<aside class="side-panel" id="side-panel" aria-label="技能和命令">
+				<div class="panel-tabs" role="tablist">
+					<button class="panel-tab active" id="tab-skills" type="button" role="tab" aria-selected="true">技能</button>
+					<button class="panel-tab" id="tab-sessions" type="button" role="tab" aria-selected="false">会话</button>
+					<button class="panel-tab panel-tab-close" id="panel-close" type="button" aria-label="关闭面板">✕</button>
+				</div>
+
+				<div class="panel-body">
+					<div class="panel-pane active" id="pane-skills">
+						<div class="pane-toolbar">
+							<span class="pane-title">已加载技能</span>
+							<div class="pane-actions">
+								<button class="btn btn-icon btn-xs" id="skills-reload" type="button" title="重新加载技能、扩展和提示词">⟳</button>
+							</div>
+						</div>
+						<div class="pane-list" id="skills-list"></div>
+					</div>
+
+					<div class="panel-pane" id="pane-sessions">
+						<div class="pane-toolbar">
+							<span class="pane-title">会话</span>
+							<button class="btn btn-icon btn-xs" id="sessions-refresh" type="button" title="刷新">⟳</button>
+						</div>
+						<div class="pane-list" id="sessions-list"></div>
+					</div>
+				</div>
+			</aside>
+		</main>
+
+		<!-- ═══════════════ Status + input ═══════════════ -->
+		<footer class="composer">
+			<div class="attachments" id="attachments" hidden></div>
+			<div class="status-line" id="status-line">
+				<span id="status-model">—</span>
+				<span class="status-sep">·</span>
+				<span id="status-thinking">—</span>
+				<span class="status-sep">·</span>
+				<span id="status-phase">空闲</span>
+				<span class="status-sep" id="status-tokens-sep" hidden>·</span>
+				<span id="status-tokens" hidden></span>
+			</div>
+			<div class="composer-box">
+				<div class="composer-suggest" id="composer-suggest" hidden></div>
+				<div class="command-menu" id="command-menu" hidden></div>
+				<div class="composer-row">
+					<button class="btn btn-slash" id="slash-btn" type="button" aria-label="快捷输入命令" title="快捷输入命令 (/)">
+						<span class="slash-glyph">/</span>
+					</button>
+					<textarea id="input" rows="1" placeholder="给 phi 发消息…  (/ 查看命令)" aria-label="给 phi 发消息"></textarea>
+					<button class="btn btn-icon btn-attach" id="attach-btn" type="button" aria-label="添加附件" title="添加文件或图片">
+						<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m21.4 11.1-9.3 9.3a5.5 5.5 0 0 1-7.8-7.8l9.3-9.3a3.8 3.8 0 1 1 5.4 5.4l-9.3 9.3a2 2 0 1 1-2.8-2.8l8.6-8.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+					</button>
+					<input type="file" id="file-input" hidden multiple />
+					<button class="btn btn-send" id="send-btn" type="button" aria-label="发送消息" disabled>
+						<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 18-8-8 18-2.5-7.5L3 11z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+					</button>
+					<button class="btn btn-abort" id="abort-btn" type="button" aria-label="停止生成" hidden>
+						<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>
+					</button>
+					<div class="dropdown" id="config-dropdown">
+						<button class="btn btn-dropdown" id="config-btn-footer" type="button" aria-haspopup="listbox" aria-label="选择 API 配置">
+							<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06-.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06-.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06-.06a1.7 1.7 0 0 0-.34 1.87v.01c.27.62.88 1.02 1.56 1.02H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1.03z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+							<span class="btn-label" id="config-label">API</span>
+							<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+						</button>
+						<div class="dropdown-menu config-menu" id="config-menu" role="listbox" hidden></div>
+					</div>
+					<div class="dropdown" id="thinking-dropdown">
+						<button class="btn btn-dropdown" id="thinking-btn" type="button" aria-haspopup="listbox" aria-label="Set thinking level">
+							<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5L13 2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+							<span class="btn-label" id="thinking-label">Thinking</span>
+							<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+						</button>
+						<div class="dropdown-menu thinking-menu" id="thinking-menu" role="listbox" hidden></div>
+					</div>
+				</div>
+			</div>
+		</footer>
+	</div><!-- /#app -->
+
+	<!-- ═══════════════ Command palette overlay ═══════════════ -->
+	<div class="overlay" id="palette-overlay" hidden>
+		<div class="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+			<div class="palette-input-row">
+				<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.3-4.3M17 10.5a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+				<input id="palette-input" type="text" placeholder="输入命令…" aria-label="搜索命令" autocomplete="off" spellcheck="false" />
+				<span class="kbd-hint">esc</span>
+			</div>
+			<div class="palette-results" id="palette-results" role="listbox"></div>
+			<div class="palette-footer">
+				<span>↵ 运行</span><span class="kbd-hint">↑↓ 浏览</span><span class="kbd-hint">esc 关闭</span>
+			</div>
+		</div>
+	</div>
+
+		<!-- ═══════════════ Working directory dialog ═══════════════ -->
+		<div class="overlay" id="cwd-dialog" hidden>
+			<div class="dialog" role="dialog" aria-modal="true" aria-label="切换工作目录">
+				<div class="dialog-title">切换工作目录</div>
+				<div class="dialog-hint">
+					当前目录：<span class="dialog-cwd" id="cwd-current">—</span>
+				</div>
+				<input id="cwd-input" type="text" autocomplete="off" spellcheck="false" placeholder="输入目录路径，例如 C:Projectsdemo" aria-label="新工作目录路径" />
+				<div class="dialog-error" id="cwd-error" hidden></div>
+				<div class="dialog-actions">
+					<button class="btn" id="cwd-browse" type="button">浏览…</button>
+					<span class="dialog-spacer"></span>
+					<button class="btn" id="cwd-cancel" type="button">取消</button>
+					<button class="btn btn-primary" id="cwd-confirm" type="button">切换</button>
+				</div>
+			</div>
+		</div>
+
+	<!-- ═══════════════ Image lightbox (in-app preview) ═══════════════ -->
+	<div class="overlay image-lightbox" id="image-lightbox" hidden>
+		<div class="image-lightbox-frame" role="dialog" aria-modal="true" aria-label="图片预览">
+			<img id="lightbox-image" alt="" />
+			<div class="image-lightbox-bar">
+				<span class="image-lightbox-name" id="lightbox-caption"></span>
+				<span class="kbd-hint">esc</span>
+				<button class="btn btn-xs image-lightbox-close" id="lightbox-close" type="button" aria-label="关闭预览">✕</button>
+			</div>
+		</div>
+	</div>
+
+	<script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+// phi desktop app icon resource
+// windres does NOT predefine IDI_ICON1 — without this define the group icon
+// gets registered under the *string* name "IDI_ICON1" and LoadIcon(1) finds
+// nothing, so Windows shows the default icon. Numeric id 1 matches the
+// MAKEINTRESOURCEW(1) lookup in shell.cpp.
+#define IDI_ICON1 1
+IDI_ICON1 ICON "../assets/phi.ico"
