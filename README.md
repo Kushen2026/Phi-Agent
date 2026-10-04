@@ -1,220 +1,216 @@
 # Phi
 
-一个本地优先的 Windows 桌面 AI Agent：既能作为编码助手读写你的代码库、跑命令、搜网页，也能在本机 GPU 上直接生成图片、视频、音乐和语音。
+A local-first Windows desktop AI Agent: it can act as a coding assistant to read and write your codebase, run commands, search the web, and also generate images, video, music, and speech directly on your local GPU.
 
-整个程序是一个自包含的 Windows 可执行文件——不依赖 Python，不依赖任何第三方运行时。GPU 计算走 CUDA 驱动接口 + NVRTC（运行时按需编译内核），图像编解码走 WIC，音视频封装走 Media Foundation，界面用 WebView2 承载。
+The entire program is a self-contained Windows executable—no Python dependency, no third-party runtime. GPU computation uses the CUDA driver interface + NVRTC (kernels compiled on demand at runtime), image codec uses WIC, audio/video muxing uses Media Foundation, and the UI is hosted by WebView2.
 
-\---
+---
 
-## 一、它是什么
+## 1. What It Is
 
-Phi 由两个互相咬合的部分组成：
+Phi consists of two interlocking parts:
 
-**1. Agent 运行时**
+**1. Agent Runtime**
 
-一个「思考 → 批量调用工具 → 观察结果 → 再思考」的循环。每一步模型流式输出推理和工具调用，运行时把这一步的所有工具作为一个批次执行完，把结果追加进对话历史，然后进入下一步；当某一步不再产生工具调用时，那一步的文本就是最终答复。
+A loop of "think → batch tool calls → observe results → think again." At each step, the model streams reasoning and tool calls, the runtime executes all tools of that step as one batch, appends the results to the conversation history, then proceeds to the next step; when a step produces no tool calls, the text of that step is the final answer.
 
-**2. 本地媒体推理引擎**
+**2. Local Media Inference Engine**
 
-一个跑在同一张显卡上的多模态生成引擎，对外只暴露四个工具：生成图、生成视频、生成音乐、合成语音。内部是一条条「节点图」——加载模型、编码提示词、采样、解码、写文件各是一个节点，用类型化的接口连起来。换一条链就是重新连线，而不是重写引擎。
+A multimodal generation engine running on the same GPU, exposing only four tools externally: generate image, generate video, generate music, synthesize speech. Internally it is a set of "node graphs"—loading a model, encoding a prompt, sampling, decoding, writing a file are each a node, connected by typed interfaces. Changing a chain means re-wiring, not rewriting the engine.
 
-\---
+---
 
-## 二、功能
+## 2. Features
 
-### 编码助手
+### Coding Assistant
 
-* **读写代码**：带行号的精确读取（支持大文件分段）、精确字符串替换编辑、原子写入、目录列举、正则/字面量内容搜索（优先使用内置 ripgrep，缺失时退回原生遍历）。
-* **执行命令**：通过真实 shell 运行（Git Bash 优先，退回 cmd.exe），支持管道、重定向、\&\&；输出实时回流到界面，并做自动压缩——去掉 ANSI 转义、折叠构建/git 噪声、超长输出保留首尾。
-* **网络访问**：Bing 搜索（返回编号结果列表：标题 / URL / 摘要）与网页抓取（HTML 转纯文本）。
-* **多模态读取**：图片直接作为图片内容交给模型；视频可以指定帧号，抽帧后同样作为图片交给模型。两者都会先缩放到模型能分辨的尺寸并重新编码，避免一张截图在每一轮请求里反复膨胀。
+- **Read/write code**: precise line-numbered reading (supports large file segmentation), exact string replacement editing, atomic writes, directory listing, regex/literal content search (prefers built-in ripgrep, falls back to native traversal if missing).
+- **Execute commands**: runs through a real shell (Git Bash preferred, falls back to cmd.exe), supports pipes, redirection, &&; output streams back to the UI in real time and is automatically compressed—strips ANSI escapes, collapses build/git noise, keeps head and tail of overly long output.
+- **Network access**: Bing search (returns numbered result list: title / URL / snippet) and web page fetching (HTML to plain text).
+- **Multimodal reading**: images are passed directly to the model as image content; videos can specify frame numbers, extracted frames are likewise passed as images. Both are first scaled to a size the model can resolve and re-encoded, avoiding a screenshot repeatedly inflating in every request round.
 
-### 后台子代理
+### Background Subagent
 
-主模型可以把一整块任务交给一个全新的子代理：它有独立的上下文窗口、独立的工具集（不能在子代理里再开子代理）、和主会话相同的系统提示词，在自己的线程上并行推进。子代理的运行日志以会话自身的消息格式实时回流到对应的工具卡片，任务完成后它的最后一段文本作为报告交回主模型。
+The main model can hand off an entire block of tasks to a brand-new subagent: it has an independent context window, an independent toolset (cannot spawn further subagents within a subagent), and the same system prompt as the main session, advancing in parallel on its own thread. The subagent's run log streams back in real time in the session's own message format to the corresponding tool card; upon task completion, its last text segment is returned to the main model as a report.
 
-### 本地媒体生成
+### Local Media Generation
 
-四个工具，全部在本机 GPU 上跑，不需要联网、不需要外部服务：
+Four tools, all running on the local GPU, no network, no external services required:
 
-* **图片生成**：文生图，或带参考图的编辑/重绘。输出尺寸由 width/height 单独决定，参考图只按自己的分辨率缩放，不参与决定画布。
-* **视频生成**：联合音视频生成，支持参考图 / 参考视频（含其声音轨）/ 独立参考音频，输出 H.264 + AAC 的 mp4。
-* **音乐生成**：给风格标签、歌词和音乐元信息（BPM、时长、拍号、调式、语言），生成 48 kHz 音乐。
-* **语音合成**：用「要说的文本 + 描述音色的自然语言指令」合成语音。只做音色设计，不做声音克隆——引擎不接受参考音频。
+- **Image generation**: text-to-image, or editing/inpainting with a reference image. Output dimensions are determined solely by width/height; the reference image is scaled only by its own resolution and does not participate in determining the canvas.
+- **Video generation**: joint audio-video generation, supports reference image / reference video (including its audio track) / independent reference audio, outputs H.264 + AAC mp4.
+- **Music generation**: given style tags, lyrics, and music metadata (BPM, duration, time signature, key, language), generates 48 kHz music.
+- **Speech synthesis**: synthesizes speech using "text to speak + natural language instruction describing the voice timbre." Only voice design, no voice cloning—the engine does not accept reference audio.
 
-### 会话与界面
+### Sessions and UI
 
-* 会话以追加式 JSONL 落盘，可随时重新打开、续聊、删除（删除进回收站）。
-* 模型、思考强度、工作目录、系统提示词语言都可以在运行中切换。
-* 上下文超长时可手动压缩：把历史总结成一段摘要，之后所有请求只带摘要和其后的内容。
+- Sessions are persisted as append-only JSONL, can be reopened, continued, deleted (deletion goes to recycle bin) at any time.
+- Model, thinking intensity, working directory, system prompt language can all be switched at runtime.
+- When context is too long, manual compression is possible: summarize history into a summary, after which all requests carry only the summary and subsequent content.
 
-\---
+---
 
-## 三、架构
+## 3. Architecture
 
-### 分层
+### Layers
 
-&#x20;   桌面外壳（原生窗口 + WebView2）
-      占位启动画面 / 主题 / 文件夹选择器
-              │  回环 HTTP + WebSocket
+    Desktop Shell (Native Window + WebView2)
+      Placeholder splash / theme / folder picker
+              │  Loopback HTTP + WebSocket
               ▼
-    协议层：会话门面 + 快照投影
-      把 Agent 的状态投影成 UI 能直接渲染的 JSON
+    Protocol Layer: Session Facade + Snapshot Projection
+      Projects Agent state into JSON the UI can render directly
               │
               ▼
-    Agent 循环
-      THINK：流式模型响应
-      EXECUTE：批量执行本步全部工具
+    Agent Loop
+      THINK: Streaming model response
+      EXECUTE: Batch execute all tools for this step
         │                    │
         ▼                    ▼
-    工具层                媒体引擎
-    bash/read/...         节点图 + CUDA
-    web/子代理            显存账本
+    Tool Layer            Media Engine
+    bash/read/...         Node Graph + CUDA
+    web/subagent          VRAM Ledger
 
+### Agent Loop
 
-### Agent 循环
+- **A turn** = one user input driven to completion.
+- **A step** = one streaming model call + one batch of all tools in this step.
+- The loop alternates steps until a step produces no tool calls.
 
-* **一次 turn** = 一条用户输入被驱动到完成。
-* **一次 step** = 一次流式模型调用 + 这一步全部工具的一个批次。
-* 循环交替 step，直到某一步没有工具调用为止。
+A few deliberate design points:
 
-几个刻意的设计点：
+- Once tool calls appear in the response, prose streamed in the same step is discarded—only the text of the final summary step is retained. "Silently do tool steps, only speak at the end" is enforced by the loop itself, not requested via prompt.
+- Tool results are written to history **at the moment each call is answered**, not after the whole batch finishes. This way, even if a tool's UI callback throws an exception, or the user aborts midway, history will not contain a dangling state of "tool_call without corresponding tool_result"—such history would cause every subsequent request to be rejected by the upstream.
+- On stream interruption (network error, HTTP 4xx), already recorded tool calls are still filled in one by one with placeholder results, for the same reason as above.
+- For parallel tool calls within the same turn, their IDs are forcibly deduplicated and completed: some gateways stuff multiple parallel calls with the same placeholder ID, and both wire formats pair by ID; duplicate IDs would make the whole batch appear "under-answered."
+- Users can "insert" new input during streaming (steering), which will be merged into context before the next step begins.
 
-* 工具调用一旦出现在响应里，同一步流出的散文就会被丢弃——只有最终摘要那一步的文本会被保留。「静默地做工具步骤，只在最后说话」是循环本身强制的，不是靠提示词请求的。
-* 工具结果在**每个调用被回答的那一刻**就写进历史，而不是整批跑完再写。这样即使某个工具的 UI 回调抛异常、或用户中途中止，历史里也不会留下「有 tool\_call 但没有对应 tool\_result」的悬空状态——那样的历史会让之后每一次请求都被上游拒绝。
-* 流式中断（网络错误、HTTP 4xx）时，已经记录下来的工具调用仍然会被逐一补上占位结果，理由同上。
-* 同一 turn 内的并行工具调用，其 ID 会被强制去重并补全：有些网关会把多个并行调用塞同一个占位 ID，而两种线上格式都按 ID 配对，重复 ID 会让整批看起来「答少了」。
-* 用户可以在流式过程中「插入」新输入（steering），它会在下一个 step 开始前并入上下文。
+### Tool Layer
 
-### 工具层
+Tools fall into four categories:
 
-工具分四类：
+| Category | Description |
+| --- | --- |
+| File/Command | Read/write, search, execute commands within the session working directory |
+| Network | Search, fetch web pages |
+| Subagent | Hand off task to background subagent |
+| Media | Image / video / music / speech generation |
 
-|类别|说明|
-|-|-|
-|文件/命令|在会话工作目录内读写、搜索、执行命令|
-|网络|搜索、抓取网页|
-|子代理|把任务交给后台子代理|
-|媒体|图 / 视频 / 音乐 / 语音生成|
+Unified conventions:
 
-统一约定：
+- **Every built-in prompt string has both Chinese and English versions**, determined by the session language (settings.json's systemPromptLanguage), including parameter descriptions, error messages, and explanatory lines inserted in compressed output. No place hardcodes language.
+- **Parameter schemas are generated on the fly at each request according to the current language**, so switching language does not require a restart.
+- **Permission gate**: each tool can be set to "within working directory only"; out-of-bounds access is rejected with a readable reason.
+- **Output cap**: each tool can be individually configured with a maximum output character count.
 
-* **每个内置提示串都有中英两版**，由会话语言（settings.json 的 systemPromptLanguage）决定用哪一份，包括参数说明、错误消息和压缩输出里插入的说明行。没有任何一处硬编码语言。
-* **参数 schema 在每次请求时按当前语言现场生成**，所以切语言不需要重启。
-* **权限门**：可以为每个工具设置「仅限工作目录内」，越界访问会被拒绝并给出可读原因。
-* **输出上限**：每个工具可以单独配置最大输出字符数。
+### Media Engine
 
-### 媒体引擎
+The engine is process-level resident, lazily loaded on demand: the image backbone's weights plus text encoder add up to over a dozen GB; reopening each call would dominate the entire runtime, while opening at startup would make sessions that never use media pay an unnecessary cost.
 
-引擎进程级常驻、按需懒加载：图片主干的权重和文本编码器加起来是十几 GB，每次调用重新打开会支配整个运行时间，而在启动时打开又会让从未使用过媒体的会话白白付出代价。
+The full flow of a chain is **one node graph**:
 
-一条链的完整流程是**一张节点图**：
+    Model Load ─┬─ Prompt Encode ─┐
+    Text Load ──┘                 ├─ Sampler ─ Decode ─ Write File
+    Empty Latent ─────────────────┘
+    Scheduler (sigma grid) ───────┘
 
-&#x20;   模型加载 ─┬─ 提示词编码 ─┐
-    文本加载 ─┘             ├─ 采样器 ─ 解码 ─ 写文件
-    空潜变量 ───────────────┘
-    调度器（sigma 网格）────┘
+- Nodes have **typed interfaces** (MODEL / CLIP / VAE / LORA / CONDITIONING / LATENT / SIGMAS / IMAGE / AUDIO / VIDEO / scalar). The executor traverses in dependency order; type mismatches are rejected before the node runs.
+- Errors are **values, not exceptions**: if a node cannot run, it states which type it is, which id, and why.
+- **A node corresponds to a stage, not a model**. Samplers dispatch by backbone type, VAE decoding dispatches by the VAE's role, latent nodes dispatch by their own geometry parameters. Adding a new backbone is adding a branch, not adding a set of nodes.
+- **Precision is determined by the file**. The loader reads the precision declared by the checkpoint itself (int8, 4/6 bit packed, fp8, fp16, bf16, fp32), loads at that precision and computes at that precision, without doing a "convert everything to one type" conversion. The same model exported at different precisions is just a different filename in settings.
+- **Weights are stream-loaded in blocks**. When the GPU cannot hold the entire checkpoint, only the current block is pushed into VRAM, then the next block after computation.
+- **Runtime LoRA correction**. For streamed weights that need to be re-read repeatedly, LoRA is not folded into the weights (that would mean re-decoding, adapting, and re-quantizing the entire checkpoint every step), but acts as a post-term of GEMM: y = x·W + (x·A)·B. Geometry is completely equivalent, at the cost of a few percentage points of the base GEMM, and precision is actually higher (delta kept in fp32).
 
+### VRAM Management
 
-* 节点有**类型化接口**（MODEL / CLIP / VAE / LORA / CONDITIONING / LATENT / SIGMAS / IMAGE / AUDIO / VIDEO / 标量）。执行器按依赖顺序遍历，类型不匹配在节点运行前就被拒绝。
-* 错误是**值而不是异常**：某个节点跑不了，它会说明自己是哪个类型、哪个 id、为什么。
-* **一个节点对应一个阶段，而不是一个模型**。采样器按主干类型分派，VAE 解码按 VAE 的角色分派，潜变量节点按自己的几何参数分派。接一个新主干是加一个分支，不是加一组节点。
-* **精度由文件决定**。加载器读取检查点自己声明的精度（int8、4/6 bit 打包、fp8、fp16、bf16、fp32），按该精度装载并按该精度计算，不做「一律转成某一种」的转换。同一个模型用不同精度导出，换的是设置里的一个文件名。
-* **权重按块流式加载**。显卡装不下整个检查点时，只把当前块推进显存，算完换下一块。
-* **运行期 LoRA 修正**。对需要反复重读的流式权重，LoRA 不折进权重（那意味着每一步都要重新解码、适配、再量化整个检查点），而是作为 GEMM 的一个后置项：y = x·W + (x·A)·B。几何完全等价，代价是基础 GEMM 的几个百分点，精度反而更高（delta 保持 fp32）。
+This is the most constrained resource in the entire engine, so there is a unified ledger:
 
-### 显存管理
+- Every byte of resident VRAM is accounted for before allocation; exceeding the limit is **rejected** with a readable error, never silently shrunk.
+- The limit is not a constant, but **derived per card**: how much the driver is willing to give this process, and how much the card itself has, take the smaller; re-read before each tool call, so "a card that was occupied by another program a minute ago" is now planned truthfully.
+- **Resident window**: as many blocks as VRAM can hold stay resident, the rest are stream-loaded. Dynamically increased or decreased at runtime based on measured usage, with the goal of keeping the sampling phase in the 90–100% range of the driver limit—below this range is paying disk bandwidth for nothing, above it is on the edge of losing the device.
+- **Return at stage boundaries**: at the end of each generation stage, VRAM not belonging to the next stage is returned to the device. Otherwise, a finished video task would think "3 GB is still occupied on the card" and cause the immediately following image task to keep several fewer blocks resident.
 
-这是整个引擎里最吃紧的资源，所以有一条统一的账本：
+### Media Tools Also Use Node Graphs
 
-* 每一字节常驻显存都在分配前记账，超限就**拒绝**并抛出可读错误，绝不静默缩水。
-* 上限不是常量，而是**按卡推导**：驱动愿意给这个进程多少、卡本身有多少，取较小者；每次工具调用前重新读取一次，所以「一分钟前还被别的程序占着的卡」现在会被如实规划。
-* **常驻窗口**：显存放得下多少块就常驻多少块，剩下的流式加载。运行期按实测占用动态增减，目标是让采样阶段落在驱动上限的 90–100% 区间——低于这个区间是白付磁盘带宽，高于则是丢设备的边缘。
-* **阶段边界归还**：每个生成阶段结束时把不属于下一阶段的显存还给设备。不然一个跑完的视频任务会以为「卡上还占着 3 GB」而让紧接着的图片任务少常驻好几块权重。
+The four media tools are the same executor, the same loader, the same nodes, just different wiring. So "adding a new chain" is writing a new wiring, not writing a new set of modules—the speech synthesis chain reuses the existing loader and audio-writing node without changing a single line.
 
-### 媒体工具也走节点图
+---
 
-四个媒体工具是同一套执行器、同一套加载器、同一套节点，只是连线不同。所以「新加一条链」是写一份新连线，而不是写一组新模块——语音合成链复用了已有的加载器和写音频节点，一行都没改。
+## 4. Usage
 
-\---
+### Running
 
-## 四、使用方式
+Double-click the executable directly. The window appears on screen within milliseconds (with a theme-colored startup placeholder), the browser kernel and protocol service start in parallel in the background, and hand off to the UI once the first frame is ready.
 
-### 运行
+Command-line arguments:
 
-直接双击可执行文件。窗口在几毫秒内出现在屏幕上（带一个主题色的启动占位画面），浏览器内核和协议服务在后台并行启动，首帧就绪后交接给界面。
+    phi.exe --media-bench [options]       Media engine acceptance benchmark
+    phi.exe --media-tool <name> [...]     Run a media tool directly (bypassing the model)
 
-命令行参数：
+Subcommands of --media-tool:
 
-&#x20;   phi.exe --media-bench \[选项]       媒体引擎验收基准
-    phi.exe --media-tool <名称> \[...]  直接跑一个媒体工具（不经过模型）
+- name schema —— Print the tool's parameter schema (English).
+- name graph —— Only build and validate the node graph; no GPU, checkpoint, or model needed.
+- name resolve —— Print which file each role resolves to under current settings, and whether it exists.
+- name '{...}' —— Actually run once with a JSON parameter, returning the result text.
 
+### First-Time Configuration
 
-\--media-tool 的几个子命令：
+**1. Configure Model**
 
-* 名称 schema —— 打印该工具的参数 schema（英文）。
-* 名称 graph —— 只构建并校验节点图，不需要显卡、检查点或模型。
-* 名称 resolve —— 打印当前设置下每个角色解析到哪个文件、是否存在。
-* 名称 '{...}' —— 用一段 JSON 参数真正跑一次，返回结果文本。
+In the UI, fill in at least one API configuration: provider, base URL, API key, model. Two wire formats are supported:
 
-### 首次配置
+- anthropic-messages
+- openai-completions (including various compatible gateways)
 
-**1. 配置模型**
+Configurations are saved, multiple can be kept and the "currently effective" one switched. The model list and thinking intensity options are filtered by the model's own declared capabilities.
 
-在界面里填入至少一个 API 配置：provider、base URL、API key、模型。支持两种线上格式：
+**2. Choose Working Directory**
 
-* anthropic-messages
-* openai-completions（含各种兼容网关）
+All relative paths of the Agent are resolved relative to the session working directory. The working directory can be switched in the UI (which rebuilds the session), or written into settings before startup.
 
-配置会存下来，可以保存多份并切换「当前生效」的那一份。模型列表和思考强度选项都会按模型自身声明的能力过滤。
+**3. Place Media Models (Optional)**
 
-**2. 选择工作目录**
+If you want to use media generation capabilities, put the corresponding checkpoints into the models directory. The directory layout is free:
 
-Agent 的所有相对路径都相对于会话工作目录解析。工作目录可以在界面里切换（会重建会话），也可以在启动前写入设置。
+- Subdirectories per chain (one directory per chain, weights, vocab, config each in place), or
+- All flat under the models directory.
 
-**3. 放置媒体模型（可选）**
+The settings panel lists **all** files under the models directory, and for each role (backbone weights, text encoder, VAE, vocab, merge table, tokenizer config, LoRA, etc.) you select one. That is: **the filesystem is the model directory**—put a file in, it appears; no need to maintain a built-in list, and no need to remember some format marker; the loader detects precision itself.
 
-如果要使用媒体生成能力，把对应的检查点放进 models 目录。目录布局是自由的：
+Each chain's selections are independent of each other. LoRA is also a separate list per chain, stacked in order; image LoRA will never leak into the video chain.
 
-* 按链分子目录（每个链一个目录，权重、词表、配置各就各位），或
-* 全平铺在 models 目录下。
+**4. Tool Settings**
 
-设置面板会列出 models 目录下**所有**文件，每个角色（主干的权重、文本编码器、VAE、词表、合并表、分词配置、LoRA 等）各选一个。也就是说：**文件系统就是模型目录**——把文件放进去，它就会出现；不需要维护一份内置清单，也不需要记住某种格式标记，加载器自己检测精度。
+- Tool enable/disable switches.
+- Per-tool permissions (e.g., restricted to within working directory).
+- Per-tool output cap.
+- Tool subset available to subagents.
+- Sampling steps, sampler, scheduler name for each chain (leave empty to use that chain's own release defaults).
 
-每条链的选择互相独立。LoRA 也是每条链各自一份列表，按顺序叠加，图像 LoRA 绝不会串进视频链。
+### Daily Use
 
-**4. 工具设置**
+- **Conversation**: just ask. The Agent will decide on its own whether to read files, run commands, search, or generate media.
+- **Abort midway**: stop at any time. The running stream is disconnected, the running command is killed (along with its entire process tree), the running subagent receives a cancellation signal.
+- **Insert supplement**: continue typing during generation; new content is merged into context before the next thinking step.
+- **Compress context**: when the conversation gets long, manually trigger compression; after compression all requests carry only the summary and subsequent content.
+- **Session management**: new, switch, rename, delete (to recycle bin). Empty sessions with no messages written are automatically discarded and do not accumulate on disk.
+- **Switch model / switch thinking intensity**: takes effect immediately and is written to the current session.
 
-* 工具启用/禁用开关。
-* 每个工具的权限（例如限定在工作目录内）。
-* 每个工具的输出上限。
-* 子代理可用的工具子集。
-* 各链的采样步数、采样器、调度器名称（留空即使用该链自身的发布默认值）。
+### Environment Requirements
 
-### 日常使用
+- Windows 10 or higher.
+- WebView2 Runtime (preinstalled on most Windows 10/11).
+- Using media generation capabilities requires an NVIDIA GPU supporting CUDA; when CUDA is missing, media tools give a readable error, and other features are unaffected.
+- For media generation, it is recommended to place checkpoints in a models directory on a non-system drive—the engine stream-loads weights in blocks, and disk throughput directly affects the time per step.
 
-* **对话**：直接提问。Agent 会自己决定读文件、跑命令、搜索还是生成媒体。
-* **中途中止**：随时停止。正在跑的流会断开，正在跑的命令会被杀掉（连同它的整个进程树），正在跑的子代理会收到取消信号。
-* **插入补充**：在生成过程中继续输入，新内容会在下一个思考步骤前并入上下文。
-* **压缩上下文**：当对话变长，手动触发压缩；压缩后所有请求只带摘要和其后的内容。
-* **会话管理**：新建、切换、重命名、删除（进回收站）。未写入任何消息的空会话会被自动丢弃，不会在磁盘上堆积。
-* **切模型 / 切思考强度**：即时生效，并写入当前会话。
+---
 
-### 环境要求
+## 5. Design Trade-offs
 
-* Windows 10 或更高版本。
-* WebView2 运行时（多数 Windows 10/11 已预装）。
-* 使用媒体生成能力需要一块支持 CUDA 的 NVIDIA 显卡；缺少 CUDA 时媒体工具会给出可读错误，其余功能不受影响。
-* 使用媒体生成能力建议把检查点放在非系统盘的 models 目录下——引擎会按块流式加载权重，磁盘吞吐直接影响每一步的耗时。
-
-\---
-
-## 五、几点设计取舍
-
-* **不引入 Python，不引入第三方运行时**。整套推理引擎只用系统自带的编解码组件和 CUDA 驱动接口。CUDA 内核在运行时用 NVRTC 编译（因此不需要 MSVC 工具链），编译结果缓存到磁盘。
-* **磁盘是慢的，所以权重不该被反复读**。检查点通常比内存大，所以引擎把「能常驻的常驻、剩下的流式加载」，并在宿主内存里缓存那些反复用到的权重块。
-* **显存是稀缺的，所以账本必须诚实**。所有规划都从「这台机器现在真的能拿出多少」出发，而不是从一个写死的常量。这是同一份二进制能在 6 GB 笔记本显卡和 48 GB 工作站上都跑起来的原因。
-* **精度是文件说了算的**。引擎不替用户决定「应该用哪种精度」——同一个模型有多少种导出，就能读多少种；换精度是换一个文件名。
-* **语言是会话的属性**。所有内置字符串（工具描述、参数说明、错误消息、压缩输出里的说明行）都跟着会话语言走，不在代码里写死。
-* **失败要可读**。几乎每一条错误消息都带上具体的数字：需要多少、还差多少、上限是多少、是哪个文件、是哪个节点。拒绝一次运行是可以接受的，静默地给出错误结果是不可接受的。
-
+- **No Python, no third-party runtime**. The entire inference engine uses only the system's built-in codec components and the CUDA driver interface. CUDA kernels are compiled at runtime with NVRTC (so no MSVC toolchain is needed), and compilation results are cached to disk.
+- **Disk is slow, so weights should not be read repeatedly**. Checkpoints are usually larger than memory, so the engine keeps "what can be resident resident, the rest stream-loaded," and caches repeatedly used weight blocks in host memory.
+- **VRAM is scarce, so the ledger must be honest**. All planning starts from "how much this machine can really give right now," not from a hardcoded constant. This is why the same binary can run on a 6 GB laptop GPU and a 48 GB workstation.
+- **Precision is decided by the file**. The engine does not decide for the user "which precision should be used"—as many exports as a model has, that many it can read; changing precision is changing a filename.
+- **Language is a session property**. All built-in strings (tool descriptions, parameter descriptions, error messages, explanatory lines in compressed output) follow the session language and are not hardcoded in code.
+- **Failures must be readable**. Almost every error message carries specific numbers: how much is needed, how much is missing, what the limit is, which file, which node. Rejecting a run is acceptable; silently producing wrong results is not.
