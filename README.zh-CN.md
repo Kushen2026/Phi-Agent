@@ -1,220 +1,557 @@
 # Phi
 
-一个本地优先的 Windows 桌面 AI Agent：既能作为编码助手读写你的代码库、跑命令、搜网页，也能在本机 GPU 上直接生成图片、视频、音乐和语音。
+一个面向 Windows 的本地优先桌面智能体，用 C++20 编写，自带一套用于图像、
+视频、音乐与语音生成的 CUDA 推理引擎。
 
-整个程序是一个自包含的 Windows 可执行文件——不依赖 Python，不依赖任何第三方运行时。GPU 计算走 CUDA 驱动接口 + NVRTC（运行时按需编译内核），图像编解码走 WIC，音视频封装走 Media Foundation，界面用 WebView2 承载。
+Phi 把两样东西装进同一个二进制：
 
-\---
+* **智能体外壳** —— 一个 WebView2 聊天窗口，承载 LLM 会话：可以读写编辑
+  文件、执行 shell 命令、搜索网页，并把任务派给后台子代理；
+* **媒体引擎** —— 一个节点图运行时，在本机 NVIDIA GPU 上跑 Qwen-Image-2.1
+  （图像）、MiniMax H3（视频 + 音频）、ACE-Step 1.5（音乐）和 Breeze-TTS-2
+  （语音合成），并以四个工具的形式交给智能体。
 
-## 一、它是什么
+一切都在本机运行。除了你自己配置的 LLM API，不涉及任何云服务。
 
-Phi 由两个互相咬合的部分组成：
+---
 
-**1. Agent 运行时**
+## 目录
 
-一个「思考 → 批量调用工具 → 观察结果 → 再思考」的循环。每一步模型流式输出推理和工具调用，运行时把这一步的所有工具作为一个批次执行完，把结果追加进对话历史，然后进入下一步；当某一步不再产生工具调用时，那一步的文本就是最终答复。
+1. [它能做什么](#它能做什么)
+2. [环境要求](#环境要求)
+3. [仓库结构](#仓库结构)
+4. [构建](#构建)
+5. [运行](#运行)
+6. [配置](#配置)
+7. [智能体](#智能体)
+8. [媒体引擎](#媒体引擎)
+9. [命令行接口](#命令行接口)
+10. [数据目录](#数据目录)
+11. [诊断](#诊断)
+12. [测试](#测试)
+13. [安全须知](#安全须知)
+14. [许可](#许可)
 
-**2. 本地媒体推理引擎**
+---
 
-一个跑在同一张显卡上的多模态生成引擎，对外只暴露四个工具：生成图、生成视频、生成音乐、合成语音。内部是一条条「节点图」——加载模型、编码提示词、采样、解码、写文件各是一个节点，用类型化的接口连起来。换一条链就是重新连线，而不是重写引擎。
+## 它能做什么
 
-\---
+### 智能体
 
-## 二、功能
+一个聊天窗口，包含会话记录、工作目录选择、模型 / 思考级别控制、技能面板、
+斜杠命令面板和设置对话框。智能体循环是一个严格的两阶段步骤：
 
-### 编码助手
+```
+THINK    流式接收一次模型响应（思考 + 工具调用 + 可选的正文）
+EXECUTE  把这次响应里的所有工具调用当作一批执行，把结果追加回历史
+          … 重复，直到模型给出不带工具调用的最终回答
+```
 
-* **读写代码**：带行号的精确读取（支持大文件分段）、精确字符串替换编辑、原子写入、目录列举、正则/字面量内容搜索（优先使用内置 ripgrep，缺失时退回原生遍历）。
-* **执行命令**：通过真实 shell 运行（Git Bash 优先，退回 cmd.exe），支持管道、重定向、\&\&；输出实时回流到界面，并做自动压缩——去掉 ANSI 转义、折叠构建/git 噪声、超长输出保留首尾。
-* **网络访问**：Bing 搜索（返回编号结果列表：标题 / URL / 摘要）与网页抓取（HTML 转纯文本）。
-* **多模态读取**：图片直接作为图片内容交给模型；视频可以指定帧号，抽帧后同样作为图片交给模型。两者都会先缩放到模型能分辨的尺寸并重新编码，避免一张截图在每一轮请求里反复膨胀。
+内置工具（每一个都能在「设置 → 工具设置」里开关、设定权限范围与输出上限）：
 
-### 后台子代理
+| 工具 | 作用 |
+| --- | --- |
+| `bash` | 执行 shell 命令，实时输出，并对结果做压缩整理 |
+| `read` | 读取文本文件；图片 / 视频则作为多模态内容交给模型 |
+| `write` | 创建新文件或覆盖现有文件 |
+| `edit` | 按精确文本替换，一组替换批量执行 |
+| `ls` | 列出目录，可选递归 |
+| `grep` | 正则搜索文件内容（优先用自带的 `rg.exe`，不可用时走原生实现） |
+| `web_search` | Bing 搜索，解析成带摘要和网址的结果列表 |
+| `fetch` | 抓取某个网址并把页面转成文本 |
+| `agent` | 启动后台子代理，完成后自动回传摘要 |
+| `image_generate` | Qwen-Image-2.1 → PNG（文生图或参考图编辑） |
+| `video_generate` | MiniMax H3 ref2va → MP4（自带生成音频） |
+| `music_generate` | ACE-Step 1.5 → WAV（风格标签 + 歌词） |
+| `tts_speak` | Breeze-TTS-2 → WAV（凭音色描述做音色设计） |
 
-主模型可以把一整块任务交给一个全新的子代理：它有独立的上下文窗口、独立的工具集（不能在子代理里再开子代理）、和主会话相同的系统提示词，在自己的线程上并行推进。子代理的运行日志以会话自身的消息格式实时回流到对应的工具卡片，任务完成后它的最后一段文本作为报告交回主模型。
-
-### 本地媒体生成
-
-四个工具，全部在本机 GPU 上跑，不需要联网、不需要外部服务：
-
-* **图片生成**：文生图，或带参考图的编辑/重绘。输出尺寸由 width/height 单独决定，参考图只按自己的分辨率缩放，不参与决定画布。
-* **视频生成**：联合音视频生成，支持参考图 / 参考视频（含其声音轨）/ 独立参考音频，输出 H.264 + AAC 的 mp4。
-* **音乐生成**：给风格标签、歌词和音乐元信息（BPM、时长、拍号、调式、语言），生成 48 kHz 音乐。
-* **语音合成**：用「要说的文本 + 描述音色的自然语言指令」合成语音。只做音色设计，不做声音克隆——引擎不接受参考音频。
-
-### 会话与界面
-
-* 会话以追加式 JSONL 落盘，可随时重新打开、续聊、删除（删除进回收站）。
-* 模型、思考强度、工作目录、系统提示词语言都可以在运行中切换。
-* 上下文超长时可手动压缩：把历史总结成一段摘要，之后所有请求只带摘要和其后的内容。
-
-\---
-
-## 三、架构
-
-### 分层
-
-&#x20;   桌面外壳（原生窗口 + WebView2）
-      占位启动画面 / 主题 / 文件夹选择器
-              │  回环 HTTP + WebSocket
-              ▼
-    协议层：会话门面 + 快照投影
-      把 Agent 的状态投影成 UI 能直接渲染的 JSON
-              │
-              ▼
-    Agent 循环
-      THINK：流式模型响应
-      EXECUTE：批量执行本步全部工具
-        │                    │
-        ▼                    ▼
-    工具层                媒体引擎
-    bash/read/...         节点图 + CUDA
-    web/子代理            显存账本
-
-
-### Agent 循环
-
-* **一次 turn** = 一条用户输入被驱动到完成。
-* **一次 step** = 一次流式模型调用 + 这一步全部工具的一个批次。
-* 循环交替 step，直到某一步没有工具调用为止。
-
-几个刻意的设计点：
-
-* 工具调用一旦出现在响应里，同一步流出的散文就会被丢弃——只有最终摘要那一步的文本会被保留。「静默地做工具步骤，只在最后说话」是循环本身强制的，不是靠提示词请求的。
-* 工具结果在**每个调用被回答的那一刻**就写进历史，而不是整批跑完再写。这样即使某个工具的 UI 回调抛异常、或用户中途中止，历史里也不会留下「有 tool\_call 但没有对应 tool\_result」的悬空状态——那样的历史会让之后每一次请求都被上游拒绝。
-* 流式中断（网络错误、HTTP 4xx）时，已经记录下来的工具调用仍然会被逐一补上占位结果，理由同上。
-* 同一 turn 内的并行工具调用，其 ID 会被强制去重并补全：有些网关会把多个并行调用塞同一个占位 ID，而两种线上格式都按 ID 配对，重复 ID 会让整批看起来「答少了」。
-* 用户可以在流式过程中「插入」新输入（steering），它会在下一个 step 开始前并入上下文。
-
-### 工具层
-
-工具分四类：
-
-|类别|说明|
-|-|-|
-|文件/命令|在会话工作目录内读写、搜索、执行命令|
-|网络|搜索、抓取网页|
-|子代理|把任务交给后台子代理|
-|媒体|图 / 视频 / 音乐 / 语音生成|
-
-统一约定：
-
-* **每个内置提示串都有中英两版**，由会话语言（settings.json 的 systemPromptLanguage）决定用哪一份，包括参数说明、错误消息和压缩输出里插入的说明行。没有任何一处硬编码语言。
-* **参数 schema 在每次请求时按当前语言现场生成**，所以切语言不需要重启。
-* **权限门**：可以为每个工具设置「仅限工作目录内」，越界访问会被拒绝并给出可读原因。
-* **输出上限**：每个工具可以单独配置最大输出字符数。
+提示词与工具 schema 都有中文和英文两份，由
+`settings.json → systemPromptLanguage` 选择。
 
 ### 媒体引擎
 
-引擎进程级常驻、按需懒加载：图片主干的权重和文本编码器加起来是十几 GB，每次调用重新打开会支配整个运行时间，而在启动时打开又会让从未使用过媒体的会话白白付出代价。
+四条现成的链，全部由同一套节点注册表搭成：
 
-一条链的完整流程是**一张节点图**：
+```
+图像:  ModelLoader ─┐
+       ClipLoader ──┼─ QwenImageEditEncode ─┬─ CONDITIONING ─┐
+       VaeLoader ───┘                      └─ LATENT ───────┼─ Sampler ─ VaeDecode ─ SaveImage
+       EmptyLatent ────────────────────────────────────────┘      ↑
+       Scheduler(model) ──────────────────────────────────────────┘
 
-&#x20;   模型加载 ─┬─ 提示词编码 ─┐
-    文本加载 ─┘             ├─ 采样器 ─ 解码 ─ 写文件
-    空潜变量 ───────────────┘
-    调度器（sigma 网格）────┘
+视频:  ModelLoader ─┬─ H3SigmaShift ──────────┐
+       ClipLoader ──┴─ H3Ref2VaEncode ─┐     ├─ Sampler ─┬─ VaeDecode(video) ─┐
+       VaeLoader(video) ───────────────┘               └─ VaeDecode(audio) ───┼─ SaveVideo
+       VaeLoader(audio) ──────────────────────────────┘                      │
+       EmptyLatentVideo ──────────────────────────────┘                      │
+       Scheduler(model) ──────────────────────────────┘                      │
 
+音乐:  ModelLoader(ace_step15) ─┬─ AceTextEncode ─┐
+       ClipLoader(ace15, 双塔) ─┘                 │
+       VaeLoader(ace_audio) ────────────┐         ├─ Sampler ─ VaeDecode ─ SaveAudio
+       AceModelSampling ─ Scheduler ────┴─────────┘
+       EmptyLatent(秒数) ───────────────┘
 
-* 节点有**类型化接口**（MODEL / CLIP / VAE / LORA / CONDITIONING / LATENT / SIGMAS / IMAGE / AUDIO / VIDEO / 标量）。执行器按依赖顺序遍历，类型不匹配在节点运行前就被拒绝。
-* 错误是**值而不是异常**：某个节点跑不了，它会说明自己是哪个类型、哪个 id、为什么。
-* **一个节点对应一个阶段，而不是一个模型**。采样器按主干类型分派，VAE 解码按 VAE 的角色分派，潜变量节点按自己的几何参数分派。接一个新主干是加一个分支，不是加一组节点。
-* **精度由文件决定**。加载器读取检查点自己声明的精度（int8、4/6 bit 打包、fp8、fp16、bf16、fp32），按该精度装载并按该精度计算，不做「一律转成某一种」的转换。同一个模型用不同精度导出，换的是设置里的一个文件名。
-* **权重按块流式加载**。显卡装不下整个检查点时，只把当前块推进显存，算完换下一块。
-* **运行期 LoRA 修正**。对需要反复重读的流式权重，LoRA 不折进权重（那意味着每一步都要重新解码、适配、再量化整个检查点），而是作为 GEMM 的一个后置项：y = x·W + (x·A)·B。几何完全等价，代价是基础 GEMM 的几个百分点，精度反而更高（delta 保持 fp32）。
+语音:  ModelLoader(breeze_tts) ─ BreezeTextEncode ─ BreezeSampler ─ BreezeDecode ─ SaveAudio
+```
 
-### 显存管理
+这张图是 ComfyUI 风格的强类型 socket 系统（`core/graph/`）：节点只注册一次
+（`core/nodes/`），链是构造函数（`core/workflows/`），执行器按依赖顺序遍历。
+加一个新能力意味着写一个节点并接上线，而不是重写整条流水线。
 
-这是整个引擎里最吃紧的资源，所以有一条统一的账本：
+引擎刻意做到自包含：
 
-* 每一字节常驻显存都在分配前记账，超限就**拒绝**并抛出可读错误，绝不静默缩水。
-* 上限不是常量，而是**按卡推导**：驱动愿意给这个进程多少、卡本身有多少，取较小者；每次工具调用前重新读取一次，所以「一分钟前还被别的程序占着的卡」现在会被如实规划。
-* **常驻窗口**：显存放得下多少块就常驻多少块，剩下的流式加载。运行期按实测占用动态增减，目标是让采样阶段落在驱动上限的 90–100% 区间——低于这个区间是白付磁盘带宽，高于则是丢设备的边缘。
-* **阶段边界归还**：每个生成阶段结束时把不属于下一阶段的显存还给设备。不然一个跑完的视频任务会以为「卡上还占着 3 GB」而让紧接着的图片任务少常驻好几块权重。
+* **构建期不需要 CUDA SDK。** 内核是 CUDA C++ 字符串常量，由 NVRTC（自带的
+  `nvrtc64_*.dll`）在运行时针对检测到的 GPU 编译，产出的 cubin 缓存到
+  `data/media_shader_cache/`。
+* **运行期不需要 Python、PyTorch 或 ComfyUI。** 权重直接从 `.safetensors`
+  读取（内存映射，按需流式送入显存）。
+* **checkpoint 存什么精度就读什么精度**，不做转换：`int8_tensorwise`
+  （含 256 宽的 convrot / Hadamard 旋转）、`asym_w4a8_int8`、`w6a8_int8`、
+  `convrot_w4a4`、`nvfp4` / `mxfp4`、`fp8`（E4M3 / E5M2），以及稠密的
+  `f16` / `bf16` / `f32`。GGUF 会被点名拒绝。
+* **只有一个显存记账员。** 每一块常驻字节在提交前先记账；超预算的开销是被
+  **拒绝**，绝不悄悄缩水。上限由显卡本身与该进程当前的驱动预算共同推导。
+* **主机侧分层。** 放不进显存的权重留在锁页（或普通）内存里流式读取，配有
+  前瞻预取槽；一个进程级的账本决定哪些张量值得锁页。
 
-### 媒体工具也走节点图
+---
 
-四个媒体工具是同一套执行器、同一套加载器、同一套节点，只是连线不同。所以「新加一条链」是写一份新连线，而不是写一组新模块——语音合成链复用了已有的加载器和写音频节点，一行都没改。
+## 环境要求
 
-\---
+**平台**
 
-## 四、使用方式
+* Windows 10 或更新版本，x64。构建面向 Win10 API（`_WIN32_WINNT=0x0A00`），
+  并链接 Media Foundation、DXGI、DWM 与 WebView2。
+* 必须安装 WebView2 Runtime（Evergreen）。Windows 11 与较新的 Windows 10
+  已内置；否则请从微软官网安装。
 
-### 运行
+**GPU**
 
-直接双击可执行文件。窗口在几毫秒内出现在屏幕上（带一个主题色的启动占位画面），浏览器内核和协议服务在后台并行启动，首帧就绪后交接给界面。
+* NVIDIA 显卡 + 较新的驱动（`nvcuda.dll` 由驱动提供）。
+* 计算能力 6.0 及以上（`int8` `dp4a` 路径）；内核按当前显卡的
+  `sm_<major><minor>` 精确编译。
+* 显存：引擎会流式读取权重，图像链在 6 GB 级别的卡上可以跑。视频链的 DiT
+  在磁盘上就有约 21 GB，在工作站级显卡以下基本是每个采样步重读一遍。视频
+  模型对张量核（`sm_70+`）依赖很重。
 
-命令行参数：
+**构建机**
 
-&#x20;   phi.exe --media-bench \[选项]       媒体引擎验收基准
-    phi.exe --media-tool <名称> \[...]  直接跑一个媒体工具（不经过模型）
+* 除了仓库本身什么都不需要：GCC 16（MinGW-w64、UCRT）、mingw32-make、
+  windres、`rg.exe` 全都在 `vendor/` 下。
+* makefile 的 recipe 是 POSIX 语法（`mkdir -p`、`cp`、`rm -rf`），请在
+  Git Bash / MSYS2 / WSL 里执行。`./make.sh` 是一个薄包装：把 `TMPDIR`
+  指到 `C:\Temp` 后 exec `vendor/gcc/bin/mingw32-make.exe`。
 
+**磁盘**
 
-\--media-tool 的几个子命令：
+* 四个模型家族合计约 80 GB。每条链的文件都是单独选择的（见
+  [配置](#配置)），所以可以只装你要用的。
 
-* 名称 schema —— 打印该工具的参数 schema（英文）。
-* 名称 graph —— 只构建并校验节点图，不需要显卡、检查点或模型。
-* 名称 resolve —— 打印当前设置下每个角色解析到哪个文件、是否存在。
-* 名称 '{...}' —— 用一段 JSON 参数真正跑一次，返回结果文本。
+---
 
-### 首次配置
+## 仓库结构
 
-**1. 配置模型**
+```
+app/                桌面外壳：wWinMain、Win32 窗口、WebView2 引导、开屏
+                    画面、目录选择对话框（`shell.cpp`）
+assets/             phi.ico
+bin/                构建产物：phi.exe + webview2loader.dll + nvrtc DLL
+core/               引擎本体（18 个分组，一层嵌套）
+  util/             基础字符串/路径/文件、JSON、rtk 输出压缩、utf8、i18n、
+                    共用的媒体原语
+  net/              回环 HTTP/1.1 + WebSocket 服务器，WinHTTP 客户端
+  llm/              提供方客户端（anthropic-messages、openai-completions）、
+                    模型目录
+  store/            settings.json、webui-configs.json、会话 .jsonl 存档、
+                    技能与提示词模板扫描
+  agent/            智能体循环、会话、子代理、系统提示词、上下文 token 估算
+  tools/            内置工具与四个媒体工具
+  ui/               协议服务器（UI 桥）与主题解析
+  graph/            节点图框架：socket、注册表、执行器，以及公开的
+                    workflow 头文件
+  nodes/            一个节点一个文件 —— 这就是节点目录
+  workflows/        一条现成链一个文件（image / video / music / tts / audio）
+  runtime/          CUDA 上下文与设备、NVRTC 编译与 cubin 缓存、派发、
+                    调度、显存预算
+  host/             safetensors 读取、量化与反量化、主机侧分层账本
+                    （锁页 / 前瞻 / 页缓存）
+  models/           各模型的前向（DiT、VAE、文本编码器）
+  sampling/         采样器与 sigma 调度器（与 ComfyUI 兼容）
+  io/               图像（WIC）、音频（Media Foundation）、视频（MF
+                    SourceReader）以及 MP4 封装
+  text/             BPE 分词器与视觉预处理
+  bench/            `--media-bench` 验收工具
+  kernels/          CUDA 内核源码（唯一跑 GPU 路径的代码）
+ui/                 index.html、app.js、styles.css —— WebView2 前端
+data/               运行时状态（设置、会话、分词器文件、缓存）
+models/             checkpoint，每条链一个目录
+vendor/             gcc/（MinGW-w64 工具链 + make + rg）、cuda/（nvrtc DLL
+                    与头文件）、webview2/（loader DLL 与头文件）
+makefile            整个构建过程
+make.sh             调用自带 make 的 POSIX shell 包装
+```
 
-在界面里填入至少一个 API 配置：provider、base URL、API key、模型。支持两种线上格式：
+大致规模：`core/` 约 6.5 万行 C++，`ui/` 约 8 千行 JS/CSS/HTML，
+`app/` 约 500 行。
 
-* anthropic-messages
-* openai-completions（含各种兼容网关）
+---
 
-配置会存下来，可以保存多份并切换「当前生效」的那一份。模型列表和思考强度选项都会按模型自身声明的能力过滤。
+## 构建
 
-**2. 选择工作目录**
+```bash
+./make.sh            # 等价于 vendor/gcc/bin/mingw32-make.exe all
+```
 
-Agent 的所有相对路径都相对于会话工作目录解析。工作目录可以在界面里切换（会重建会话），也可以在启动前写入设置。
+在仓库根目录的 POSIX shell 里执行。默认目标链接出 `bin/phi.exe`
+（GUI 子系统，`-municode -mwindows`，静态链接），并把
+`webview2loader.dll` 与 `nvrtc*` 系列 DLL 从 `vendor/` 复制进 `bin/`。
 
-**3. 放置媒体模型（可选）**
+常用变体：
 
-如果要使用媒体生成能力，把对应的检查点放进 models 目录。目录布局是自由的：
+```bash
+./make.sh OBJDIR=build/obj/w1     # 隔离目标文件（并行跑两份构建）
+./make.sh clean                   # 删除 build/ 与 bin/
+./make.sh -j8                     # 并行编译
+```
 
-* 按链分子目录（每个链一个目录，权重、词表、配置各就各位），或
-* 全平铺在 models 目录下。
+说明：
 
-设置面板会列出 models 目录下**所有**文件，每个角色（主干的权重、文本编码器、VAE、词表、合并表、分词配置、LoRA 等）各选一个。也就是说：**文件系统就是模型目录**——把文件放进去，它就会出现；不需要维护一份内置清单，也不需要记住某种格式标记，加载器自己检测精度。
+* 目标文件路径镜像源码树（`build/obj/core/io/image_io.o`），并通过
+  `-MMD -MP` 生成的依赖文件回读，所以改一个头文件会重建所有包含它的
+  编译单元。
+* 构建不需要 CUDA SDK：`core/runtime/cuda_api.cpp` 自己声明所需的
+  运行时 / NVRTC 入口并动态加载 DLL。
+* `windres` 把 `app/phi.rc`（图标）编进可执行文件。
 
-每条链的选择互相独立。LoRA 也是每条链各自一份列表，按顺序叠加，图像 LoRA 绝不会串进视频链。
+---
 
-**4. 工具设置**
+## 运行
 
-* 工具启用/禁用开关。
-* 每个工具的权限（例如限定在工作目录内）。
-* 每个工具的输出上限。
-* 子代理可用的工具子集。
-* 各链的采样步数、采样器、调度器名称（留空即使用该链自身的发布默认值）。
+```bash
+bin/phi.exe
+```
 
-### 日常使用
+窗口立刻出现并绘制带主题的 Φ 开屏画面，同时 WebView2 运行时与回环协议
+服务器在后台启动；WebView 首帧就绪后接管画面。服务器绑定一个随机的回环
+端口，WebView 导航到它 —— 前后端之间从不经过网络。
 
-* **对话**：直接提问。Agent 会自己决定读文件、跑命令、搜索还是生成媒体。
-* **中途中止**：随时停止。正在跑的流会断开，正在跑的命令会被杀掉（连同它的整个进程树），正在跑的子代理会收到取消信号。
-* **插入补充**：在生成过程中继续输入，新内容会在下一个思考步骤前并入上下文。
-* **压缩上下文**：当对话变长，手动触发压缩；压缩后所有请求只带摘要和其后的内容。
-* **会话管理**：新建、切换、重命名、删除（进回收站）。未写入任何消息的空会话会被自动丢弃，不会在磁盘上堆积。
-* **切模型 / 切思考强度**：即时生效，并写入当前会话。
+`phi.exe` 是 GUI 子系统二进制。带控制台子命令（`--media-bench`、
+`--media-tool`）启动时，它会附着到父控制台（没有就分配一个），把纯文本
+输出到 stdout / stderr。
 
-### 环境要求
+首次启动按需创建 `data/`（设置、会话、WebView 配置、着色器缓存）。
 
-* Windows 10 或更高版本。
-* WebView2 运行时（多数 Windows 10/11 已预装）。
-* 使用媒体生成能力需要一块支持 CUDA 的 NVIDIA 显卡；缺少 CUDA 时媒体工具会给出可读错误，其余功能不受影响。
-* 使用媒体生成能力建议把检查点放在非系统盘的 models 目录下——引擎会按块流式加载权重，磁盘吞吐直接影响每一步的耗时。
+---
 
-\---
+## 配置
 
-## 五、几点设计取舍
+所有状态都是 `data/` 下的 JSON。
 
-* **不引入 Python，不引入第三方运行时**。整套推理引擎只用系统自带的编解码组件和 CUDA 驱动接口。CUDA 内核在运行时用 NVRTC 编译（因此不需要 MSVC 工具链），编译结果缓存到磁盘。
-* **磁盘是慢的，所以权重不该被反复读**。检查点通常比内存大，所以引擎把「能常驻的常驻、剩下的流式加载」，并在宿主内存里缓存那些反复用到的权重块。
-* **显存是稀缺的，所以账本必须诚实**。所有规划都从「这台机器现在真的能拿出多少」出发，而不是从一个写死的常量。这是同一份二进制能在 6 GB 笔记本显卡和 48 GB 工作站上都跑起来的原因。
-* **精度是文件说了算的**。引擎不替用户决定「应该用哪种精度」——同一个模型有多少种导出，就能读多少种；换精度是换一个文件名。
-* **语言是会话的属性**。所有内置字符串（工具描述、参数说明、错误消息、压缩输出里的说明行）都跟着会话语言走，不在代码里写死。
-* **失败要可读**。几乎每一条错误消息都带上具体的数字：需要多少、还差多少、上限是多少、是哪个文件、是哪个节点。拒绝一次运行是可以接受的，静默地给出错误结果是不可接受的。
+### `data/settings.json`
 
+```jsonc
+{
+  "hotkeys":   { "input.send": "Enter", "input.newline": "Shift+Enter",
+                 "session.new": "Ctrl+Alt+N", "input.focus": "Ctrl+I" },
+  "appearance":{ "theme": "mint", "radius": "none", "density": "compact", … },
+  "tools": {
+    "enabled":     { "bash": true, "read": true, …, "tts_speak": true },
+    "permissions": { "bash": "everywhere", "read": "everywhere", … },  // 或 "in-cwd"
+    "outputLimits":{ "bash": 120000, "read": 120000 },
+    "subagent":    { "tools": ["bash","read","write","edit"], "thinking": "…" },
+    "media": {
+      "image_dit": "qwen_image_2.1/qwen_image_2.1_int8_convrot.safetensors",
+      "image_te":  "qwen_image_2.1/qwen3vl_8b_int8_convrot.safetensors",
+      "image_vae": "qwen_image_2.1/qwen_image_2.1_vae_bf16.safetensors",
+      "video_dit": "minimax_h3/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+      "video_te":  "minimax_h3/minimax_h3_qwen3vl_32b_convrot_int4.safetensors",
+      "video_vae": "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors",
+      "video_avae":"minimax_h3/minimax_h3_audio_vae_fp32.safetensors",
+      "music_dit": "ace_step_1.5/acestep_v1.5_xl_sft_bf16.safetensors",
+      "music_te":  "ace_step_1.5/qwen_0.6b_ace15.safetensors",
+      "music_lm":  "ace_step_1.5/qwen_4b_ace15.safetensors",
+      "music_vae": "ace_step_1.5/ace_1.5_vae.safetensors",
+      "tts_model": "breeze_tts_2/breeze_tts_2_bf16.safetensors",
+      "tts_codec": "breeze_tts_2/breeze_tts_2_audio_tokenizer.safetensors",
+      "image_steps": 25, "video_steps": 20, "music_steps": 50,
+      "image_sampler": "euler", "image_scheduler": "simple",
+      "video_sampler": "euler", "video_scheduler": "beta",
+      "music_sampler": "euler", "music_scheduler": "simple",
+      "image_loras": [], "image_lora_strengths": [1.0],
+      "video_loras": [], "video_lora_strengths": [1.0]
+    }
+  },
+  "defaultProvider": "…", "defaultModel": "…", "defaultThinkingLevel": "max",
+  "systemPromptLanguage": "zh"
+}
+```
+
+以上内容都能在「设置」（API 配置 · 工具设置 · 快捷键 · 界面风格 · 通用 ·
+关于）里改，文件本身是同一份数据。
+
+### `data/models.json` 与 `data/webui-configs.json`
+
+提供方有两个来源：`assets/models-catalog.json`（随程序分发的已知提供方目录，
+只读）和 `models.json`（你自己添加的）。界面的 API 配置页把「配置档」
+写进 `webui-configs.json`：
+
+```json
+{
+  "active": "My Provider",
+  "profiles": [{
+    "name": "My Provider",
+    "model": "…", "baseUrl": "https://…/v1", "apiKey": "…",
+    "apiFormat": "openai-completions",      // 或 "anthropic-messages"
+    "subagent": { "model": "…", "baseUrl": "…", "apiKey": "…", "apiFormat": "…" },
+    "vision": "image",                       // "none" | "image" | "image_video"
+    "systemPromptLanguage": "zh"
+  }]
+}
+```
+
+`vision` 决定 `read` 工具能不能把一张图片（或整段视频）交给模型。
+纯文本模型会得到一句明确的拒绝，而不是被端点打回的内容。思考级别为
+`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`
+（按提供方映射）。
+
+API 密钥的解析顺序：配置档显式密钥 → `models.json` 提供方密钥 → 目录内置
+密钥 → 环境变量。
+
+### 模型
+
+把 checkpoint 放到 `models/` 下，每条链一个目录（扁平目录也能识别）。
+引擎会从 `data/` 和会话工作目录向上搜索，寻找形似 checkpoint 目录的
+`models/`。
+
+分词器文件放在 `data/tokenizers/`，随程序走而不是随模型目录走：默认是
+`qwen2.5/vocab.json`、`merges.txt`、`tokenizer_config.json` 与
+`breeze_tts_2/tokenizer.json`，每条链都可以单独改。
+
+---
+
+## 智能体
+
+* **会话**：一个会话对应 `data/sessions/<bucket>/` 下的一个 `.jsonl`
+  文件，bucket 由工作目录推导。每次落盘都是「写临时文件 + 原子 rename」的
+  整体重写，所以崩溃不可能留下半行 JSON；回放时还会对旧追加式格式的遗留问题
+  做一次性自愈。
+* **上下文压缩**：上下文窗口将满时把较早的对话总结掉。token 估算器（用真实
+  BPE 词表标定）驱动上下文进度条与压缩报告。`/compact` 可手动触发。
+* **子代理**（`agent` 工具）在后台跑，有自己的一套工具与思考级别，完成后把
+  摘要回灌到父会话。
+* **技能**是带 YAML frontmatter 的 `SKILL.md`，在 `data/skills/`（全局）
+  和 `<cwd>/data/skills/`（项目）里发现。
+* **提示词模板**是 `data/prompts/` 与 `<cwd>/.phi/prompts/` 下的 markdown
+  文件，会出现在 `/` 命令面板里，和内建的 `/copy`、`/session`、
+  `/compact` 并列。
+* **附件**：把文件拖进输入框会以 base64 上传到 `data/uploads/` 并按路径
+  引用 —— 会话文件里存的是路径，不是几 MB 的 base64。
+
+默认快捷键：`Enter` 发送 · `Shift+Enter` 换行 · `Ctrl+Alt+N` 新会话 ·
+`Ctrl+I` 聚焦输入框 —— 这四组可在「设置 → 快捷键」里改。
+`Ctrl+Shift+C`（设置）与 `Ctrl+B`（技能面板）是固定快捷键。
+
+---
+
+## 媒体引擎
+
+### 工具
+
+每个媒体工具都只是某一张图的一层薄壳。它们共用一个进程级引擎（一个 CUDA
+上下文，同一时刻只跑一次生成），首次使用时惰性打开，之后复用。
+
+**`image_generate`** —— Qwen-Image-2.1，输出 PNG。
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 英文，100–300 词（主体 / 环境 / 风格 / 镜头 / 氛围 / 细节） |
+| `width`、`height` | 400–2000 像素，画布上取 32 的倍数，生成后再裁回精确尺寸 |
+| `ref_images` | 0–9 个绝对路径；带参考图时这条链变成参考隐空间的编辑 |
+| `output` | `.png` 的绝对路径 |
+
+**`video_generate`** —— MiniMax H3 ref2va，输出 MP4（H.264 + AAC）。
+
+| 参数 | 说明 |
+| --- | --- |
+| `prompt` | 英文，300–600 词：先用 `<Subject N>` / `<Picture N>` / `<Audio N>` 声明主体与引用，再按镜头顺序（`[Shot N] At SS.s`）写，最后是场景与音乐 |
+| `duration_frames` | 5–362 帧、24 fps（会被对齐到合法的 `17k+5` 时间网格） |
+| `width`、`height` | 128–2048 像素，取偶数值（yuv420），画布上对齐到 32 |
+| `ref_images` | 0–9 张，严格对应 `<Picture N>` 顺序 |
+| `ref_audios` | 0–3 段，严格对应 `<Audio N>` 顺序 |
+| `output` | `.mp4` 的绝对路径 |
+
+**`music_generate`** —— ACE-Step 1.5，输出 48 kHz WAV。
+
+| 参数 | 说明 |
+| --- | --- |
+| `tags` | 英文风格标签，逗号分隔 |
+| `lyrics` | 歌词，用 `[verse]` / `[chorus]` 分行；纯器乐写 `[instrumental]` |
+| `duration` | 时长（秒） |
+| `bpm`、`language`、`keyscale`、`timesignature` | 默认 72 / `en` / `D minor` / `4` |
+| `output` | `.wav` 的绝对路径 |
+
+**`tts_speak`** —— Breeze-TTS-2 音色设计，输出 24 kHz WAV。不接受参考音频：
+音色完全来自 `instruction` 的描述。
+
+| 参数 | 说明 |
+| --- | --- |
+| `text` | 要朗读的文本（中英双语，可内联 `[笑]` / `(sigh)` 之类的语气事件） |
+| `instruction` | 音色描述（必填） |
+| `output` | `.wav` 的绝对路径 |
+
+种子由工具每次随机抽取并在报告里给出，不能外部指定。
+
+### 采样
+
+步数来自工具设置（默认图像 25、视频 20、音乐 50）。
+
+采样器：`euler`、`euler_ancestral`、`heun`、`dpmpp_2m`、
+`dpmpp_2s_ancestral`、`dpmpp_2m_sde`、`dpmpp_sde`、`res_multistep`、
+`lcm`。
+调度器：`simple`、`normal`、`sgm_uniform`、`karras`、`exponential`、
+`ddim_uniform`、`beta`、`linear_quadratic`、`kl_optimal`。
+
+默认值复刻了原始发布工作流（图像 `euler`+`simple`，视频
+`res_multistep`+`beta`，音乐 `euler`+`simple`）。采样器与调度器的数学
+是 ComfyUI 实现的移植，由 makefile 里的主机测试钉住。
+
+### 节点目录
+
+`MediaModelLoader`、`MediaClipLoader`、`MediaVaeLoader`、
+`MediaLoraLoader`、`MediaQwenImageEditEncode`、`MediaH3Ref2VaEncode`、
+`MediaH3SigmaShift`、`MediaQwenImage21Cache`、`MediaEmptyLatent`、
+`MediaScheduler`、`MediaSampler`、`MediaVaeDecode`、
+`MediaVaeEncodeImage`、`MediaLoadImage`、`MediaSaveImage`、
+`MediaSaveAudio`、`MediaSaveVideo`、`MediaSeed`、`MediaConstInt`、
+`MediaAceTextEncode`、`MediaAceModelSampling`、`MediaBreezeTextEncode`、
+`MediaBreezeSampler`、`MediaBreezeDecode`。
+
+一个节点对应一个**阶段**，而不是一个模型：`MediaSampler` 按模型的架构
+分派，`MediaVaeDecode` 按 VAE 的角色分派，`MediaEmptyLatent` 按它自己的
+`arch` 参数分派。
+
+---
+
+## 命令行接口
+
+```bash
+phi.exe --media-bench [选项]      # 环境、显存预算、流式吞吐、int8 自检、
+                                  # 内核基准，可选跑真实链
+phi.exe --media-tool <名称> …     # 按智能体的方式运行某一个媒体工具
+```
+
+`--media-bench` 的选项（节选）：
+
+```
+[--quick] [--verbose] [--json out.json] [--model path]...
+[--image] [--image-size WxH] [--image-prompt text] [--image-out out.png]
+[--image-seed N] [--image-ref path]... [--image-ref-area px2]
+[--image-negative text] [--image-cfg F]
+[--video] [--video-size WxH] [--video-frames N] [--video-prompt text]
+[--video-out out.mp4] [--video-seed N] [--video-steps N]
+[--video-ref path]... [--video-ref-clip path]... [--video-ref-clip-audio path]...
+[--video-ref-audio path]... [--video-ref-image-size match|max]
+[--video-lora path]... [--video-lora-strength F]...
+```
+
+任一硬性检查失败都会返回非零退出码，所以它可以用来卡 CI。
+
+`--media-tool` 在工具名之后接受：
+
+* `schema` —— 打印工具的 JSON schema（按「全能模型」视角）；
+* `graph` —— 构建该链的图并对着注册表校验每个节点、端口和连线，不需要
+  GPU、不需要 checkpoint；
+* `resolve` —— 打印当前 `settings.json` 下每个模型角色解析到哪个文件、
+  该文件是否存在；
+* 一个 JSON 参数对象 —— 真正运行该工具（同一个 `ToolDef::run`、同一个
+  `ToolContext`，只是没有模型在回路里）。
+
+```bash
+phi.exe --media-tool image_generate "{\"prompt\":\"a red fox in tall grass\",\"width\":1024,\"height\":1024,\"output\":\"C:/out/fox.png\"}"
+phi.exe --media-tool video_generate schema
+phi.exe --media-tool resolve
+```
+
+---
+
+## 数据目录
+
+| 路径 | 内容 |
+| --- | --- |
+| `data/settings.json` | 快捷键、外观、工具设置、媒体角色、默认值 |
+| `data/models.json` | 用户添加的提供方与模型 |
+| `data/webui-configs.json` | 设置对话框写出的 API 配置档 |
+| `data/sessions/<bucket>/*.jsonl` | 一个文件就是一份自洽的会话快照 |
+| `data/skills/`、`data/prompts/` | 全局技能与提示词模板 |
+| `data/tokenizers/` | BPE 词表/合并表/配置，以及 Breeze-TTS-2 的 tokenizer.json |
+| `data/uploads/` | 输入框里附带的文件 |
+| `data/media_shader_cache/` | 编译好的 cubin，按源码/入口/架构/NVRTC/头文件路径/快速数学 分键 |
+| `data/webview/` | WebView2 的用户数据目录 |
+
+`data/` 按需创建；除你想保留的 JSON 之外，删除是安全的。
+
+---
+
+## 诊断
+
+引擎的诊断埋在环境变量后面，默认全关（未设置时零开销）。值得知道的几个：
+
+| 变量 | 作用 |
+| --- | --- |
+| `PHI_TRACE` | 启动 / 传输 / 会话的时间戳追踪，输出到 stderr |
+| `PHI_MEDIA_TRACE` | 刚跑完那张图的逐节点耗时 |
+| `PHI_MEDIA_STATE` | 一次生成边界上进程仍持有什么 |
+| `PHI_VRAM_BUDGET_MB` | 覆盖显存上限（仍受物理显存约束） |
+| `PHI_VRAM_MARGIN_PERCENT` | 覆盖预算余量（限制在 50–100） |
+| `PHI_RING_MB` | 钉住上传环大小（用来刻意走小环路径） |
+| `PHI_CUDA_BIN`、`PHI_CUDA_INCLUDE` | 额外搜索 NVRTC DLL / 头文件的根目录 |
+| `PHI_TOKENIZER_DIR` | 一次性覆盖所有分词器角色 |
+| `PHI_W4A8_CPU` | 强制走主机解码路径（分组尺度权重的 A/B） |
+| `PHI_PERF` | 以 `?perf=1` 打开界面 |
+| `PHI_IMG_STEPS`、`PHI_VIDEO_STEPS` | 单次基准的步数覆盖 |
+
+还有更多，`grep getenv core/` 全部可见；绝大多数是内核调优用的单点实验开关。
+
+---
+
+## 测试
+
+makefile 定义了若干主机侧测试目标，用同一套自带工具链把少量 `core/` 源码
+链接成控制台程序：
+
+```bash
+./make.sh precision-test     # 每个加载器的每一种权重量族，对着参考值
+./make.sh sampling-test      # 采样器/调度器数学，不需要设备
+./make.sh workflow-test      # 工具设置 → workflow → 节点的接缝
+./make.sh token-test         # 上下文 token 估算器 vs 真实 BPE 词表
+```
+
+`grouped-decode-test` 还需要 `bin/phi.exe` 和 GPU，因为它要把分组尺度权重的
+**设备**解码与主机解码逐字节对比。
+
+> 注意：这些目标引用了 `tests/` 下的源码（以及
+> `tests/data/*.safetensors`），而它们不在本快照里 —— 目标是定义好的，
+> 夹具没有随包提供。要用之前先把它们补进你的工作树。
+
+---
+
+## 安全须知
+
+* UI 桥只绑定 `127.0.0.1`，且每个请求都校验 `Host` 头，所以网页无法驱动
+  这个本地服务。
+* `bash` 会执行模型让它执行的任何东西。每个工具的权限范围
+  （`everywhere` / `in-cwd`）和「设置 → 工具设置」里的开关就是护栏，
+  请有意识地设置。
+* API 密钥以**明文**存放在 `data/models.json` 与 `data/webui-configs.json`，
+  请把这两个文件当机密对待。
+* 会话会原样记录工具参数与输出，包括智能体读过的文件内容。`data/sessions/`
+  的敏感程度等同于你让它工作的那些目录。
+
+---
+
+## 许可
+
+本源码树没有附带 `LICENSE` 文件。在补充之前，请视其代码为作者的作品：
+未经许可不得再分发或商用。`vendor/` 下的第三方组件（MinGW-w64 GCC、
+CUDA NVRTC 运行时与头文件、WebView2 loader、ripgrep）各自遵循自己的许可。

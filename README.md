@@ -1,216 +1,585 @@
 # Phi
 
-A local-first Windows desktop AI Agent: it can act as a coding assistant to read and write your codebase, run commands, search the web, and also generate images, video, music, and speech directly on your local GPU.
+A local-first desktop agent for Windows, written in C++20, that ships its own
+CUDA inference engine for image, video, music and speech generation.
 
-The entire program is a self-contained Windows executable—no Python dependency, no third-party runtime. GPU computation uses the CUDA driver interface + NVRTC (kernels compiled on demand at runtime), image codec uses WIC, audio/video muxing uses Media Foundation, and the UI is hosted by WebView2.
+Phi is two things in one binary:
 
----
+* **an agent shell** — a chat window (WebView2) hosting an LLM session that can
+  read, write and edit files, run shell commands, search the web, and delegate
+  to background subagents;
+* **a media engine** — a node-graph runtime that runs Qwen-Image-2.1 (image),
+  MiniMax H3 (video + audio), ACE-Step 1.5 (music) and Breeze-TTS-2
+  (text-to-speech) locally on an NVIDIA GPU, exposed to the agent as four tools.
 
-## 1. What It Is
-
-Phi consists of two interlocking parts:
-
-**1. Agent Runtime**
-
-A loop of "think → batch tool calls → observe results → think again." At each step, the model streams reasoning and tool calls, the runtime executes all tools of that step as one batch, appends the results to the conversation history, then proceeds to the next step; when a step produces no tool calls, the text of that step is the final answer.
-
-**2. Local Media Inference Engine**
-
-A multimodal generation engine running on the same GPU, exposing only four tools externally: generate image, generate video, generate music, synthesize speech. Internally it is a set of "node graphs"—loading a model, encoding a prompt, sampling, decoding, writing a file are each a node, connected by typed interfaces. Changing a chain means re-wiring, not rewriting the engine.
+Everything runs on the machine. No cloud services are involved beyond the LLM
+API you configure yourself.
 
 ---
 
-## 2. Features
+## Table of contents
 
-### Coding Assistant
-
-- **Read/write code**: precise line-numbered reading (supports large file segmentation), exact string replacement editing, atomic writes, directory listing, regex/literal content search (prefers built-in ripgrep, falls back to native traversal if missing).
-- **Execute commands**: runs through a real shell (Git Bash preferred, falls back to cmd.exe), supports pipes, redirection, &&; output streams back to the UI in real time and is automatically compressed—strips ANSI escapes, collapses build/git noise, keeps head and tail of overly long output.
-- **Network access**: Bing search (returns numbered result list: title / URL / snippet) and web page fetching (HTML to plain text).
-- **Multimodal reading**: images are passed directly to the model as image content; videos can specify frame numbers, extracted frames are likewise passed as images. Both are first scaled to a size the model can resolve and re-encoded, avoiding a screenshot repeatedly inflating in every request round.
-
-### Background Subagent
-
-The main model can hand off an entire block of tasks to a brand-new subagent: it has an independent context window, an independent toolset (cannot spawn further subagents within a subagent), and the same system prompt as the main session, advancing in parallel on its own thread. The subagent's run log streams back in real time in the session's own message format to the corresponding tool card; upon task completion, its last text segment is returned to the main model as a report.
-
-### Local Media Generation
-
-Four tools, all running on the local GPU, no network, no external services required:
-
-- **Image generation**: text-to-image, or editing/inpainting with a reference image. Output dimensions are determined solely by width/height; the reference image is scaled only by its own resolution and does not participate in determining the canvas.
-- **Video generation**: joint audio-video generation, supports reference image / reference video (including its audio track) / independent reference audio, outputs H.264 + AAC mp4.
-- **Music generation**: given style tags, lyrics, and music metadata (BPM, duration, time signature, key, language), generates 48 kHz music.
-- **Speech synthesis**: synthesizes speech using "text to speak + natural language instruction describing the voice timbre." Only voice design, no voice cloning—the engine does not accept reference audio.
-
-### Sessions and UI
-
-- Sessions are persisted as append-only JSONL, can be reopened, continued, deleted (deletion goes to recycle bin) at any time.
-- Model, thinking intensity, working directory, system prompt language can all be switched at runtime.
-- When context is too long, manual compression is possible: summarize history into a summary, after which all requests carry only the summary and subsequent content.
+1. [What it does](#what-it-does)
+2. [Requirements](#requirements)
+3. [Repository layout](#repository-layout)
+4. [Build](#build)
+5. [Run](#run)
+6. [Configuration](#configuration)
+7. [The agent](#the-agent)
+8. [The media engine](#the-media-engine)
+9. [Command-line interface](#command-line-interface)
+10. [Data directories](#data-directories)
+11. [Diagnostics](#diagnostics)
+12. [Tests](#tests)
+13. [Security notes](#security-notes)
+14. [License](#license)
 
 ---
 
-## 3. Architecture
+## What it does
 
-### Layers
+### Agent
 
-    Desktop Shell (Native Window + WebView2)
-      Placeholder splash / theme / folder picker
-              │  Loopback HTTP + WebSocket
-              ▼
-    Protocol Layer: Session Facade + Snapshot Projection
-      Projects Agent state into JSON the UI can render directly
-              │
-              ▼
-    Agent Loop
-      THINK: Streaming model response
-      EXECUTE: Batch execute all tools for this step
-        │                    │
-        ▼                    ▼
-    Tool Layer            Media Engine
-    bash/read/...         Node Graph + CUDA
-    web/subagent          VRAM Ledger
+A single chat window with a session transcript, a working-directory selector,
+model/thinking-level controls, a skills panel, a slash-command palette and a
+settings dialog. The agent loop is a strict two-phase step:
 
-### Agent Loop
+```
+THINK    stream one model response (reasoning + tool calls + optional text)
+EXECUTE  run every tool call from that response as a batch, append the results
+         … repeat until the model produces a final answer with no tool calls
+```
 
-- **A turn** = one user input driven to completion.
-- **A step** = one streaming model call + one batch of all tools in this step.
-- The loop alternates steps until a step produces no tool calls.
+Built-in tools (each can be enabled, given a permission scope and an output
+limit in Settings → Tool settings):
 
-A few deliberate design points:
-
-- Once tool calls appear in the response, prose streamed in the same step is discarded—only the text of the final summary step is retained. "Silently do tool steps, only speak at the end" is enforced by the loop itself, not requested via prompt.
-- Tool results are written to history **at the moment each call is answered**, not after the whole batch finishes. This way, even if a tool's UI callback throws an exception, or the user aborts midway, history will not contain a dangling state of "tool_call without corresponding tool_result"—such history would cause every subsequent request to be rejected by the upstream.
-- On stream interruption (network error, HTTP 4xx), already recorded tool calls are still filled in one by one with placeholder results, for the same reason as above.
-- For parallel tool calls within the same turn, their IDs are forcibly deduplicated and completed: some gateways stuff multiple parallel calls with the same placeholder ID, and both wire formats pair by ID; duplicate IDs would make the whole batch appear "under-answered."
-- Users can "insert" new input during streaming (steering), which will be merged into context before the next step begins.
-
-### Tool Layer
-
-Tools fall into four categories:
-
-| Category | Description |
+| Tool | Purpose |
 | --- | --- |
-| File/Command | Read/write, search, execute commands within the session working directory |
-| Network | Search, fetch web pages |
-| Subagent | Hand off task to background subagent |
-| Media | Image / video / music / speech generation |
+| `bash` | Run a shell command, stream its output, compact the result |
+| `read` | Read a text file, or hand an image/video to the model as multimodal content |
+| `write` | Create or overwrite a file |
+| `edit` | Exact-string replacements, applied as a batch |
+| `ls` | List a directory, optionally recursive |
+| `grep` | Regex content search (uses the vendored `rg.exe`, with a native fallback) |
+| `web_search` | Bing search, parsed into results with snippets and URLs |
+| `fetch` | Fetch a URL and convert the page to text |
+| `agent` | Start a background subagent that reports back a summary |
+| `image_generate` | Qwen-Image-2.1 → PNG (text-to-image or reference-image editing) |
+| `video_generate` | MiniMax H3 ref2va → MP4 (with generated audio) |
+| `music_generate` | ACE-Step 1.5 → WAV (tags + lyrics) |
+| `tts_speak` | Breeze-TTS-2 → WAV (voice design from a timbre description) |
 
-Unified conventions:
+Prompt strings and tool schemas exist in Chinese and English, driven by
+`settings.json → systemPromptLanguage`.
 
-- **Every built-in prompt string has both Chinese and English versions**, determined by the session language (settings.json's systemPromptLanguage), including parameter descriptions, error messages, and explanatory lines inserted in compressed output. No place hardcodes language.
-- **Parameter schemas are generated on the fly at each request according to the current language**, so switching language does not require a restart.
-- **Permission gate**: each tool can be set to "within working directory only"; out-of-bounds access is rejected with a readable reason.
-- **Output cap**: each tool can be individually configured with a maximum output character count.
+### Media engine
 
-### Media Engine
+Four ready-made chains, all built from the same registry of nodes:
 
-The engine is process-level resident, lazily loaded on demand: the image backbone's weights plus text encoder add up to over a dozen GB; reopening each call would dominate the entire runtime, while opening at startup would make sessions that never use media pay an unnecessary cost.
+```
+image:  ModelLoader ─┐
+        ClipLoader ──┼─ QwenImageEditEncode ─┬─ CONDITIONING ─┐
+        VaeLoader ───┘                      └─ LATENT ───────┼─ Sampler ─ VaeDecode ─ SaveImage
+        EmptyLatent ────────────────────────────────────────┘      ↑
+        Scheduler(model) ──────────────────────────────────────────┘
 
-The full flow of a chain is **one node graph**:
+video:  ModelLoader ─┬─ H3SigmaShift ──────────┐
+        ClipLoader ──┴─ H3Ref2VaEncode ─┐     ├─ Sampler ─┬─ VaeDecode(video) ─┐
+        VaeLoader(video) ───────────────┘               └─ VaeDecode(audio) ───┼─ SaveVideo
+        VaeLoader(audio) ──────────────────────────────┘                      │
+        EmptyLatentVideo ──────────────────────────────┘                      │
+        Scheduler(model) ──────────────────────────────┘                      │
 
-    Model Load ─┬─ Prompt Encode ─┐
-    Text Load ──┘                 ├─ Sampler ─ Decode ─ Write File
-    Empty Latent ─────────────────┘
-    Scheduler (sigma grid) ───────┘
+music:  ModelLoader(ace_step15) ─┬─ AceTextEncode ─┐
+        ClipLoader(ace15, dual) ─┘                 │
+        VaeLoader(ace_audio) ────────────┐         ├─ Sampler ─ VaeDecode ─ SaveAudio
+        AceModelSampling ─ Scheduler ────┴─────────┘
+        EmptyLatent(seconds) ────────────┘
 
-- Nodes have **typed interfaces** (MODEL / CLIP / VAE / LORA / CONDITIONING / LATENT / SIGMAS / IMAGE / AUDIO / VIDEO / scalar). The executor traverses in dependency order; type mismatches are rejected before the node runs.
-- Errors are **values, not exceptions**: if a node cannot run, it states which type it is, which id, and why.
-- **A node corresponds to a stage, not a model**. Samplers dispatch by backbone type, VAE decoding dispatches by the VAE's role, latent nodes dispatch by their own geometry parameters. Adding a new backbone is adding a branch, not adding a set of nodes.
-- **Precision is determined by the file**. The loader reads the precision declared by the checkpoint itself (int8, 4/6 bit packed, fp8, fp16, bf16, fp32), loads at that precision and computes at that precision, without doing a "convert everything to one type" conversion. The same model exported at different precisions is just a different filename in settings.
-- **Weights are stream-loaded in blocks**. When the GPU cannot hold the entire checkpoint, only the current block is pushed into VRAM, then the next block after computation.
-- **Runtime LoRA correction**. For streamed weights that need to be re-read repeatedly, LoRA is not folded into the weights (that would mean re-decoding, adapting, and re-quantizing the entire checkpoint every step), but acts as a post-term of GEMM: y = x·W + (x·A)·B. Geometry is completely equivalent, at the cost of a few percentage points of the base GEMM, and precision is actually higher (delta kept in fp32).
+tts:    ModelLoader(breeze_tts) ─ BreezeTextEncode ─ BreezeSampler ─ BreezeDecode ─ SaveAudio
+```
 
-### VRAM Management
+The graph is a ComfyUI-style typed-socket system (`core/graph/`): nodes are
+registered once (`core/nodes/`), the chains are constructor functions
+(`core/workflows/`), and the executor walks the graph in dependency order.
+Adding a capability means writing one node and wiring it — not rewriting a
+pipeline.
 
-This is the most constrained resource in the entire engine, so there is a unified ledger:
+The engine is deliberately self-contained:
 
-- Every byte of resident VRAM is accounted for before allocation; exceeding the limit is **rejected** with a readable error, never silently shrunk.
-- The limit is not a constant, but **derived per card**: how much the driver is willing to give this process, and how much the card itself has, take the smaller; re-read before each tool call, so "a card that was occupied by another program a minute ago" is now planned truthfully.
-- **Resident window**: as many blocks as VRAM can hold stay resident, the rest are stream-loaded. Dynamically increased or decreased at runtime based on measured usage, with the goal of keeping the sampling phase in the 90–100% range of the driver limit—below this range is paying disk bandwidth for nothing, above it is on the edge of losing the device.
-- **Return at stage boundaries**: at the end of each generation stage, VRAM not belonging to the next stage is returned to the device. Otherwise, a finished video task would think "3 GB is still occupied on the card" and cause the immediately following image task to keep several fewer blocks resident.
-
-### Media Tools Also Use Node Graphs
-
-The four media tools are the same executor, the same loader, the same nodes, just different wiring. So "adding a new chain" is writing a new wiring, not writing a new set of modules—the speech synthesis chain reuses the existing loader and audio-writing node without changing a single line.
-
----
-
-## 4. Usage
-
-### Running
-
-Double-click the executable directly. The window appears on screen within milliseconds (with a theme-colored startup placeholder), the browser kernel and protocol service start in parallel in the background, and hand off to the UI once the first frame is ready.
-
-Command-line arguments:
-
-    phi.exe --media-bench [options]       Media engine acceptance benchmark
-    phi.exe --media-tool <name> [...]     Run a media tool directly (bypassing the model)
-
-Subcommands of --media-tool:
-
-- name schema —— Print the tool's parameter schema (English).
-- name graph —— Only build and validate the node graph; no GPU, checkpoint, or model needed.
-- name resolve —— Print which file each role resolves to under current settings, and whether it exists.
-- name '{...}' —— Actually run once with a JSON parameter, returning the result text.
-
-### First-Time Configuration
-
-**1. Configure Model**
-
-In the UI, fill in at least one API configuration: provider, base URL, API key, model. Two wire formats are supported:
-
-- anthropic-messages
-- openai-completions (including various compatible gateways)
-
-Configurations are saved, multiple can be kept and the "currently effective" one switched. The model list and thinking intensity options are filtered by the model's own declared capabilities.
-
-**2. Choose Working Directory**
-
-All relative paths of the Agent are resolved relative to the session working directory. The working directory can be switched in the UI (which rebuilds the session), or written into settings before startup.
-
-**3. Place Media Models (Optional)**
-
-If you want to use media generation capabilities, put the corresponding checkpoints into the models directory. The directory layout is free:
-
-- Subdirectories per chain (one directory per chain, weights, vocab, config each in place), or
-- All flat under the models directory.
-
-The settings panel lists **all** files under the models directory, and for each role (backbone weights, text encoder, VAE, vocab, merge table, tokenizer config, LoRA, etc.) you select one. That is: **the filesystem is the model directory**—put a file in, it appears; no need to maintain a built-in list, and no need to remember some format marker; the loader detects precision itself.
-
-Each chain's selections are independent of each other. LoRA is also a separate list per chain, stacked in order; image LoRA will never leak into the video chain.
-
-**4. Tool Settings**
-
-- Tool enable/disable switches.
-- Per-tool permissions (e.g., restricted to within working directory).
-- Per-tool output cap.
-- Tool subset available to subagents.
-- Sampling steps, sampler, scheduler name for each chain (leave empty to use that chain's own release defaults).
-
-### Daily Use
-
-- **Conversation**: just ask. The Agent will decide on its own whether to read files, run commands, search, or generate media.
-- **Abort midway**: stop at any time. The running stream is disconnected, the running command is killed (along with its entire process tree), the running subagent receives a cancellation signal.
-- **Insert supplement**: continue typing during generation; new content is merged into context before the next thinking step.
-- **Compress context**: when the conversation gets long, manually trigger compression; after compression all requests carry only the summary and subsequent content.
-- **Session management**: new, switch, rename, delete (to recycle bin). Empty sessions with no messages written are automatically discarded and do not accumulate on disk.
-- **Switch model / switch thinking intensity**: takes effect immediately and is written to the current session.
-
-### Environment Requirements
-
-- Windows 10 or higher.
-- WebView2 Runtime (preinstalled on most Windows 10/11).
-- Using media generation capabilities requires an NVIDIA GPU supporting CUDA; when CUDA is missing, media tools give a readable error, and other features are unaffected.
-- For media generation, it is recommended to place checkpoints in a models directory on a non-system drive—the engine stream-loads weights in blocks, and disk throughput directly affects the time per step.
+* **No CUDA SDK at build time.** Kernels are CUDA C++ string literals; NVRTC
+  (vendored `nvrtc64_*.dll`) compiles them for the detected GPU at runtime,
+  and the resulting cubins are cached under `data/media_shader_cache/`.
+* **No Python, no PyTorch, no ComfyUI at runtime.** Weights are read straight
+  from `.safetensors` files (memory-mapped, streamed to VRAM on demand).
+* **Any weight precision the checkpoint stores** is read verbatim:
+  `int8_tensorwise` (with the 256-wide convrot/Hadamard rotation),
+  `asym_w4a8_int8`, `w6a8_int8`, `convrot_w4a4`, `nvfp4`/`mxfp4`,
+  `fp8` (E4M3/E5M2), and dense `f16`/`bf16`/`f32`. GGUF is refused by name.
+* **One VRAM accountant.** Every resident byte is charged before it is
+  committed; a charge that would exceed the budget is refused, never silently
+  truncated. The ceiling is derived from the card and the driver's live budget.
+* **Host-side tiers.** Weights that do not fit in VRAM are held in pinned (or
+  plain) system memory and streamed, with a look-ahead prefetch slot; a
+  process-wide ledger decides which tensors are worth pinning.
 
 ---
 
-## 5. Design Trade-offs
+## Requirements
 
-- **No Python, no third-party runtime**. The entire inference engine uses only the system's built-in codec components and the CUDA driver interface. CUDA kernels are compiled at runtime with NVRTC (so no MSVC toolchain is needed), and compilation results are cached to disk.
-- **Disk is slow, so weights should not be read repeatedly**. Checkpoints are usually larger than memory, so the engine keeps "what can be resident resident, the rest stream-loaded," and caches repeatedly used weight blocks in host memory.
-- **VRAM is scarce, so the ledger must be honest**. All planning starts from "how much this machine can really give right now," not from a hardcoded constant. This is why the same binary can run on a 6 GB laptop GPU and a 48 GB workstation.
-- **Precision is decided by the file**. The engine does not decide for the user "which precision should be used"—as many exports as a model has, that many it can read; changing precision is changing a filename.
-- **Language is a session property**. All built-in strings (tool descriptions, parameter descriptions, error messages, explanatory lines in compressed output) follow the session language and are not hardcoded in code.
-- **Failures must be readable**. Almost every error message carries specific numbers: how much is needed, how much is missing, what the limit is, which file, which node. Rejecting a run is acceptable; silently producing wrong results is not.
+**Platform**
+
+* Windows 10 or newer, x64. The build targets the Win10 APIs
+  (`_WIN32_WINNT=0x0A00`) and links the Media Foundation, DXGI, DWM and
+  WebView2 surfaces.
+* The WebView2 Runtime (Evergreen) must be installed. It ships with Windows 11
+  and recent Windows 10 builds; otherwise install it from Microsoft.
+
+**GPU**
+
+* An NVIDIA GPU with a current driver (`nvcuda.dll` comes from the driver).
+* Compute capability 6.0 or better (`int8` `dp4a` path); the kernels are
+  compiled for exactly the `sm_<major><minor>` of the card present.
+* VRAM: the engine streams weights, so it runs on a 6 GB class card for the
+  image chain. The video chain's DiT alone is ~21 GB on disk — expect it to be
+  streamed per sampling step on anything below a workstation card. The video
+  model also benefits strongly from tensor cores (`sm_70+`).
+
+**Build host**
+
+* Nothing beyond the repository itself: GCC 16 (MinGW-w64, UCRT) mingw32-make,
+  windres and `rg.exe` all live under `vendor/`.
+* The makefile's recipes are POSIX (`mkdir -p`, `cp`, `rm -rf`), so run them
+  from Git Bash, MSYS2 or WSL. `./make.sh` is a thin wrapper that execs
+  `vendor/gcc/bin/mingw32-make.exe` with `TMPDIR` pointed at `C:\Temp`.
+
+**Disk**
+
+* The four model families together are ~80 GB as shipped. Each chain's files
+  are selected individually (see [Configuration](#configuration)), so you can
+  install only what you use.
+
+---
+
+## Repository layout
+
+```
+app/                the desktop shell: wWinMain, the Win32 window, WebView2
+                    bootstrap, the splash, the folder picker (`shell.cpp`)
+assets/             phi.ico
+bin/                build output: phi.exe + webview2loader.dll + nvrtc DLLs
+core/               the engine (18 groups, one level of nesting)
+  util/             base strings/paths/files, JSON, the rtk output compactor,
+                    utf8, i18n, shared media primitives
+  net/              loopback HTTP/1.1 + WebSocket server, WinHTTP client
+  llm/              provider clients (anthropic-messages, openai-completions),
+                    the model catalog
+  store/            settings.json, webui-configs.json, session .jsonl archive,
+                    skills/prompt-template scanning
+  agent/            the agent loop, sessions, subagents, system prompt,
+                    the context-token estimator
+  tools/            the built-in tools and the four media tools
+  ui/               the protocol server (the UI bridge) and theme resolution
+  graph/            the node-graph framework: sockets, registry, executor,
+                    plus the public workflow headers
+  nodes/            one file per node — the catalogue
+  workflows/        one file per ready-made chain (image/video/music/tts/audio)
+  runtime/          CUDA context & device, NVRTC compilation and the cubin
+                    cache, dispatch, scheduling, the VRAM budget
+  host/             safetensors reader, quantisation/dequantisation, the
+                    host-side tier ledger (pinned / look-ahead / page cache)
+  models/           the model forward passes (DiTs, VAEs, text encoders)
+  sampling/         samplers and sigma schedulers (ComfyUI-compatible)
+  io/               image (WIC), audio (Media Foundation), video (MF
+                    SourceReader) and the MP4 muxer
+  text/             BPE tokenizers and vision prep
+  bench/            the `--media-bench` acceptance instrument
+  kernels/          CUDA kernel sources (the only GPU-path code)
+ui/                 index.html, app.js, styles.css — the WebView2 front end
+data/               runtime state (settings, sessions, tokenizer files, caches)
+models/             the checkpoints, one directory per chain
+vendor/             gcc/ (MinGW-w64 toolchain + make + rg), cuda/ (nvrtc DLLs
+                    and headers), webview2/ (loader DLL and header)
+makefile            the whole build
+make.sh             POSIX-shell wrapper around the vendored make
+```
+
+Rough size: ~65 k lines of C++ in `core/`, ~8 k lines of JS/CSS/HTML in `ui/`,
+~0.5 k lines in `app/`.
+
+---
+
+## Build
+
+```bash
+./make.sh            # == vendor/gcc/bin/mingw32-make.exe all
+```
+
+From a POSIX shell at the repository root. The default goal links
+`bin/phi.exe` (GUI subsystem, `-municode -mwindows`, statically linked) and
+copies `webview2loader.dll` and the `nvrtc*` DLLs out of `vendor/` into
+`bin/`.
+
+Useful variants:
+
+```bash
+./make.sh OBJDIR=build/obj/w1     # isolate objects (two builds at once)
+./make.sh clean                   # remove build/ and bin/
+./make.sh -j8                     # parallel compile
+```
+
+Notes:
+
+* Objects mirror the source tree (`build/obj/core/io/image_io.o`), and
+  `-MMD -MP` dependency files are pulled back in, so editing a header rebuilds
+  every translation unit that includes it.
+* The build needs no CUDA SDK: `core/runtime/cuda_api.cpp` declares the
+  handful of runtime/NVRTC entry points itself and loads the DLLs dynamically.
+* `windres` compiles `app/phi.rc` (the icon) into the executable.
+
+---
+
+## Run
+
+```bash
+bin/phi.exe
+```
+
+The window appears immediately and paints a themed Φ splash while the WebView2
+runtime and the loopback protocol server start; the WebView takes over on its
+first frame. The server binds a random loopback port and the WebView navigates
+to it — the two halves never talk over the network.
+
+`phi.exe` is a GUI-subsystem binary. When invoked with a console subcommand
+(`--media-bench`, `--media-tool`) it attaches to the parent console (or
+allocates one) and streams plain text to stdout/stderr.
+
+On first start `data/` is created as needed (settings, sessions, WebView
+profile, shader cache).
+
+---
+
+## Configuration
+
+All state is JSON under `data/`.
+
+### `data/settings.json`
+
+```jsonc
+{
+  "hotkeys":   { "input.send": "Enter", "input.newline": "Shift+Enter",
+                 "session.new": "Ctrl+Alt+N", "input.focus": "Ctrl+I" },
+  "appearance":{ "theme": "mint", "radius": "none", "density": "compact", … },
+  "tools": {
+    "enabled":     { "bash": true, "read": true, …, "tts_speak": true },
+    "permissions": { "bash": "everywhere", "read": "everywhere", … },  // or "in-cwd"
+    "outputLimits":{ "bash": 120000, "read": 120000 },
+    "subagent":    { "tools": ["bash","read","write","edit"], "thinking": "…" },
+    "media": {
+      "image_dit": "qwen_image_2.1/qwen_image_2.1_int8_convrot.safetensors",
+      "image_te":  "qwen_image_2.1/qwen3vl_8b_int8_convrot.safetensors",
+      "image_vae": "qwen_image_2.1/qwen_image_2.1_vae_bf16.safetensors",
+      "video_dit": "minimax_h3/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors",
+      "video_te":  "minimax_h3/minimax_h3_qwen3vl_32b_convrot_int4.safetensors",
+      "video_vae": "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors",
+      "video_avae":"minimax_h3/minimax_h3_audio_vae_fp32.safetensors",
+      "music_dit": "ace_step_1.5/acestep_v1.5_xl_sft_bf16.safetensors",
+      "music_te":  "ace_step_1.5/qwen_0.6b_ace15.safetensors",
+      "music_lm":  "ace_step_1.5/qwen_4b_ace15.safetensors",
+      "music_vae": "ace_step_1.5/ace_1.5_vae.safetensors",
+      "tts_model": "breeze_tts_2/breeze_tts_2_bf16.safetensors",
+      "tts_codec": "breeze_tts_2/breeze_tts_2_audio_tokenizer.safetensors",
+      "image_steps": 25, "video_steps": 20, "music_steps": 50,
+      "image_sampler": "euler", "image_scheduler": "simple",
+      "video_sampler": "euler", "video_scheduler": "beta",
+      "music_sampler": "euler", "music_scheduler": "simple",
+      "image_loras": [], "image_lora_strengths": [1.0],
+      "video_loras": [], "video_lora_strengths": [1.0]
+    }
+  },
+  "defaultProvider": "…", "defaultModel": "…", "defaultThinkingLevel": "max",
+  "systemPromptLanguage": "zh"
+}
+```
+
+All of this is editable in **Settings** (API config · tool settings · hotkeys ·
+appearance · general · about); the file is the same data.
+
+### `data/models.json` and `data/webui-configs.json`
+
+Two places a provider can come from: `assets/models-catalog.json` (a shipped
+catalog of known providers, read-only) and `models.json` (providers you add).
+The UI's API-config page writes *profiles* to `webui-configs.json`:
+
+```json
+{
+  "active": "My Provider",
+  "profiles": [{
+    "name": "My Provider",
+    "model": "…", "baseUrl": "https://…/v1", "apiKey": "…",
+    "apiFormat": "openai-completions",      // or "anthropic-messages"
+    "subagent": { "model": "…", "baseUrl": "…", "apiKey": "…", "apiFormat": "…" },
+    "vision": "image",                       // "none" | "image" | "image_video"
+    "systemPromptLanguage": "zh"
+  }]
+}
+```
+
+`vision` decides whether the `read` tool may hand an image — or a whole
+video — to the model. A text-only model gets a plain refusal instead of
+content its endpoint would reject. Thinking levels are `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max` (mapped per provider).
+
+API keys are resolved in this order: an explicit profile key → `models.json`
+provider key → the catalog's embedded key → an environment variable.
+
+### Models
+
+Put checkpoints under `models/`, one directory per chain (a flat directory
+also works). The engine searches upward from `data/` and from the session's
+working directory for a `models/` folder that plausibly holds checkpoints.
+
+Tokenizer files live under `data/tokenizers/` and travel with the program
+rather than with the checkpoints: `qwen2.5/vocab.json`, `merges.txt`,
+`tokenizer_config.json` and `breeze_tts_2/tokenizer.json` by default, each
+individually overridable per chain.
+
+---
+
+## The agent
+
+* **Sessions** are one `.jsonl` file per session under
+  `data/sessions/<bucket>/`, where the bucket is derived from the working
+  directory. Each write is a whole-file rewrite to a temporary file followed by
+  an atomic rename, so a crash can never leave a half-written JSON line; the
+  replay self-heals leftovers from the old append-only format.
+* **Context compaction** summarizes older turns when the context window
+  fills. A token estimator (calibrated against the real BPE vocabulary) drives
+  the meter and the compaction report. `/compact` forces it.
+* **Subagents** (`agent` tool) run in the background on their own tool set and
+  thinking level, and report a summary back into the parent transcript.
+* **Skills** are `SKILL.md` files with YAML frontmatter, discovered in
+  `data/skills/` (global) and `<cwd>/data/skills/` (project).
+* **Prompt templates** are markdown files in `data/prompts/` and
+  `<cwd>/.phi/prompts/`; they appear in the `/` palette next to the built-ins
+  (`/copy`, `/session`, `/compact`).
+* **Attachments**: dropping a file into the composer base64-uploads it to
+  `data/uploads/` and references it by path — the session file stores the path,
+  not megabytes of base64.
+
+Default hotkeys: `Enter` send · `Shift+Enter` newline · `Ctrl+Alt+N` new
+session · `Ctrl+I` focus input — all four rebindable in Settings → Hotkeys.
+`Ctrl+Shift+C` (settings) and `Ctrl+B` (skills panel) are fixed.
+
+---
+
+## The media engine
+
+### Tools
+
+Each media tool is a thin surface over one graph. They share the process-wide
+engine (one CUDA context, one generation at a time) which is opened lazily on
+first use and reused afterwards.
+
+**`image_generate`** — Qwen-Image-2.1, PNG out.
+
+| Argument | Notes |
+| --- | --- |
+| `prompt` | English, 100–300 words (subject / environment / style / camera / mood / detail) |
+| `width`, `height` | 400–2000 px, each a multiple of 32 on the canvas, cropped back to the exact request |
+| `ref_images` | 0–9 absolute paths; with references the chain becomes a reference-latent edit |
+| `output` | absolute `.png` path |
+
+**`video_generate`** — MiniMax H3 ref2va, MP4 (H.264 + AAC) out.
+
+| Argument | Notes |
+| --- | --- |
+| `prompt` | English, 300–600 words: `<Subject N>` / `<Picture N>` / `<Audio N>` declarations, then shots (`[Shot N] At SS.s`), scene, music |
+| `duration_frames` | 5–362 frames at 24 fps (snapped to the legal `17k+5` temporal grid) |
+| `width`, `height` | 128–2048 px, even values (yuv420), aligned to 32 on the canvas |
+| `ref_images` | 0–9, in strict `<Picture N>` order |
+| `ref_audios` | 0–3, in strict `<Audio N>` order |
+| `output` | absolute `.mp4` path |
+
+**`music_generate`** — ACE-Step 1.5, 48 kHz WAV out.
+
+| Argument | Notes |
+| --- | --- |
+| `tags` | English style tags, comma separated |
+| `lyrics` | lines with `[verse]` / `[chorus]` markers; `[instrumental]` for none |
+| `duration` | seconds |
+| `bpm`, `language`, `keyscale`, `timesignature` | defaults 72 / `en` / `D minor` / `4` |
+| `output` | absolute `.wav` path |
+
+**`tts_speak`** — Breeze-TTS-2 voice design, 24 kHz WAV out. No reference clip:
+the voice comes from the `instruction` description.
+
+| Argument | Notes |
+| --- | --- |
+| `text` | the words to read aloud (Chinese or English; inline `[笑]` / `(sigh)` events) |
+| `instruction` | the timbre description (required) |
+| `output` | absolute `.wav` path |
+
+Seeds are drawn by the tool on every call and reported; you cannot pass one.
+
+### Sampling
+
+Steps come from tool settings (image 25, video 20, music 50 by default).
+
+Samplers: `euler`, `euler_ancestral`, `heun`, `dpmpp_2m`,
+`dpmpp_2s_ancestral`, `dpmpp_2m_sde`, `dpmpp_sde`, `res_multistep`,
+`lcm`.
+Schedulers: `simple`, `normal`, `sgm_uniform`, `karras`, `exponential`,
+`ddim_uniform`, `beta`, `linear_quadratic`, `kl_optimal`.
+
+Defaults reproduce the released workflows (image `euler`+`simple`, video
+`res_multistep`+`beta`, music `euler`+`simple`). The scheduler and
+sampler maths are ports of the ComfyUI implementations and are pinned by the
+host tests in the makefile.
+
+### Node catalogue
+
+`MediaModelLoader`, `MediaClipLoader`, `MediaVaeLoader`, `MediaLoraLoader`,
+`MediaQwenImageEditEncode`, `MediaH3Ref2VaEncode`, `MediaH3SigmaShift`,
+`MediaQwenImage21Cache`, `MediaEmptyLatent`, `MediaScheduler`,
+`MediaSampler`, `MediaVaeDecode`, `MediaVaeEncodeImage`, `MediaLoadImage`,
+`MediaSaveImage`, `MediaSaveAudio`, `MediaSaveVideo`, `MediaSeed`,
+`MediaConstInt`, `MediaAceTextEncode`, `MediaAceModelSampling`,
+`MediaBreezeTextEncode`, `MediaBreezeSampler`, `MediaBreezeDecode`.
+
+One node per *stage*, not per model: `MediaSampler` dispatches on the model's
+architecture, `MediaVaeDecode` on the VAE's role, `MediaEmptyLatent` on its
+own `arch` parameter.
+
+---
+
+## Command-line interface
+
+```bash
+phi.exe --media-bench [options]      # environment, VRAM budget, streaming
+                                     # throughput, int8 self-test, kernel
+                                     # benchmarks, optional real chain runs
+phi.exe --media-tool <name> …        # run one media tool exactly as the agent does
+```
+
+`--media-bench` options (a subset):
+
+```
+[--quick] [--verbose] [--json out.json] [--model path]...
+[--image] [--image-size WxH] [--image-prompt text] [--image-out out.png]
+[--image-seed N] [--image-ref path]... [--image-ref-area px2]
+[--image-negative text] [--image-cfg F]
+[--video] [--video-size WxH] [--video-frames N] [--video-prompt text]
+[--video-out out.mp4] [--video-seed N] [--video-steps N]
+[--video-ref path]... [--video-ref-clip path]... [--video-ref-clip-audio path]...
+[--video-ref-audio path]... [--video-ref-image-size match|max]
+[--video-lora path]... [--video-lora-strength F]...
+```
+
+It returns a non-zero exit code when a hard check fails, so it can gate CI.
+
+`--media-tool` accepts, after the tool name:
+
+* `schema` — print the tool's JSON schema (as a fully-capable model sees it);
+* `graph` — build the chain's graph and validate every node, port and link
+  against the registry, with no GPU and no checkpoint;
+* `resolve` — print which file every model role resolves to for the current
+  `settings.json`, and whether it exists;
+* a JSON argument object — run the tool for real (same `ToolDef::run`, same
+  `ToolContext`, no model in the loop).
+
+```bash
+phi.exe --media-tool image_generate "{\"prompt\":\"a red fox in tall grass\",\"width\":1024,\"height\":1024,\"output\":\"C:/out/fox.png\"}"
+phi.exe --media-tool video_generate schema
+phi.exe --media-tool resolve
+```
+
+---
+
+## Data directories
+
+| Path | Contents |
+| --- | --- |
+| `data/settings.json` | hotkeys, appearance, tool settings, media roles, defaults |
+| `data/models.json` | user-added providers and models |
+| `data/webui-configs.json` | API profiles written by the settings dialog |
+| `data/sessions/<bucket>/*.jsonl` | one self-contained session snapshot per file |
+| `data/skills/`, `data/prompts/` | global skills and prompt templates |
+| `data/tokenizers/` | BPE vocab/merges/config, plus Breeze-TTS-2's tokenizer.json |
+| `data/uploads/` | files attached in the composer |
+| `data/media_shader_cache/` | compiled cubins, keyed by source/entry/arch/NVRTC/include/fast-math |
+| `data/webview/` | the WebView2 user-data profile |
+
+`data/` is created on demand and is safe to delete except for the JSON files
+you want to keep.
+
+---
+
+## Diagnostics
+
+The engine is instrumented behind environment variables, all off by default
+(zero cost when unset). The ones worth knowing:
+
+| Variable | Effect |
+| --- | --- |
+| `PHI_TRACE` | timestamped startup/transport/session tracing to stderr |
+| `PHI_MEDIA_TRACE` | per-node timings for the graph that just ran |
+| `PHI_MEDIA_STATE` | what the process still holds at a generation's edges |
+| `PHI_VRAM_BUDGET_MB` | override the VRAM ceiling (bounded by the physical card) |
+| `PHI_VRAM_MARGIN_PERCENT` | override the budget margin (clamped to 50–100) |
+| `PHI_RING_MB` | pin the upload-ring size (to exercise the small-ring paths) |
+| `PHI_CUDA_BIN`, `PHI_CUDA_INCLUDE` | extra roots searched for NVRTC DLLs / headers |
+| `PHI_TOKENIZER_DIR` | override every tokenizer role at once |
+| `PHI_W4A8_CPU` | force the host decode path for grouped-scale weights (A/B) |
+| `PHI_PERF` | open the UI with `?perf=1` |
+| `PHI_IMG_STEPS`, `PHI_VIDEO_STEPS` | per-run step overrides for the bench |
+
+There are many more, all discovered by `grep getenv core/`; most are
+single-purpose experiment switches for kernel tuning.
+
+---
+
+## Tests
+
+The makefile defines host-side test goals that build console programs out of a
+handful of `core/` sources, using the same vendored toolchain:
+
+```bash
+./make.sh precision-test     # every weight family, per loader, vs a reference
+./make.sh sampling-test      # sampler/scheduler maths, no device needed
+./make.sh workflow-test      # tool settings → workflow → node plumbing
+./make.sh token-test         # context-token estimator vs the real BPE vocab
+```
+
+`grouped-decode-test` additionally needs `bin/phi.exe` and a GPU, because it
+compares the *device* decode of grouped-scale weights against the host decoder
+byte for byte.
+
+> Note: these goals reference sources under `tests/` (and
+> `tests/data/*.safetensors`), which are not part of this snapshot — the goals
+> are defined, the fixtures are not shipped here. Build them into your tree
+> before relying on them.
+
+---
+
+## Security notes
+
+* The UI bridge binds `127.0.0.1` only, and every request is checked against
+  the `Host` header, so a page on the web cannot drive the local server.
+* `bash` runs whatever the model asks it to. The per-tool permission scope
+  (`everywhere` vs `in-cwd`) and the enable switches in Settings → Tool
+  settings are the guard rails; set them deliberately.
+* API keys are stored in **plain text** in `data/models.json` and
+  `data/webui-configs.json`. Treat those files as secrets.
+* Sessions record tool arguments and outputs verbatim, including file contents
+  the agent read. The `data/sessions/` directory is as sensitive as the
+  working directories you point the agent at.
+
+---
+
+## License
+
+This source tree ships no `LICENSE` file. Until one is added, treat the code
+as the author's work: no redistribution or commercial use without permission.
+Third-party components under `vendor/` (MinGW-w64 GCC, CUDA NVRTC runtime and
+headers, the WebView2 loader, ripgrep) keep their own licenses.
