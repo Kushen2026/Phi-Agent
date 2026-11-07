@@ -43,10 +43,10 @@ ToolDef build_agent_tool() {
 	t.name = "agent";
 	t.description = "启动一个全新的子代理在后台运行，子代理的任务完成后会自动返回摘要";
 	t.description_en =
-	    "Launch a brand new subagent to run in the background, automatically returning a summary when the task is completed.";
+	    "Start a fresh subagent in the background; it returns a summary when the task is done.";
 	t.prompt_snippet = "把任务交给后台子代理并行处理";
 	t.prompt_snippet_en = "Delegate tasks to background subagents";
-	t.parameters_fn = [](const std::string& lang) {
+	t.parameters_fn = [](const std::string& lang, const ToolContext&) {
 		return schema_object({
 			{"description", schema_string(lang, "任务的简短描述（3-5 个词）", "A short description of the task (3-5 words)")},
 			{"prompt", schema_string(lang, "给子代理的任务", "The task for the subagent")},

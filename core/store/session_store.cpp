@@ -29,9 +29,22 @@ static std::string iso_stamp(int64_t ms) {
 	return out;
 }
 
-// ISO 串 -> 文件系统安全的主干（':' '.' 均替换为 '-'）。
+// 会话文件名的可读时间戳：本地时间 "YYYY-MM-DD-HH-MM-SS"。小时不补零，和界面
+// 上看到的一致。只给人看，不参与任何逻辑——会话 id 才是唯一标识。
+// 文件名里必须用 '-' 而不是 ':'：'/' 与 ':' 在 NTFS 上是非法字符，带冒号的
+// 时间戳会让文件根本写不出来（整个会话无法落盘）。显示名再把时分秒还原成 ':'。
 static std::string fs_safe_stamp(int64_t ms) {
-	return replace_all(replace_all(iso_stamp(ms), ":", "-"), ".", "-");
+	time_t secs = (time_t)(ms / 1000);
+	struct tm t;
+#ifdef _WIN32
+	localtime_s(&t, &secs);
+#else
+	localtime_r(&secs, &t);
+#endif
+	char buf[48];
+	snprintf(buf, sizeof(buf), "%04d-%02d-%02d-%d-%02d-%02d",
+		 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+	return std::string(buf);
 }
 
 // ── 桶路径 ──────────────────────────────────────────────────────────────────
@@ -58,11 +71,50 @@ std::string SessionArchive::bucket_dir() const {
 // "<fs-safe ISO 时间>_<会话id>.jsonl"。会话 id 是唯一权威标识：定位、去重、
 // 打开都只认它。文件名里的时间戳仅用于人类浏览，不参与任何逻辑。
 
+// 文件名 -> 给人看的会话名。默认会话的文件名是 "<YYYY-MM-DD-H-MM-SS>_<uuid>.jsonl"，
+// 显示名取时间戳那一半，并把时间部分的 '-' 还原成 ':'（文件名不能用冒号，
+// 界面上看起来应该是 2026-11-07-9:23:40）。命名过的会话另有 title 条目，不走这里。
+std::string session_file_display_name(const std::string& file) {
+	std::string stem = path_basename(file);
+	if (ends_with(stem, ".jsonl")) stem = stem.substr(0, stem.size() - 6);
+	size_t cut = stem.find('_');
+	if (cut == std::string::npos) return stem;
+	const std::string stamp = stem.substr(0, cut);
+	// 只认 "YYYY-MM-DD-H-MM-SS" 这个形状（日期一段 + 时/分/秒三段），避免把
+	// 用户自己起的名字里的 '-' 也改掉。
+	if (stamp.size() < 16 || stamp[4] != '-' || stamp[7] != '-' || stamp[10] != '-')
+		return stamp;
+	const size_t h = 11;                       // "YYYY-MM-DD-H" 之后
+	const size_t c1 = stamp.find('-', h);
+	if (c1 == std::string::npos) return stamp;
+	const size_t c2 = stamp.find('-', c1 + 1);
+	if (c2 == std::string::npos) return stamp;
+	// "2026-11-07-9-23-40" -> "2026-11-07-9:23:40"
+	return stamp.substr(0, c1) + ":" + stamp.substr(c1 + 1, c2 - c1 - 1) + ":" +
+	       stamp.substr(c2 + 1);
+}
+
 static std::string session_id_from_name(const std::string& name) {
 	std::string stem = name;
 	if (ends_with(stem, ".jsonl")) stem = stem.substr(0, stem.size() - 6);
 	size_t cut = stem.find('_');
 	return cut == std::string::npos ? stem : stem.substr(cut + 1);
+}
+
+// 数一个会话文件里已经落盘的消息条数（只看 type 字段，不回放消息正文）。
+// attach() 用它把 last_synced_size_ 对齐到文件的真实状态。
+static size_t count_message_entries(const std::string& file) {
+	auto raw = read_file(file);
+	if (!raw) return 0;
+	size_t n = 0;
+	for (const auto& line : split(*raw, '\n')) {
+		std::string t = trim(line);
+		if (t.empty()) continue;
+		if (t.find("\"type\": \"message\"") != std::string::npos ||
+		    t.find("\"type\":\"message\"") != std::string::npos)
+			n++;
+	}
+	return n;
 }
 
 // ── 生命周期 ────────────────────────────────────────────────────────────────
@@ -83,8 +135,14 @@ void SessionArchive::attach(const std::string& file) {
 	file_ = file;
 	id_ = session_id_from_name(path_basename(file));
 	created_fresh_ = false;
-	dirty_ = true;              // 元数据未知，待回放方通过 set_* 补全
-	last_synced_size_ = 0;
+	// 不置 dirty：仅仅打开一个会话不该改写磁盘上的文件，否则「最近修改」时间
+	// 会被打开动作本身刷成「刚刚」，即使一个字都没输入。回放方随后用 set_title /
+	// set_model / set_thinking 回填元数据，只有值真的与文件不同时才置 dirty。
+	dirty_ = false;
+	// 「已同步的消息条数」取文件里现有的条数，而不是 0：sync() 用它判断历史是否
+	// 增长过。置 0 会让第一次 sync 误以为「从 0 条变成 N 条」，于是立刻重写整个
+	// 文件——正是「打开就变刚刚」的根因。这里只数行，不回放消息。
+	last_synced_size_ = count_message_entries(file);
 }
 
 void SessionArchive::detach() {
@@ -172,9 +230,17 @@ void SessionArchive::write_header_locked() {
 	}
 }
 
+void SessionArchive::mark_clean() {
+	std::lock_guard<std::mutex> lock(write_mutex_);
+	dirty_ = false;
+}
+
 void SessionArchive::sync(const std::vector<AgentMessage>& messages) {
 	std::lock_guard<std::mutex> lock(write_mutex_);
 	if (file_.empty()) return;
+	// 只有「消息条数变了」或「元数据被显式改过」才考虑落盘。打开一个旧会话
+	// 什么都不输入时，这两个条件都不成立，因此不会碰磁盘、也不会刷新
+	// 「最近修改」时间。
 	if (!dirty_ && messages.size() == last_synced_size_) return;
 	if (messages.empty()) return;  // 没有历史就不落盘（新会话只有头部）
 
@@ -217,6 +283,16 @@ void SessionArchive::sync(const std::vector<AgentMessage>& messages) {
 		JsonValue e = JsonValue::object();
 		e["message"] = message_to_json(m);
 		push_entry("message", std::move(e));
+	}
+
+	// 内容没变就不写：每次 sync 都会重新盖一个 timestamp，直接写下去会把
+	// 「最近修改」时间刷成现在，哪怕这次调用没有任何实际变化（典型场景：
+	// 打开一个旧会话，apply_profile_after_start() 重新应用配置时触发一次
+	// sync）。只比较内容而不比较时间戳，正是为了让这种无变化的调用不留痕迹。
+	if (auto raw = read_file(file_); raw && *raw == content) {
+		dirty_ = false;
+		last_synced_size_ = messages.size();
+		return;
 	}
 
 	// 原子替换：写临时文件 + rename。崩溃后磁盘上要么是旧完整内容，要么是
@@ -277,11 +353,11 @@ void SessionArchive::sync(const std::vector<AgentMessage>& messages) {
 	out.reserve(by_id.size());
 	for (auto& [id, s] : by_id) {
 		if (s.title.empty()) {
-			// No title found in file: derive from filename
-			s.title = path_basename(s.file_path);
-			if (ends_with(s.title, ".jsonl")) s.title = s.title.substr(0, s.title.size() - 6);
-			size_t cut = s.title.find('_');
-			s.title = cut == std::string::npos ? s.title : s.title.substr(cut + 1);
+			// 没有命名：显示文件名里的时间戳部分（"YYYY-MM-DD-H:MM:SS"），
+			// 也就是列表上「这个会话是什么时候开的」。文件名同样是
+			// "<时间戳>_<uuid>.jsonl"，所以这里取 _ 之前的一半，
+			// 而不是之前那样把 uuid 当标题（一串 8c14f6cf 对谁都没有意义）。
+			s.title = session_file_display_name(s.file_path);
 		}
 		out.push_back(std::move(s));
 	}
@@ -444,7 +520,7 @@ SessionContent SessionArchive::replay(const std::string& file) {
 
 // ── 消息编解码 ──────────────────────────────────────────────────────────────
 
-JsonValue message_to_json(const AgentMessage& m) {
+JsonValue message_to_json(const AgentMessage& m, bool inline_media) {
 	JsonValue j = JsonValue::object();
 	j["role"] = m.role;
 	JsonValue content = JsonValue::array();
@@ -477,8 +553,15 @@ JsonValue message_to_json(const AgentMessage& m) {
 			case ContentPart::Type::Image: {
 				JsonValue p = JsonValue::object();
 				p["type"] = "image";
-				p["data"] = part.image_data;
 				p["mimeType"] = part.image_mime;
+				// 落盘只写路径：一个几 MB 的图片或视频整段 base64 进 jsonl，会话文件
+				// 会大出一个数量级，而文件本来就一直在磁盘上。重放时按路径读回同样
+				// 的字节（文件没了就只是少这一张图，历史文本仍然完整）。界面快照
+				// （inline_media）则要 base64——聊天窗口得把图片直接画出来。
+				if (!part.source_path.empty()) p["path"] = part.source_path;
+				if (inline_media || part.source_path.empty() || !path_exists(part.source_path)) {
+					p["data"] = part.image_data;
+				}
 				content.push_back(std::move(p));
 				break;
 			}
@@ -540,7 +623,19 @@ AgentMessage message_from_json(const JsonValue& j) {
 			m.content.push_back(
 				ContentPart::tool_call(part["id"].as_string(""), part["name"].as_string("tool"), part["arguments"]));
 		} else if (type == "image") {
-			m.content.push_back(ContentPart::image(part["data"].as_string(""), part["mimeType"].as_string("image/png")));
+			ContentPart p = ContentPart::image(part["data"].as_string(""), part["mimeType"].as_string("image/png"));
+			// 落盘时只留了路径（见 message_to_json）：把文件读回来，恢复成当时发送的
+			// 那一段字节。文件被删/被换掉时这张图就取不到了——历史里的文字与工具
+			// 输出仍然完整，模型只是少了那张图。
+			std::string src = part["path"].as_string("");
+			if (!src.empty()) {
+				std::vector<uint8_t> raw;
+				if (p.image_data.empty() && read_file_bytes(src, raw) && !raw.empty()) {
+					p.image_data = base64_encode_bytes(raw);
+					p.source_path = src;
+				}
+			}
+			m.content.push_back(std::move(p));
 		}
 	}
 	if (m.role == "assistant") {

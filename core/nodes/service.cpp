@@ -83,7 +83,9 @@ GpuCtx* graph_gpu(GraphContext& ctx) {
 // phase's residency plan reads the card this process really has. It is called at
 // the end of each node that streamed through them (text encode, a sampler, a VAE
 // decode) - never inside a sampling loop, where the chunks are deliberately kept
-// so the loop's accounting stabilises.
+// so the loop's accounting stabilises. (Handing the whole generation back - the
+// loaded modules, the compiled kernels and the host-side caches - is
+// `release_generation_state` in tools_media.cpp, which runs once per tool call.)
 void release_shared_arenas(GpuCtx* g) {
 	if (!g) return;
 	if (g->wa) g->wa->release_chunks();
@@ -140,7 +142,9 @@ TokenizerFiles tokenizer_files_of(GraphContext& ctx, const std::string& arch,
 	// name is looked up under the models directory.
 	auto pick = [&](const char* role, const std::string& given) -> std::string {
 		if (!given.empty()) return path_normalize(resolve_user_path(ctx, given));
-		const std::string v = resolve_media_role(JsonValue::object(), role, ctx.models_dir);
+		// ctx.agent_dir carries the built-in vocabulary (<data>/tokenizers/qwen2.5):
+		// the tokenizer files ship with the app, not with any one model.
+		const std::string v = resolve_media_role(JsonValue::object(), role, ctx.models_dir, ctx.agent_dir);
 		return v.empty() ? std::string() : path_normalize(v);
 	};
 	TokenizerFiles f;

@@ -192,8 +192,14 @@ bool send_all(SOCKET s, const char* data, size_t len, std::string& err,
 	size_t off = 0;
 	while (off < len) {
 		// honor abort during large uploads (a big context body can take many
-		// SO_SNDTIMEO windows to drain into a slow peer); poll between sends
-		if (cancelled && (*cancelled)()) {
+		// SO_SNDTIMEO windows to drain into a slow peer); poll between sends.
+		// NOTE: callers pass &cancelled even when the user supplied no callback,
+		// so the POINTER is non-null while the std::function inside it is EMPTY.
+		// Invoking an empty std::function throws std::bad_function_call — that
+		// throw escaped the plain-HTTP request path (no catch around the handler
+		// on the client thread) and killed the process. Hence the extra
+		// emptiness check before the call.
+		if (cancelled && *cancelled && (*cancelled)()) {
 			err = "cancelled";
 			return false;
 		}
@@ -729,7 +735,10 @@ HttpStreamResult http_request_impl(
 	auto process_body = [&](const char* data, size_t len) {
 		chunker.feed(data, len, [&](const char* p, size_t n) {
 			if (stop_requested) return;
-			if (!on_chunk) {
+			// pointer emptiness AND the std::function inside it: a caller may hand
+			// us an empty function, and calling that throws instead of taking the
+			// accumulate-the-body path below
+			if (!on_chunk || !*on_chunk) {
 				result.body.append(p, n);
 				return;
 			}

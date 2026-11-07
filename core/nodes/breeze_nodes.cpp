@@ -20,18 +20,24 @@ namespace phi::media {
 
 namespace {
 
+// The node parameters, with the *released* Voice-Design node's own defaults
+// (nodes.py's `_generation_controls`) so a hand-wired graph that names no
+// sampling values behaves like the official workflow: backbone 0.9 / 50 / 1.0
+// with a 1.1 repetition penalty, depth decoder 0.9 / 50 / 1.0, cfg 4 for voice
+// design. They are read from the node's params one by one, so a graph that sets
+// only some of them keeps the reference's value for the rest.
 BreezeParams read_params(const JsonValue& p) {
 	BreezeParams bp;
 	bp.text = param_string(p, "text", "");
 	bp.instruction = param_string(p, "instruction", "");
 	bp.cfg_scale = (float)param_number(p, "cfg_scale", 4.0);
 	bp.max_new_tokens = param_int(p, "max_new_tokens", 0);
-	bp.temperature = (float)param_number(p, "temperature", 0.7);
-	bp.top_k = param_int(p, "top_k", 0);
+	bp.temperature = (float)param_number(p, "temperature", 0.9);
+	bp.top_k = param_int(p, "top_k", 50);
 	bp.top_p = (float)param_number(p, "top_p", 1.0);
-	bp.repetition_penalty = (float)param_number(p, "repetition_penalty", 1.0);
-	bp.depth_temperature = (float)param_number(p, "depth_temperature", 1.0);
-	bp.depth_top_k = param_int(p, "depth_top_k", 0);
+	bp.repetition_penalty = (float)param_number(p, "repetition_penalty", 1.1);
+	bp.depth_temperature = (float)param_number(p, "depth_temperature", 0.9);
+	bp.depth_top_k = param_int(p, "depth_top_k", 50);
 	bp.depth_top_p = (float)param_number(p, "depth_top_p", 1.0);
 	return bp;
 }
@@ -58,9 +64,10 @@ void register_breeze_text_encode(NodeRegistry& reg) {
 	n.outputs = {port("CONDITIONING", SocketType::Conditioning, false, "the prompt")};
 	{
 		JsonValue p = JsonValue::object();
-		p["text"] = "the words to speak";
-		p["instruction"] = "the timbre / style description";
+		p["text"] = "the words to speak (this is the part that is read aloud)";
+		p["instruction"] = "the timbre / style description (never spoken)";
 		p["cfg_scale"] = "classifier-free guidance (4 for voice design)";
+		p["max_new_tokens"] = "frame budget in the sampler's unit (0 = the text length decides)";
 		n.params = p;
 	}
 	n.run = [](GraphContext&, const JsonValue& p, const std::vector<Value>& in) {
@@ -68,6 +75,8 @@ void register_breeze_text_encode(NodeRegistry& reg) {
 		auto tts = breeze_of(model, "BreezeTextEncode");
 		const BreezeParams bp = read_params(p);
 		if (bp.text.empty()) throw MediaError("BreezeTextEncode: text must not be empty");
+		if (bp.instruction.empty())
+			throw MediaError("BreezeTextEncode: instruction (the voice description) must not be empty");
 		auto pr = tts->prepare(bp);
 		auto out = std::make_shared<ConditioningData>();
 		out->arch = "tts";
@@ -91,13 +100,13 @@ void register_breeze_sampler(NodeRegistry& reg) {
 	n.outputs = {port("LATENT", SocketType::Latent, false, "the acoustic codes")};
 	{
 		JsonValue p = JsonValue::object();
-		p["max_new_tokens"] = "cap on generated frames (0 = the model's own 1500, subject to EOS)";
-		p["temperature"] = "backbone sampling temperature";
-		p["top_k"] = "backbone top-k (0 = off)";
+		p["max_new_tokens"] = "cap on generated frames (0 = the prompt's text-derived budget) - a cap, never a raise";
+		p["temperature"] = "backbone sampling temperature (0.9 is the released node's)";
+		p["top_k"] = "backbone top-k (50 is the released node's; 0 = off)";
 		p["top_p"] = "backbone nucleus threshold";
-		p["repetition_penalty"] = "backbone repetition penalty";
-		p["depth_temperature"] = "depth-decoder temperature";
-		p["depth_top_k"] = "depth-decoder top-k (0 = off)";
+		p["repetition_penalty"] = "backbone repetition penalty (1.1 is the released node's)";
+		p["depth_temperature"] = "depth-decoder temperature (0.9 is the released node's)";
+		p["depth_top_k"] = "depth-decoder top-k (50 is the released node's; 0 = off)";
 		p["depth_top_p"] = "depth-decoder nucleus threshold";
 		p["seed"] = "the sampling seed, used as given (leave the field out to draw one)";
 		n.params = p;

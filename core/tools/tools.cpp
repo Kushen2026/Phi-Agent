@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <regex>
 #include <string>
@@ -25,7 +26,7 @@ namespace {
 // (see build_tools_json).
 ToolDef make_tool(const char* name, const char* description, const char* description_en,
 	const char* snippet, const char* snippet_en,
-	std::function<JsonValue(const std::string& language)> parameters_fn,
+	std::function<JsonValue(const std::string& language, const ToolContext& ctx)> parameters_fn,
 	std::function<ToolResult(const JsonValue&, ToolContext&)> run) {
 	ToolDef t;
 	t.name = name;
@@ -43,11 +44,11 @@ ToolDef make_tool(const char* name, const char* description, const char* descrip
 ToolDef bash_tool() {
 	return make_tool(
 		"bash",
-		"执行 shell 命令并查看输出。通过真实 shell 运行（支持管道、&&、重定向和 Unix coreutils。输出会自动压缩（去除 ANSI 代码、精简 git/构建输出、硬截断）。文件操作请优先使用专用工具（read/edit/write/ls/grep）。",
-		"Execute a shell command and see its output. Runs through a real shell (pipes, &&, redirects and Unix coreutils work). Output is automatically compacted (ANSI stripped, git/build output condensed, hard truncation). Prefer dedicated tools (read/edit/write/ls/grep) for file work.",
+		"执行 shell 命令并查看输出。文件操作请优先使用专用工具。",
+		"Run a shell command and see its output. Prefer the dedicated file tools for file operations.",
 		"执行 shell 命令，实时输出",
 		"Run a shell command and stream its output",
-		[](const std::string& lang) {
+		[](const std::string& lang, const ToolContext&) {
 			return schema_object({
 				{"command", schema_string(lang, "要运行的 shell 命令", "The shell command to run")},
 				{"timeout", schema_number(lang, "超时时间（毫秒）", "Timeout in milliseconds")},
@@ -117,16 +118,30 @@ bool image_mime_for_path(const std::string& path, std::string& mime) {
 
 // ── video frames ───────────────────────────────────────────────────────────
 
-// Extension -> "this is a video container", for the frame read path. mp4 is the
-// format the tool is documented for; the others share the same MF reader and
-// cost nothing to accept (a container whose decoder is missing fails open() and
-// is reported as such).
+// Extension -> "this is a video container". mp4 is the format the tool is
+// documented for; the others share the same MF reader and cost nothing to
+// accept (a container whose decoder is missing fails open() and is reported as
+// such).
 bool video_ext_for_path(const std::string& path) {
 	size_t dot = path.find_last_of('.');
 	if (dot == std::string::npos) return false;
 	const std::string ext = to_lower(path.substr(dot));
 	return ext == ".mp4" || ext == ".m4v" || ext == ".mov" || ext == ".mkv" ||
 	       ext == ".webm" || ext == ".avi";
+}
+
+// The container the model is actually handed when a video is sent whole: the
+// video block's media type is one of these, and a jpeg still is what a frame
+// read produces instead.
+std::string video_mime_for_path(const std::string& path) {
+	size_t dot = path.find_last_of('.');
+	const std::string ext = dot == std::string::npos ? std::string() : to_lower(path.substr(dot));
+	if (ext == ".m4v" || ext == ".mov") return "video/mp4";
+	if (ext == ".webm") return "video/webm";
+	if (ext == ".avi") return "video/x-msvideo";
+	// .mkv and .mp4 both travel as mp4: every real Matroska read here is an
+	// H.264/AAC file, and "video/x-matroska" is a type no provider accepts
+	return "video/mp4";
 }
 
 // `frames` arrives either as a JSON array of numbers (the schema's shape) or as
@@ -256,6 +271,8 @@ ToolResult read_video_result(const std::vector<int64_t>& frames, const std::stri
 		// model would take it for the frame it asked for.
 		if (past_end)
 			sent += past_end_note + tr(lang, "，取到末帧", " — the last frame was taken");
+		// 帧是从视频文件里解码出来的，磁盘上没有对应的独立图片；这里不写
+		// source_path，整段视频本身也没有内联进来，所以会话文件里只有文字报告。
 		images.push_back(std::move(f.image.part));
 	}
 
@@ -281,22 +298,88 @@ ToolResult read_video_result(const std::vector<int64_t>& frames, const std::stri
 	return r;
 }
 
+// ── whole videos ───────────────────────────────────────────────────────────
+
+// 「图片和视频」档位下读一个视频：整段文件交给模型，而不是抽帧。体积上限就是
+// 设置 → 工具设置里 read 的截断限制——一段视频会随之后每一轮请求重新发送，没有
+// 上限的一次读取能把整个会话撑爆。超过上限时回落到抽帧（帧号按长度均分），所以
+// 仍然能知道视频里有什么。
+constexpr int kWholeVideoFallbackFrames = 4;
+
+// base64 之后的大小约是原始字节的 4/3；这里按原始字节判断，把文本与 JSON 的余量
+// 一起留在上限之内。
+int64_t whole_video_max_bytes(const ToolContext& ctx) {
+	return (int64_t)tool_output_limit(ctx, 120000);
+}
+
+// The whole-file result: one text part saying what the model is looking at, then
+// one video content part. `fell_back` is set when the file was too large and the
+// caller should decode frames instead — the function never returns a half-sent
+// video (a model handed a 200 MB block would fail the request outright).
+ToolResult read_whole_video_result(const std::string& abs, int64_t max_bytes, ToolContext& ctx,
+	bool& fell_back) {
+	const std::string& lang = ctx.language;
+	fell_back = false;
+	const int64_t size = tool_file_size(abs);
+	const std::string display = tool_display_path(ctx.cwd, abs);
+
+	// 上限是 0（不限）时也读不了整段：一段 200 MB 的视频进请求体，provider 直接
+	// 拒掉整个请求，那不是「读到了视频」，而是把这一轮对话弄坏。所以体积不可知或
+	// 超限一律回落到抽帧。
+	if (size <= 0 || (max_bytes > 0 && size > max_bytes)) {
+		fell_back = true;
+		return ToolResult();  // the caller decodes frames instead
+	}
+
+	std::vector<uint8_t> raw;
+	if (!read_file_bytes(abs, raw) || raw.empty()) {
+		return error_result(tr(lang, "无法读取视频: ", "cannot read video: ") + abs);
+	}
+
+	// 容器名与实际内容不符时（把 mkv 改名成 mp4、或者干脆不是视频）仍按扩展名的
+	// 类型送出去：provider 会按 media_type 解码，猜错时错误信息比这里编一个更准确。
+	const std::string mime = video_mime_for_path(abs);
+	const std::string info = mime + ", " + tool_human_size((int64_t)raw.size());
+
+	ToolResult r;
+	r.content.push_back(ContentPart::text_part(tr(lang,
+		"视频: " + display + "（" + info + "）\n已把整段视频作为多模态视频内容提供给模型。",
+		"Video: " + display + " (" + info + ")\n"
+		"the whole video was sent to the model as multimodal video content.")));
+	// 视频只有一种内容块：整段文件（base64），media_type 是容器类型。放在
+	// ContentPart::Image 里是因为那条通道（provider 两条线 + 会话存档）已经能
+	// 携带任意 media_type 的二进制内容；video 只是它的另一种 mime。
+	// source_path 让会话文件只写路径：整段 mp4 的 base64 是几十 MB 的量级，
+	// 每一轮 sync 都把它重写进 jsonl 是不可接受的。
+	ContentPart part = ContentPart::image(base64_encode_bytes(raw), mime);
+	part.source_path = abs;
+	r.content.push_back(std::move(part));
+	return r;
+}
+
 ToolDef read_tool() {
-	return make_tool(
+	ToolDef t = make_tool(
 		"read",
-		"读取文本文件并显示行号，支持 offset/limit 读取大文件。也可读取 jpg jpeg png 图片与 mp4 视频的若干帧：图片和视频帧都会重新编码为 jpeg，再作为多模态内容提供给模型。读视频时用 frames 指定要看的帧号（从 1 开始，最多 4 帧）。请勿读取超出所需的内容。",
-		"Read a text file with line numbers (offset/limit for large files). Also reads jpg / jpeg / png images and frames of an mp4 video: images and video frames are re-encoded as jpeg and sent to the model as multimodal content. For a video, pass `frames` with the 1-based frame numbers to look at (at most 4). Do not read more than needed",
-		"读取文件、图片或视频帧",
-		"Read a file, an image, or video frames",
-		[](const std::string& lang) {
-			return schema_object({
-				{"path", schema_string(lang, "文件路径（绝对路径，或相对于工作目录）", "File path (absolute, or relative to the working directory)")},
+		// 说明随模型的多模态能力变化：只有真能收到图片/视频的模型才被告知可以读
+		// 它们，否则模型会去调一个注定被拒的工具
+		"读取文件",
+		"Read a file",
+		"读取文件",
+		"Read a file",
+		[](const std::string& lang, const ToolContext& ctx) {
+			std::vector<std::pair<std::string, JsonValue>> props{
+				{"path", schema_string(lang, "文件路径", "File path")},
 				{"offset", schema_number(lang, "起始行号（从 1 开始）", "First line to read (1-based)")},
 				{"limit", schema_number(lang, "最多返回的行数", "Maximum number of lines to return")},
-				{"frames", schema_array(lang, schema_number(lang, "帧号", "frame number"),
-					"读取视频时要看的帧号（从 1 开始，最多 4 帧；仅视频路径使用）",
-					"Frame numbers to read from a video (1-based, at most 4; video paths only)")},
-			}, {"path"});
+			};
+			// frames 只对「能看视频」的模型有意义：模型连图片都收不到时还摆一个帧号
+			// 参数，就是在教它调一个注定被拒的工具
+			if (ctx.can_read_videos) {
+				props.push_back({"frames", schema_array(lang, schema_number(lang, "帧号", "frame number"),
+					"读取视频时要看的帧号（从 1 开始，最多 4 帧；整段视频超过体积上限时用它指定抽帧）",
+					"Frame numbers to read from a video (1-based, at most 4; used when the whole video is past the size cap)")});
+			}
+			return schema_object(std::move(props), {"path"});
 		},
 		[](const JsonValue& args, ToolContext& ctx) -> ToolResult {
 			std::string path = arg_string(args, "path");
@@ -319,6 +402,13 @@ ToolDef read_tool() {
 			// trying to read it as text (which would only fail the binary check)
 			std::string image_mime;
 			if (image_mime_for_path(abs, image_mime)) {
+				// 无多模态档位：模型收不到图片（provider 会拒掉整个请求），所以直接说
+				// 清楚为什么读不了，而不是给一段二进制文件的报错
+				if (!ctx.can_read_images) {
+					return error_result(tr(ctx.language,
+						"当前模型没有多模态能力，无法读取图片（可在 设置 → API 配置 → 多模态 中调整）: ",
+						"the current model has no multimodal capability, so images cannot be read (see Settings → API config → Multimodal): ") + tool_display_path(ctx.cwd, abs));
+				}
 				std::vector<uint8_t> raw;
 				if (!read_file_bytes(abs, raw)) {
 					return error_result(tr(ctx.language, "无法读取图片: ", "cannot read image: ") + abs);
@@ -333,6 +423,9 @@ ToolDef read_tool() {
 				// picture was compressed is what stops the model from reading the same
 				// file over and over looking for the "full" version.
 				ModelImage img = tool_model_image(raw, image_mime);
+				// 会话文件里只记这个路径（见 session_store.cpp message_to_json），
+				// 不记整段 base64：重放时按路径把同一份文件读回来
+				img.part.source_path = abs;
 				const std::string info = img.mime + ", " + tool_human_size(img.bytes);
 				const std::string tail = img.recompressed
 					? tr(ctx.language,
@@ -350,9 +443,51 @@ ToolDef read_tool() {
 				return r;
 			}
 
-			// videos: decode the requested frames and hand them back as jpeg images,
-			// the same way the still path above does for a picture
+			// videos: 「图片和视频」档位把整段文件交给模型；没有这个能力时明确拒绝，
+			// 有图片能力时回落到抽帧（帧号均分），否则只有抽帧这一条路
 			if (video_ext_for_path(abs)) {
+				if (ctx.can_read_videos) {
+					bool too_large = false;
+					ToolResult whole = read_whole_video_result(abs, whole_video_max_bytes(ctx), ctx, too_large);
+					if (!too_large) return whole;
+					// 超过体积上限：抽帧回退。调用方给了帧号就用它，没给就按视频长度
+					// 均分取 kWholeVideoFallbackFrames 帧，这样一次「读这个视频」仍然
+					// 能看到整段内容的大意。
+					std::vector<int64_t> frames = parse_frame_args(args);
+					if (frames.empty()) {
+						VideoProbe probe;
+						try {
+							probe = tool_read_video_frames(abs, {});
+						} catch (const std::exception& e) {
+							return error_result(tr(ctx.language, "无法读取视频: ", "cannot read video: ") +
+								tool_display_path(ctx.cwd, abs) + " — " + e.what());
+						}
+						const int64_t count = probe.frame_count > 0 ? probe.frame_count : 1;
+						const int n = kWholeVideoFallbackFrames;
+						for (int i = 0; i < n; i++) {
+							int64_t f = count <= (int64_t)n ? (int64_t)i + 1
+								: (int64_t)std::llround((double)i * (double)(count - 1) / (double)(n - 1)) + 1;
+							if (f < 1) f = 1;
+							if (f > count) f = count;
+							if (std::find(frames.begin(), frames.end(), f) == frames.end()) frames.push_back(f);
+						}
+					}
+					ToolResult r = read_video_result(frames, abs, ctx);
+					// 回退原因写在结果最前面：否则模型会以为整段视频已经送到眼前，
+					// 只是「只有 4 帧」而已
+					if (!r.is_error && r.content.size() > 0 && r.content[0].type == ContentPart::Type::Text) {
+						r.content[0].text = tr(ctx.language,
+							"（视频超过读取上限 " + tool_human_size(whole_video_max_bytes(ctx)) + "，改为抽取以下帧）\n",
+							"(the video is past the read cap of " + tool_human_size(whole_video_max_bytes(ctx)) +
+								", so the following frames were decoded instead)\n") + r.content[0].text;
+					}
+					return r;
+				}
+				if (!ctx.can_read_images) {
+					return error_result(tr(ctx.language,
+						"当前模型没有多模态能力，无法读取视频（可在 设置 → API 配置 → 多模态 中调整）: ",
+						"the current model has no multimodal capability, so videos cannot be read (see Settings → API config → Multimodal): ") + tool_display_path(ctx.cwd, abs));
+				}
 				return read_video_result(parse_frame_args(args), abs, ctx);
 			}
 
@@ -407,6 +542,30 @@ ToolDef read_tool() {
 			}
 			return text_result(tool_truncate_middle(out, tool_output_limit(ctx, 120000), ctx.language));
 		});
+
+	// 说明与系统提示词里的那一行都按能力给：无多模态只说能读文件，图片档位加上
+	// 图片，视频档位再加上视频
+	t.description_fn = [](const std::string& lang, const ToolContext& ctx) -> std::string {
+		if (lang_is_zh(lang)) {
+			if (ctx.can_read_videos) return "读取文本文件并显示行号。也可读取 png jpg jpeg 图片与 mp4 视频";
+			if (ctx.can_read_images) return "读取文本文件并显示行号。也可读取 png jpg jpeg 图片";
+			return "读取文本文件并显示行号";
+		}
+		if (ctx.can_read_videos) return "Read a text file with line numbers. Also reads png/jpg/jpeg images and mp4 videos.";
+		if (ctx.can_read_images) return "Read a text file with line numbers. Also reads png/jpg/jpeg images.";
+		return "Read a text file with line numbers.";
+	};
+	t.snippet_fn = [](const std::string& lang, const ToolContext& ctx) -> std::string {
+		if (lang_is_zh(lang)) {
+			if (ctx.can_read_videos) return "读取文件、图片或视频";
+			if (ctx.can_read_images) return "读取文件或图片";
+			return "读取文件";
+		}
+		if (ctx.can_read_videos) return "Read a file, an image, or a video";
+		if (ctx.can_read_images) return "Read a file or an image";
+		return "Read a file";
+	};
+	return t;
 }
 
 // ── write ──────────────────────────────────────────────────────────────────
@@ -414,14 +573,14 @@ ToolDef read_tool() {
 ToolDef write_tool() {
 	return make_tool(
 		"write",
-		"创建新文件或覆盖现有文件。父目录会自动创建。修改现有文件请优先使用 edit。",
-		"Create a new file or overwrite an existing one with the given content. Parent directories are created automatically. Prefer edit for changing existing files.",
+		"创建新文件或覆盖现有文件",
+		"Create a new file or overwrite an existing one.",
 		"创建或覆盖文件",
 		"Create or overwrite a file",
-		[](const std::string& lang) {
+		[](const std::string& lang, const ToolContext&) {
 			return schema_object({
-				{"path", schema_string(lang, "文件路径（绝对路径，或相对于工作目录）", "File path (absolute, or relative to the working directory)")},
-				{"content", schema_string(lang, "要写入的文件内容", "The file content to write")},
+				{"path", schema_string(lang, "文件路径", "File path")},
+				{"content", schema_string(lang, "要写入的文件内容", "The content to write")},
 			}, {"path", "content"});
 		},
 		[](const JsonValue& args, ToolContext& ctx) -> ToolResult {
@@ -456,17 +615,6 @@ size_t count_occurrences(const std::string& text, const std::string& needle) {
 	if (needle.empty()) return 0;
 	size_t count = 0;
 	for (size_t pos = text.find(needle); pos != std::string::npos; pos = text.find(needle, pos + needle.size())) {
-		count++;
-	}
-	return count;
-}
-
-// count non-overlapping occurrences of `needle` in `text`, case-insensitively
-size_t count_occurrences_ci(const std::string& text, const std::string& needle) {
-	if (needle.empty()) return 0;
-	std::string lt = to_lower(text), ln = to_lower(needle);
-	size_t count = 0;
-	for (size_t pos = lt.find(ln); pos != std::string::npos; pos = lt.find(ln, pos + ln.size())) {
 		count++;
 	}
 	return count;
@@ -524,7 +672,7 @@ size_t count_in(const std::string& hay, const std::string& needle) {
 // retry an exact-match failure tolerantly. The needle is tried as given and with
 // trailing newlines trimmed; only a UNIQUE match counts (0 = miss, >1 = too
 // ambiguous to edit safely). Returns the span in `content`.
-bool tolerant_match(const std::string& content, const std::string& old_text, bool ci,
+bool tolerant_match(const std::string& content, const std::string& old_text,
 	int mode, EditSpan& out) {
 	std::vector<std::string> needles{old_text};
 	std::string trimmed = old_text;
@@ -533,12 +681,12 @@ bool tolerant_match(const std::string& content, const std::string& old_text, boo
 
 	std::vector<size_t> cs;
 	std::string nc = normalize_for_match(content, mode, cs);
-	std::string hc = ci ? to_lower(nc) : nc;
+	const std::string& hc = nc;
 	for (const auto& needle : needles) {
 		std::vector<size_t> os;
 		std::string no = normalize_for_match(needle, mode, os);
 		if (no.empty()) continue;
-		std::string ho = ci ? to_lower(no) : no;
+		const std::string& ho = no;
 		if (count_in(hc, ho) != 1) continue;
 		size_t p = hc.find(ho);
 		size_t start = cs[p];
@@ -557,13 +705,13 @@ bool tolerant_match(const std::string& content, const std::string& old_text, boo
 ToolDef edit_tool() {
 	return make_tool(
 		"edit",
-		"对文件进行精确的字符串替换。传入一组编辑操作；每个 oldText 必须在文件中精确匹配唯一一处（包含足够的上下文）。所有编辑会原子性地一次性写入；如果任何编辑未匹配，则不会进行任何更改。",
-		"Make exact string replacements in a file. Pass a list of edits; each oldText must match exactly ONE unique location in the file (include enough surrounding context). All edits are applied in one atomic write; if any edit fails to match, nothing is changed.",
+		"对文件进行精确的修改",
+		"Make precise edits to a file.",
 		"精确替换文件中的文本",
 		"Replace exact text in a file",
-		[](const std::string& lang) {
+		[](const std::string& lang, const ToolContext&) {
 			return schema_object({
-				{"path", schema_string(lang, "文件路径（绝对路径，或相对于工作目录）", "File path (absolute, or relative to the working directory)")},
+				{"path", schema_string(lang, "文件路径", "File path")},
 				{"edits", schema_array(lang, schema_object({
 					{"oldText", schema_string(lang, "要替换的精确文本（必须在文件中唯一）", "The exact text to replace (must be unique in the file)")},
 					{"newText", schema_string(lang, "替换的文本", "The replacement text")},
@@ -591,8 +739,6 @@ ToolDef edit_tool() {
 					"edits 必须是非空数组（每项含 oldText/newText）",
 					"edits must be a non-empty array of objects with oldText/newText"));
 			}
-			bool ci = args.find("case_insensitive") && args.find("case_insensitive")->as_bool(false);
-
 			std::string content;
 			if (!read_file(abs, content)) {
 				return error_result(tr(ctx.language, "无法读取文件: ", "cannot read file: ") + abs);
@@ -613,10 +759,10 @@ ToolDef edit_tool() {
 						"edit " + std::to_string(i) + ": oldText 不能为空",
 						"edit " + std::to_string(i) + ": oldText must not be empty"));
 				}
-				size_t n = ci ? count_occurrences_ci(updated, old_text) : count_occurrences(updated, old_text);
+				size_t n = count_occurrences(updated, old_text);
 				EditSpan span;
 				if (n == 1) {
-					size_t pos = ci ? to_lower(updated).find(to_lower(old_text)) : updated.find(old_text);
+					size_t pos = updated.find(old_text);
 					span = {pos, old_text.size(), true};
 				} else if (n > 1) {
 					return error_result(tr(ctx.language,
@@ -624,8 +770,8 @@ ToolDef edit_tool() {
 							" 处，必须唯一 — 请补充更多上下文使其唯一，或拆分多次调用",
 						"edit " + std::to_string(i) + ": oldText matched " + std::to_string(n) +
 							" places but must be unique — add more surrounding context to make it unique, or split it into several calls"));
-				} else if (!tolerant_match(updated, old_text, ci, 1, span) &&
-				           !tolerant_match(updated, old_text, ci, 2, span)) {
+				} else if (!tolerant_match(updated, old_text, 1, span) &&
+				           !tolerant_match(updated, old_text, 2, span)) {
 					// exact match missed and no tolerant fallback: report it with the hint
 					// that CRLF / whitespace / indentation differences are forgiven
 					std::string preview = old_text.substr(0, 120);
@@ -694,11 +840,11 @@ void walk_listing(const std::string& root, const std::string& rel_prefix, bool r
 ToolDef ls_tool() {
 	return make_tool(
 		"ls",
-		"列出目录内容：文件名、类型和文件大小。使用 recursive 递归遍历子目录（跳过 .git / node_modules）。",
-		"List the contents of a directory: names, types and file sizes. Use recursive to walk subdirectories (skips .git / node_modules).",
+		"列出目录内的所有文件",
+		"List all files in a directory.",
 		"列出目录内容",
 		"List the contents of a directory",
-		[](const std::string& lang) {
+		[](const std::string& lang, const ToolContext&) {
 			return schema_object({
 				{"path", schema_string(lang, "目录路径", "Directory path")},
 				{"recursive", schema_boolean(lang, "是否递归列出子目录", "Whether to list subdirectories recursively")},
@@ -749,35 +895,14 @@ ToolDef ls_tool() {
 
 // native fallback search (used when the vendored rg.exe is unavailable)
 std::string grep_native(const std::string& language, const std::string& pattern,
-	const std::string& root, bool is_dir,
-	const std::string& include_glob, bool ignore_case, bool literal,
-	const std::string& output_mode, int context_lines, bool& matched) {
+	const std::string& root, bool is_dir, const std::string& include_glob, bool& matched) {
 	std::regex re;
-	bool regex_ok = true;
-	if (!literal) {
-		try {
-			auto flags = std::regex::ECMAScript;
-			if (ignore_case) flags |= std::regex::icase;
-			re.assign(pattern, flags);
-		} catch (const std::exception&) {
-			regex_ok = false;
-		}
-	} else if (ignore_case) {
-		try {
-			re.assign(std::regex_replace(pattern, std::regex("[-[\\]{}()*+?.,\\^$|#\\s]"), "\\$&"),
-				std::regex::icase);
-		} catch (const std::exception&) {
-			regex_ok = false;
-		}
+	try {
+		re.assign(pattern, std::regex::ECMAScript);
+	} catch (const std::exception&) {
+		return tr(language, "无效的正则表达式: ", "invalid regex pattern: ") + pattern;
 	}
-	if (!regex_ok) return tr(language, "无效的正则表达式: ", "invalid regex pattern: ") + pattern;
-
-	std::string lower_pattern = to_lower(pattern);
-	auto line_matches = [&](const std::string& line) {
-		if (literal && !ignore_case) return contains(line, pattern);
-		if (literal) return contains(to_lower(line), lower_pattern);
-		return std::regex_search(line, re);
-	};
+	auto line_matches = [&](const std::string& line) { return std::regex_search(line, re); };
 
 	std::vector<std::string> files;
 	if (!is_dir) {
@@ -813,31 +938,17 @@ std::string grep_native(const std::string& language, const std::string& pattern,
 		bytes = decode_external_text(bytes);  // legacy encodings -> valid UTF-8
 		std::vector<std::string> lines = tool_split_lines(tool_strip_cr(bytes));
 		bool file_matched = false;
-		long file_count = 0;
 		std::string file_out;
 		for (size_t i = 0; i < lines.size(); i++) {
 			if (!line_matches(lines[i])) continue;
 			file_matched = true;
 			match_count++;
-			file_count++;
-			if (output_mode == "files_with_matches") break;
-			size_t from = i > (size_t)context_lines ? i - context_lines : 0;
-			size_t to = std::min(lines.size() - 1, i + (size_t)context_lines);
-			for (size_t k = from; k <= to; k++) {
-				file_out += file + ":" + std::to_string(k + 1) + ": " + lines[k] + "\n";
-			}
-			if (context_lines > 0 && to < lines.size() - 1) file_out += "---\n";
+			file_out += file + ":" + std::to_string(i + 1) + ": " + lines[i] + "\n";
 			if (match_count >= kMaxMatches) break;
 		}
 		if (file_matched) {
 			matched = true;
-			if (output_mode == "files_with_matches") {
-				out += file + "\n";
-			} else if (output_mode == "count") {
-				out += file + ":" + std::to_string(file_count) + "\n";
-			} else {
-				out += file_out;
-			}
+			out += file_out;
 		}
 	}
 	if (match_count >= kMaxMatches) {
@@ -870,19 +981,15 @@ static std::string win_quote_shell_arg(const std::string& arg) {
 ToolDef grep_tool() {
 	return make_tool(
 		"grep",
-		"在文件内容中搜索文本（默认正则表达式，literal:true 时作为纯文本处理）。可通过 include glob 过滤文件名（如 \"*.cpp\"）。输出模式：content（默认，路径:行号: 文本）、files_with_matches、count。",
-		"Search file contents for a pattern (regex by default, literal with literal:true). Narrow with include globs like \"*.cpp\". Output modes: content (default, path:line: text), files_with_matches, count.",
+		"在文件内容中搜索文本",
+		"Search file contents for a pattern.",
 		"搜索文件内容（正则、glob 过滤）",
 		"Search file contents (regex, glob filter)",
-		[](const std::string& lang) {
+		[](const std::string& lang, const ToolContext&) {
 			return schema_object({
 				{"pattern", schema_string(lang, "要搜索的文本或正则表达式", "The text or regular expression to search for")},
 				{"path", schema_string(lang, "要搜索的文件或目录", "The file or directory to search")},
 				{"include", schema_string(lang, "文件名 glob 过滤，例如 \"*.ts\" 或 \"*.{h,cpp}\"", "Filename glob filter, e.g. \"*.ts\" or \"*.{h,cpp}\"")},
-				{"literal", schema_boolean(lang, "将模式视为纯文本", "Treat the pattern as plain text")},
-				{"case_insensitive", schema_boolean(lang, "忽略大小写", "Ignore case")},
-				{"output_mode", schema_string(lang, "输出模式：content、files_with_matches 或 count", "Output mode: content, files_with_matches or count")},
-				{"context", schema_number(lang, "每个匹配点前后的上下文行数", "Number of context lines before and after each match")},
 			}, {"pattern"});
 		},
 		[](const JsonValue& args, ToolContext& ctx) -> ToolResult {
@@ -892,10 +999,6 @@ ToolDef grep_tool() {
 			}
 			std::string path = arg_string(args, "path");
 			std::string include = arg_string(args, "include");
-			bool literal = args.find("literal") && args.find("literal")->as_bool(false);
-			bool ignore_case = args.find("case_insensitive") && args.find("case_insensitive")->as_bool(false);
-			std::string output_mode = arg_string(args, "output_mode", "content");
-			int context = std::clamp<int>(std::max<int64_t>(0, arg_int(args, "context", 0)), 0, 5);
 
 			std::string abs = path.empty() ? path_absolute(ctx.cwd) : tool_resolve_path(ctx.cwd, path);
 			if (std::string deny = tool_check_path_permission(ctx, abs); !deny.empty()) {
@@ -910,11 +1013,6 @@ ToolDef grep_tool() {
 			std::string rg = path_join(ctx.bin_dir, "rg.exe");
 			if (path_exists(rg)) {
 				std::string cmdline = "\"" + path_backslash(rg) + "\" --no-heading --path-separator / -n";
-				if (ignore_case) cmdline += " -i";
-				if (literal) cmdline += " -F";
-				if (output_mode == "files_with_matches") cmdline += " --files-with-matches";
-				else if (output_mode == "count") cmdline += " -c";
-				else if (context > 0) cmdline += " -C " + std::to_string(context);
 				if (!include.empty()) cmdline += " -g " + win_quote_shell_arg(include);
 				// pattern comes from the MODEL and may contain quotes/$/backticks:
 				// naive \"...\" wrapping let a pattern like `"; rm -rf ~; "` escape
@@ -933,8 +1031,7 @@ ToolDef grep_tool() {
 			}
 
 			bool matched = false;
-			std::string out = grep_native(ctx.language, pattern, abs, is_dir, include, ignore_case, literal,
-				output_mode, context, matched);
+			std::string out = grep_native(ctx.language, pattern, abs, is_dir, include, matched);
 			// the native walker prefixes a bad pattern with this localized marker
 			std::string invalid = tr(ctx.language, "无效的正则表达式", "invalid regex");
 			if (!matched && out.find(invalid) == std::string::npos) {

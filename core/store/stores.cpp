@@ -120,12 +120,20 @@ JsonValue SettingsStore::tool_settings() const {
 	//   "image_sampler"/"image_scheduler": ComfyUI names (euler + simple),
 	//   "video_sampler"/"video_scheduler": res_multistep + beta,
 	//   "music_sampler"/"music_scheduler": euler + simple,
-	//   "loras": [<id|path>, ...]   // applied in order, at most kMaxLoras
+	//   "image_loras"/"video_loras": [<id|path>, ...]   // in order, at most kMaxLoras
+	//   "image_lora_strengths"/"video_lora_strengths": [<float>, ...]
+	//                                  // index-matched to the list above; default 1.0,
+	//                                  // ComfyUI's strength_model / strength_clip
 	// }
 	// An empty section keeps the shipped checkpoints (media_models.cpp resolves the
 	// defaults).
 	defaults["media"] = JsonValue::object();
 	defaults["media"]["loras"] = JsonValue::array();
+	// LoRA 强度（与 <chain>_loras 逐项对应，默认 1.0）。这里只给空数组：真正的
+	// 逐槽默认值由界面补齐为 1.0，服务端读不到数值时也回落到 1.0（media_models.cpp），
+	// 所以旧 settings.json 里没有这个键时行为与加这个功能之前完全一致。
+	defaults["media"]["image_lora_strengths"] = JsonValue::array();
+	defaults["media"]["video_lora_strengths"] = JsonValue::array();
 	// 采样步数：每次请求的参数（不需要重建引擎），默认就是两条链各自的默认步数。
 	// 缺这个键时工具会回落到 kImageSteps / kVideoSteps（tools_media.cpp）。
 	defaults["media"]["image_steps"] = 25;   // qwen image 2.1
@@ -233,6 +241,8 @@ JsonValue profile_to_json(const StoredProfile& p) {
 	if (!p.api_format.empty()) j["apiFormat"] = p.api_format;
 	if (p.subagent) j["subagent"] = subagent_to_json(*p.subagent);
 	if (!p.system_prompt_language.empty()) j["systemPromptLanguage"] = p.system_prompt_language;
+	// 多模态档位：只有非默认值才写盘，旧配置里没有这个键就仍然读作 image
+	if (!p.vision.empty() && p.vision != "image") j["vision"] = p.vision;
 	return j;
 }
 
@@ -248,6 +258,7 @@ StoredProfile profile_from_json(const JsonValue& j) {
 		if (!sub->is_null()) p.subagent = subagent_from_json(*sub);
 	}
 	p.system_prompt_language = j["systemPromptLanguage"].as_string("");
+	p.vision = j["vision"].as_string("");
 	return p;
 }
 
@@ -371,6 +382,7 @@ void ConfigStore::save(const ProfileDraft& draft) {
 	updated.api_format = trim(draft.api_format).empty() ? "anthropic-messages" : trim(draft.api_format);
 	updated.subagent = draft.subagent;
 	updated.system_prompt_language = draft.system_prompt_language;
+	updated.vision = trim(draft.vision).empty() ? "" : vision_mode_key(vision_mode_from_key(trim(draft.vision)));
 
 	bool replaced = false;
 	for (auto& existing : listing.profiles) {
@@ -386,6 +398,9 @@ void ConfigStore::save(const ProfileDraft& draft) {
 			if (updated.system_prompt_language.empty()) {
 				updated.system_prompt_language = existing.system_prompt_language;
 			}
+			// 多模态：表单没给值时沿用原档位（而不是退回默认），否则每次保存
+			// API 配置都会把用户选过的「无多模态」悄悄改成「图片」
+			if (updated.vision.empty()) updated.vision = existing.vision;
 			existing = updated;
 			replaced = true;
 			break;
@@ -441,7 +456,9 @@ void ConfigStore::activate_gateway(const StoredProfile& profile) {
 	model.api = provider.api;
 	model.base_url = profile.base_url;
 	model.reasoning = true;
-	model.input = {"text", "image"};
+	// 多模态档位决定这个网关模型能收到什么：无多模态 = 只有文本，图片 =
+	// {"text","image"}，图片和视频 = 再加上 "video"
+	model.input = vision_mode_inputs(vision_mode_from_key(profile.vision));
 	model.cost = {};
 	model.context_window = 1000000;
 	model.max_tokens = 64000;
@@ -466,6 +483,17 @@ void ConfigStore::activate_gateway(const StoredProfile& profile) {
 void ConfigStore::activate_direct(const StoredProfile& profile) {
 	// api_key is stored in config.json — resolved via key_provider_callback at runtime
 	settings_->set_defaults(profile.provider, profile.model, settings_->default_thinking_level().value_or(""));
+}
+
+// 多模态档位只存在 profile 里（网关模型把它摊成 ModelDef::input，直连模型则由
+// 目录自带的 input 决定）。会话要问「当前模型能不能看图 / 看视频」时，网关场景下
+// 这里就是唯一可靠的来源。
+std::string ConfigStore::active_vision() const {
+	Listing listing = list();
+	for (const auto& p : listing.profiles) {
+		if (p.name == listing.active) return vision_mode_key(vision_mode_from_key(p.vision));
+	}
+	return vision_mode_key(VisionMode::Image);
 }
 
 void ConfigStore::activate(const std::string& name) {

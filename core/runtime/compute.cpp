@@ -1,5 +1,12 @@
-// Compute layer implementation: NVRTC compilation, the on-disk kernel cache, and
-// dispatch.
+// Compute layer implementation: NVRTC compilation, the cubin cache, and dispatch.
+//
+// A kernel compiled for this process' device is kept in `ComputeContext::kernels_`
+// as a loaded module, and (unless the context was created without a cache
+// directory) written out as a cubin under that directory so a later process finds
+// it instead of running NVRTC again. That is the only thing in the engine that
+// outlives a generation on disk, and `ComputeContext::pipeline` says why it has to:
+// the compiled form of a kernel is a function of the code and the machine, never of
+// a request.
 #include "runtime/compute.hpp"
 
 #include <windows.h>
@@ -47,13 +54,13 @@ std::string hex16(u64 v) {
 }
 
 // The cache lives under the install's data directory, and that path is UTF-8
-// everywhere else in this engine (it holds non-ASCII characters on a machine
-// whose user name or install folder is not ASCII). The C runtime's `fopen`
-// interprets the path in the process' ANSI codepage, so on such a machine every
-// cubin lookup silently missed and every launch recompiled through NVRTC - a
-// slow engine rather than a broken one, which is exactly the kind of failure
-// that never gets reported. `_wfopen` with the UTF-8 -> wide conversion the rest
-// of the tree uses is the same call the model loaders make.
+// everywhere else in this engine (it holds non-ASCII characters on a machine whose
+// user name or install folder is not ASCII). The C runtime's `fopen` interprets the
+// path in the process' ANSI codepage, so on such a machine every cubin lookup would
+// silently miss and every launch recompile through NVRTC - a slow engine rather
+// than a broken one, which is exactly the kind of failure that never gets reported.
+// `_wfopen` with the UTF-8 -> wide conversion the rest of the tree uses is the same
+// call the model loaders make.
 FILE* open_u8(const std::string& path, const wchar_t* mode) {
 	return _wfopen(utf8_to_wide(path).c_str(), mode);
 }
@@ -76,10 +83,9 @@ bool read_file(const std::string& path, std::vector<u8>* out) {
 }
 
 void write_file(const std::string& path, const void* data, size_t n) {
-	// atomic: write a temp file and rename over the target. A crash mid-write
-	// would otherwise leave a partial cubin that reads as "valid cache"
-	// (> 64 bytes) and then fails ModuleLoadData on every later run, with no
-	// self-heal path.
+	// atomic: write a temp file and rename over the target. A crash mid-write would
+	// otherwise leave a partial cubin that reads as "valid cache" (> 64 bytes) and
+	// then fails ModuleLoadData on every later run, with no self-heal path.
 	std::string tmp = path + ".tmp";
 	FILE* f = open_u8(tmp, L"wb");
 	if (!f) return;
@@ -186,34 +192,26 @@ private:
 std::string ShaderCompilerStatus::describe() const {
 	std::string s = nvrtc ? "nvrtc" : "no nvrtc";
 	s += " (" + std::to_string(compiles) + " compiled, " + std::to_string(cache_hits) +
-	     " cached)";
+	     " cached";
+	// The NVRTC bill, so "is the cubin cache worth anything?" is a number and not
+	// an opinion: it is what a cold cache costs a run.
+	if (compile_ms > 0.0) {
+		char buf[48];
+		snprintf(buf, sizeof buf, ", %.1f s in nvrtc", compile_ms / 1000.0);
+		s += buf;
+	}
+	s += ")";
 	if (!last_error.empty()) s += " last error: " + last_error;
 	return s;
 }
 
 const ShaderCompilerStatus& shader_compiler_status() { return mutable_status(); }
 
-int clear_shader_cache(const std::string& cache_dir) {
-	if (cache_dir.empty()) return 0;
-	std::string glob = path_backslash(cache_dir) + "\\*.cubin";
-	WIN32_FIND_DATAW fd{};
-	HANDLE h = FindFirstFileW(utf8_to_wide(glob).c_str(), &fd);
-	if (h == INVALID_HANDLE_VALUE) return 0;
-	const std::wstring dir = utf8_to_wide(path_backslash(cache_dir));
-	int n = 0;
-	do {
-		std::wstring full = dir + L"\\" + fd.cFileName;
-		if (DeleteFileW(full.c_str())) n++;
-	} while (FindNextFileW(h, &fd));
-	FindClose(h);
-	return n;
-}
-
 // ── ComputeContext ─────────────────────────────────────────────────────────
 
 ComputeContext::~ComputeContext() { destroy(); }
 
-void ComputeContext::destroy() {
+void ComputeContext::release_kernels() {
 	CudaApi& api = cuda_api();
 	for (GpuKernel* k : kernels_) {
 		if (!k) continue;
@@ -221,6 +219,10 @@ void ComputeContext::destroy() {
 		delete k;
 	}
 	kernels_.clear();
+}
+
+void ComputeContext::destroy() {
+	release_kernels();
 	for (GpuBuffer* b : owned_) {
 		if (b && cuda_) cuda_->free(b);
 	}
@@ -239,7 +241,7 @@ void ComputeContext::create(CudaContext& cuda, const std::string& cache_dir) {
 		std::wstring w = utf8_to_wide(path_backslash(cache_dir_));
 		if (!CreateDirectoryW(w.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
 			// No writable cache directory: compiling in memory per kernel is a
-			// working engine (just a slower first frame), so this is not fatal.
+			// working engine (just a slower one), so this is not fatal.
 			cache_dir_.clear();
 		}
 	}
@@ -276,81 +278,110 @@ GpuKernel* ComputeContext::pipeline(const std::string& key, const std::string& s
 		bz = block_z ? block_z : 1;
 	}
 
-	// ── disk cache ─────────────────────────────────────────────────────────
-	// Compiling ~25 kernels through NVRTC costs tens of seconds, so the cubin is
-	// kept. The key includes a hash of the source, so editing a kernel misses the
-	// cache instead of silently reusing the old binary.
-	// The cache key must change with EVERY input that affects the compiled
-	// cubin, not just the source: a different NVRTC version, a different
-	// include dir (cuda_fp16.h changed between CUDA versions), or the
-	// PHI_CUDA_FAST_MATH switch all produce a different binary. Hashing only
-	// (source, entry, arch) meant fast-math could be silently reused for a
-	// non-fast-math run (or the reverse) — a precision change the user cannot
-	// see.
+	// ── the cubin cache ────────────────────────────────────────────────────
+	//
+	// Compile the source, keep the binary, and read it back on a later run.
+	//
+	// This is the one piece of state in the engine that is deliberately kept across
+	// generations, and the rule that lets it be kept is the same rule that drops
+	// everything else at the end of a call:
+	//
+	//   * a cache may be kept when its key cannot describe a *request* - when what
+	//     it holds is a function of the code and the machine alone. A compiled kernel
+	//     is exactly that: it depends on the source, the entry, the arch, the NVRTC
+	//     version, the include dir and PHI_CUDA_FAST_MATH, and on nothing about a
+	//     prompt, a seed, a duration or a resolution. Editing a kernel changes the
+	//     key, the sources ship inside the binary, and no user file can invalidate
+	//     an entry - so a stale hit is impossible, not merely unlikely;
+	//   * anything derived from a *request* is dropped when the request ends - which
+	//     is all of it, since the four media tools never repeat a call (see
+	//     `release_generation_state`).
+	//
+	// It is worth being honest about how much that saves, because the comments this
+	// cache used to carry claimed "tens of seconds" and the measurement says
+	// otherwise. On the reference box each chain compiles 9-21 kernels for 0.2-0.5 s
+	// of NVRTC (image 15 in 0.4 s, video 21 in 0.5 s, tts 9 in 0.2 s, music 11 in
+	// 0.2 s) - not the dominant cost of a generation, which is the weight streaming,
+	// but pure waste that lands on *every* call, for a file that is 840 KB in total.
+	// `compile_ms` in `ShaderCompilerStatus` is where that number comes from, so the
+	// next person to weigh this cache does not have to trust a comment either way.
+	//
+	// The key hashes every input that changes the binary, not just the source: a
+	// different NVRTC version, a different include dir (cuda_fp16.h changed between
+	// CUDA versions) or the PHI_CUDA_FAST_MATH switch all produce a different
+	// binary. Hashing only (source, entry, arch) meant fast-math could be silently
+	// reused for a non-fast-math run (or the reverse) - a precision change the user
+	// cannot see.
 	std::string compile_inputs = entry + "|" + cuda_->arch() + "|" +
 	                             api.nvrtc_version() + "|" +
-	                             (getenv("PHI_CUDA_FAST_MATH") ? "fastmath" : "nofastmath") + "|" +
-	                             api.include_dir();
+	                             (getenv("PHI_CUDA_FAST_MATH") ? "fastmath" : "nofastmath") +
+	                             "|" + api.include_dir();
 	std::string tag = key + "-" + hex16(fnv1a(source, compile_inputs));
 	std::string bin_path = cache_dir_.empty() ? "" : cache_dir_ + "\\" + tag + ".cubin";
 	std::vector<u8> binary;
 	bool from_cache = false;
 	if (!bin_path.empty() && read_file(bin_path, &binary) && binary.size() > 64) {
 		from_cache = true;
+		mutable_status().cache_hits++;
 	}
 
 	if (!from_cache) {
-		std::vector<std::string> opt = {"-arch=" + cuda_->arch(), "--std=c++17",
-		                                "-default-device"};
-		for (const std::string& inc : api.include_opts()) opt.push_back(inc);
-		if (getenv("PHI_CUDA_FAST_MATH")) opt.push_back("--use_fast_math");
-		std::vector<const char*> opts;
-		for (std::string& s : opt) opts.push_back(s.c_str());
+		const int64_t nvrtc_t0 = now_ms();
+		{
+			std::vector<std::string> opt = {"-arch=" + cuda_->arch(), "--std=c++17",
+			                                "-default-device"};
+			for (const std::string& inc : api.include_opts()) opt.push_back(inc);
+			if (getenv("PHI_CUDA_FAST_MATH")) opt.push_back("--use_fast_math");
+			std::vector<const char*> opts;
+			for (std::string& s : opt) opts.push_back(s.c_str());
 
-		nvrtcProgram prog = nullptr;
-		int rc = api.NvrtcCreateProgram(&prog, source.c_str(), (key + ".cu").c_str(), 0, nullptr,
-		                                nullptr);
-		if (rc != 0) throw MediaError("nvrtcCreateProgram failed for '" + key + "'");
-		rc = api.NvrtcCompileProgram(prog, (int)opts.size(), opts.data());
-		std::string log;
-		size_t lsz = 0;
-		if (api.NvrtcGetProgramLogSize && api.NvrtcGetProgramLogSize(prog, &lsz) == 0 && lsz > 1) {
-			log.resize(lsz);
-			api.NvrtcGetProgramLog(prog, &log[0]);
-			while (!log.empty() && (log.back() == '\0' || log.back() == '\n')) log.pop_back();
-		}
-		if (rc != 0) {
-			mutable_status().last_error = log;
+			nvrtcProgram prog = nullptr;
+			int rc = api.NvrtcCreateProgram(&prog, source.c_str(), (key + ".cu").c_str(), 0,
+			                                nullptr, nullptr);
+			if (rc != 0) throw MediaError("nvrtcCreateProgram failed for '" + key + "'");
+			rc = api.NvrtcCompileProgram(prog, (int)opts.size(), opts.data());
+			std::string log;
+			size_t lsz = 0;
+			if (api.NvrtcGetProgramLogSize && api.NvrtcGetProgramLogSize(prog, &lsz) == 0 &&
+			    lsz > 1) {
+				log.resize(lsz);
+				api.NvrtcGetProgramLog(prog, &log[0]);
+				while (!log.empty() && (log.back() == '\0' || log.back() == '\n')) log.pop_back();
+			}
+			if (rc != 0) {
+				mutable_status().last_error = log;
+				if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
+				throw MediaError("shader '" + key + "' failed to compile:\n" + log);
+			}
+			// CUBIN when the toolkit can emit it (the driver then loads it directly);
+			// PTX otherwise, which the driver JITs on first use.
+			size_t bsz = 0;
+			bool got = false;
+			if (api.NvrtcGetCUBINSize && api.NvrtcGetCUBIN &&
+			    api.NvrtcGetCUBINSize(prog, &bsz) == 0 && bsz > 0) {
+				binary.resize(bsz);
+				got = api.NvrtcGetCUBIN(prog, (char*)binary.data()) == 0;
+			}
+			if (!got) {
+				size_t psz = 0;
+				if (api.NvrtcGetPTXSize(prog, &psz) != 0) {
+					if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
+					throw MediaError("nvrtc: no cubin and no PTX for '" + key + "'");
+				}
+				binary.resize(psz);
+				if (api.NvrtcGetPTX(prog, (char*)binary.data()) != 0) {
+					if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
+					throw MediaError("nvrtcGetPTX failed for '" + key + "'");
+				}
+			}
 			if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
-			throw MediaError("shader '" + key + "' failed to compile:\n" + log);
 		}
-		// CUBIN when the toolkit can emit it (the driver then loads it directly);
-		// PTX otherwise, which the driver JITs on first use.
-		size_t bsz = 0;
-		bool got = false;
-		if (api.NvrtcGetCUBINSize && api.NvrtcGetCUBIN && api.NvrtcGetCUBINSize(prog, &bsz) == 0 &&
-		    bsz > 0) {
-			binary.resize(bsz);
-			got = api.NvrtcGetCUBIN(prog, (char*)binary.data()) == 0;
-		}
-		if (!got) {
-			size_t psz = 0;
-			if (api.NvrtcGetPTXSize(prog, &psz) != 0) {
-				if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
-				throw MediaError("nvrtc: no cubin and no PTX for '" + key + "'");
-			}
-			binary.resize(psz);
-			if (api.NvrtcGetPTX(prog, (char*)binary.data()) != 0) {
-				if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
-				throw MediaError("nvrtcGetPTX failed for '" + key + "'");
-			}
-		}
-		if (api.NvrtcDestroyProgram) api.NvrtcDestroyProgram(&prog);
-		if (!bin_path.empty() && binary.size() > 64) write_file(bin_path, binary.data(),
-		                                                        binary.size());
+		mutable_status().compile_ms += (double)(now_ms() - nvrtc_t0);
 		mutable_status().compiles++;
-	} else {
-		mutable_status().cache_hits++;
+		// Publish the binary for the next run. Failing to write is not failing to
+		// compile - the kernel in hand works - so the cache is best-effort.
+		if (!bin_path.empty() && binary.size() > 64)
+			write_file(bin_path, binary.data(), binary.size());
 	}
 
 	// cuModuleLoadData sniffs cubin vs PTX.

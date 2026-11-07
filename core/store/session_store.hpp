@@ -48,6 +48,10 @@ struct SessionContent {
 	std::vector<std::string> repairs;
 };
 
+// 文件名 -> 显示名。默认会话的文件名是 "<时间戳>_<uuid>.jsonl"，显示名就是那段
+// 时间戳（"2026-11-07-9:23:40"）；命名过的会话另有 title 条目，不走这里。
+std::string session_file_display_name(const std::string& file);
+
 // 会话索引条目（目录扫描产物，不含消息正文）。
 struct SessionSummary {
 	std::string id;
@@ -84,6 +88,9 @@ public:
 	void set_title(const std::string& title);
 	// 强制下一次 sync 重写文件（历史被整体替换时使用，如压缩）。
 	void mark_dirty();
+	// 清除待写标记：元数据与磁盘内容一致时使用（打开会话后回填元数据之后），
+	// 使一次纯打开不产生任何磁盘写入。
+	void mark_clean();
 
 	// 把当前历史整体重写到文件；内容无变化时内部直接跳过。
 	void sync(const std::vector<AgentMessage>& messages);
@@ -117,7 +124,12 @@ private:
 };
 
 // 消息 <-> JSON（持久化与 UI 快照投影共用同一套编解码）。
-JsonValue message_to_json(const AgentMessage& m);
+//
+// 媒体块（图片/视频）有两种写法：带磁盘来源的只写 path，没有来源的内联 base64。
+// 落盘时一律只写 path——一个几 MB 的 mp4 的 base64 是几十 MB，每次 sync 都把它
+// 重写进 jsonl 是不可接受的。界面快照则相反：聊天窗口要直接把图片画出来，没有
+// base64 就只剩空白，所以快照内联。同一个编解码，`inline_media` 决定用哪一种。
+JsonValue message_to_json(const AgentMessage& m, bool inline_media = false);
 AgentMessage message_from_json(const JsonValue& j);
 
 }  // namespace phi

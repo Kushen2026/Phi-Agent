@@ -173,12 +173,13 @@ void CudaContext::create(int device_index) {
 
 	// Hand the host-side weight caches a page-locked allocator (see
 	// SafeTensors::set_host_allocator). The streamer moves ~17 GB per sampling
-	// step host -> device, and when the source buffer is locked the driver can
-	// DMA straight out of it instead of copying it into the ring first. The cap
-	// is deliberately a *fraction of free RAM*: page-locked memory cannot be
-	// paged out, and locking the ~7 GB the pinned set wants on a 16 GB machine
-	// would leave the OS none. Past the cap the caches fall back to malloc and
-	// the streamer to the ring - slower, never wrong.
+	// step host -> device when the checkpoint is int8, and *twice* that when it is
+	// bf16 - the same model is 20 GB as int8 and 40 GB as bf16 - and when the source
+	// buffer is locked the driver can DMA straight out of it instead of copying it
+	// into the ring first. The cap is deliberately a *fraction of free RAM*:
+	// page-locked memory cannot be paged out, and locking the ~7 GB the pinned set
+	// wants on a 16 GB machine would leave the OS none. Past the cap the caches fall
+	// back to malloc and the streamer to the ring - slower, never wrong.
 	//
 	// The fraction is a *reservation*, not a target: whatever is left past the
 	// cache's own share is what the look-ahead slot gets, and the slot is the
@@ -187,10 +188,21 @@ void CudaContext::create(int device_index) {
 	// weight). At free/3 with a 4 GB ceiling the cache's 7.9 GB request consumed
 	// the whole cap first and the slot fell back to malloc on every block - the
 	// measured cost was a host memcpy of ~11 GB per sampling step.
+	//
+	// The ceiling used to be a flat 7 GB, which is the figure a 16 GB box could
+	// afford and a 64 GB box was held to as well - exactly the box where a bf16
+	// checkpoint's 30 GB of streamed weights would otherwise go through the ring.
+	// It scales with installed memory now (a fifth of it, never below the old 7 GB),
+	// which leaves the small machine where it was and lets the large one lock the
+	// share its RAM tier actually holds.
 	{
 		const u64 free_ram = SafeTensors::host_free_bytes();
+		const u64 total_ram = SafeTensors::host_total_bytes();
+		u64 hard = total_ram / 5;
+		const u64 floor_cap = 7ull << 30;
+		if (hard < floor_cap) hard = floor_cap;
+		if (total_ram > 0 && hard > total_ram / 2) hard = total_ram / 2;
 		u64 cap = free_ram / 2;
-		const u64 hard = 7ull << 30;
 		if (cap > hard) cap = hard;
 		SafeTensors::set_host_allocator(
 		    [](size_t n) -> void* {

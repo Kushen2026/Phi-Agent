@@ -659,7 +659,22 @@ void HttpServer::client_loop(int sock, std::shared_ptr<std::atomic<bool>> done) 
 	// plain http
 	HttpResponse res;
 	if (http_handler_) {
-		res = http_handler_(req);
+		// a throw on this bare thread = std::terminate = app crash (same rule as
+		// the WS message loop above): an /api/* handler must never take the app
+		// down with it, so answer 500 instead of propagating
+		try {
+			res = http_handler_(req);
+		} catch (const std::exception& e) {
+			fprintf(stderr, "[http] handler error: %s\n", e.what());
+			res.status = 500;
+			res.content_type = "application/json; charset=utf-8";
+			res.body = std::string("{\"error\":\"handler failed\"}");
+		} catch (...) {
+			fprintf(stderr, "[http] handler error: unknown\n");
+			res.status = 500;
+			res.content_type = "application/json; charset=utf-8";
+			res.body = std::string("{\"error\":\"handler failed\"}");
+		}
 	} else {
 		res.status = 404;
 		res.body = "no handler";

@@ -83,6 +83,10 @@ struct StoredProfile {
 	std::string api_format;
 	std::optional<SubagentConfig> subagent;
 	std::string system_prompt_language;  // empty = unset
+	// 设置 → API 配置 → 多模态: "none" | "image" | "image_video". Empty = unset,
+	// which reads as "image" — the capability every profile had before the
+	// setting existed, so an old webui-configs.json behaves as it always did.
+	std::string vision;
 };
 
 struct ProfileDraft {
@@ -94,6 +98,7 @@ struct ProfileDraft {
 	std::string api_format;
 	std::optional<SubagentConfig> subagent;
 	std::string system_prompt_language;
+	std::string vision;  // empty = keep the previous value / default "image"
 };
 
 class ConfigStore {
@@ -122,6 +127,11 @@ public:
 	// saved cwd (webui-cwd.json)
 	std::optional<std::string> saved_cwd() const;
 	void save_cwd(const std::string& cwd);
+
+	// 多模态档位 of the active profile ("none" | "image" | "image_video").
+	// The Agent reads its input modalities from the ModelDef, so this is the one
+	// place the setting has to be looked up from.
+	std::string active_vision() const;
 
 	static std::string gateway_provider_id(const std::string& profile_name);
 	static std::string mask_key(const std::string& key);

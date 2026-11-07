@@ -92,7 +92,7 @@ void print_tool_resolve(const std::string& base_dir) {
 		const JsonValue* m = tools && tools->is_object() ? tools->find("media") : nullptr;
 		if (m && m->is_object()) media = *m;
 	}
-	media::MediaModelSpec spec = media::resolve_media_spec(media, models_dir);
+	media::MediaModelSpec spec = media::resolve_media_spec(media, models_dir, agent_dir);
 	struct Row { const char* role; const std::string* path; };
 	const Row rows[] = {
 	    {"image_dit", &spec.image_dit},
@@ -118,8 +118,6 @@ void print_tool_resolve(const std::string& base_dir) {
 	    {"tts_model", &spec.tts_model},
 	    {"tts_codec", &spec.tts_codec},
 	    {"tts_tokenizer", &spec.tts_tokenizer},
-	    {"tts_config", &spec.tts_config},
-	    {"tts_codec_config", &spec.tts_codec_config},
 	};
 	auto trim_base = [&](const std::string& p) {
 		const std::string pre = models_dir + "/";
@@ -139,9 +137,12 @@ void print_tool_resolve(const std::string& base_dir) {
 void print_tool_schema(const ToolDef& t) {
 	JsonValue schema = JsonValue::object();
 	schema["name"] = t.name;
-	schema["description"] = t.description;
-	schema["parameters"] = t.parameters_fn ? t.parameters_fn("en") : JsonValue::object();
-	(void)0;
+	ToolContext schema_ctx;  // the CLI prints the schemas of a fully capable model
+	schema_ctx.language = "en";
+	schema_ctx.can_read_images = true;
+	schema_ctx.can_read_videos = true;
+	schema["description"] = t.text("en", schema_ctx);
+	schema["parameters"] = t.parameters_fn ? t.parameters_fn("en", schema_ctx) : JsonValue::object();
 	printf("%s\n", schema.dump(2).c_str());
 }
 

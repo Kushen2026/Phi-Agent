@@ -54,19 +54,30 @@ Graph build_tts_workflow(const TtsWorkflowParams& p) {
 	put_str(model.params, "codec_config", p.codec_config);
 
 	// The voice-design prompt: the instruction describes the timbre, `text` is
-	// what is spoken. `cfg_scale` 4 is the released node's default for design.
+	// what is spoken. runtime.py's `design_segments(text, instruction)` fixes that
+	// order at the *prompt* level, so the two parameter names travel unchanged from
+	// the tool through `TtsWorkflowParams` to here; they are never swapped on the
+	// way down. `cfg_scale` 4 is the released node's default for design.
+	//
+	// The order is only half of it: the encoder has to *see* the boundary. Its
+	// attention scale comes from the encoder config's `query_pre_attn_scalar` (see
+	// `BreezeTts::open`); a wrong one leaves the prompt off-distribution and the
+	// model speaks the timbre description instead of the text.
 	GraphNode enc = gn(2, "MediaBreezeTextEncode");
 	enc.params["text"] = p.text;
 	enc.params["instruction"] = p.instruction;
 	enc.params["cfg_scale"] = p.cfg_scale;
+	// The prompt carries the frame budget (`BreezeTts::prepare`), so the length the
+	// caller asked for belongs on the encode node. 0 = the text length decides.
+	enc.params["max_new_tokens"] = (int64_t)(p.max_new_tokens > 0
+	                                             ? p.max_new_tokens
+	                                             : tts_frames_for_seconds(p.duration_seconds));
 
 	GraphNode sampler = gn(3, "MediaBreezeSampler");
-	// The sampler counts frames; a caller speaks seconds. `duration_seconds` is the
-	// documented input and the frame budget is derived from it here, so the two
-	// units cannot drift apart (the tool reports the cap back in seconds).
-	sampler.params["max_new_tokens"] = (int64_t)(p.max_new_tokens > 0
-	                                                ? p.max_new_tokens
-	                                                : tts_frames_for_seconds(p.duration_seconds));
+	// The same budget on the sampler node, which is where the number is documented:
+	// it is a cap there (a hand-wired graph can shorten an utterance with it), and
+	// it cannot raise the prompt's figure past the context. 0 = the prompt's own.
+	sampler.params["max_new_tokens"] = enc.params["max_new_tokens"];
 	sampler.params["temperature"] = p.temperature;
 	sampler.params["top_k"] = (int64_t)p.top_k;
 	sampler.params["top_p"] = p.top_p;

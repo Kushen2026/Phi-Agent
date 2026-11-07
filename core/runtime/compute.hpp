@@ -1,4 +1,18 @@
-// Compute layer: NVRTC compilation, kernel caching, and dispatch.
+// Compute layer: NVRTC compilation, the cubin cache, and dispatch.
+//
+// A kernel is compiled through NVRTC once per (source, entry, arch, NVRTC version,
+// include dir, fast-math) and the result is kept in two places: in `kernels_` as a
+// loaded module, so one run's thousands of dispatches reuse it, and as a cubin
+// under the cache directory the context was created with, so the *next* run does
+// not pay NVRTC again.
+//
+// That cache is the one piece of state in this engine that is deliberately kept
+// across generations. It is machine code, not a result: it depends on the kernel
+// source and the toolchain and on nothing about a request, so it cannot go stale,
+// and recompiling it per generation is NVRTC work repeated for a byte-identical
+// module (0.2-0.5 s a call on the reference box, measured). See
+// `ComputeContext::pipeline` for the full argument, including why a request-shaped
+// cache would *not* be kept.
 //
 // What the rest of the engine sees is deliberately narrow: the same
 // `KernelParams` (20 scalars + 8 SRV + 4 UAV), the same
@@ -48,15 +62,14 @@ struct KernelParams {
 enum class ShaderModel { SM5_1, SM6_0, SM6_2, SM6_4, SM6_6 };
 
 struct ShaderCompilerStatus {
-	bool nvrtc = false;        // nvrtc64_*.dll usable
-	int compiles = 0;
-	int cache_hits = 0;
+	bool nvrtc = false;      // nvrtc64_*.dll usable
+	int compiles = 0;        // kernels NVRTC compiled in this process
+	int cache_hits = 0;      // kernels that came back out of the on-disk cache
+	double compile_ms = 0;   // wall time spent inside NVRTC
 	std::string last_error;
 	std::string describe() const;
 };
 const ShaderCompilerStatus& shader_compiler_status();
-// Removes every cached cubin under `cache_dir`; returns how many files went.
-int clear_shader_cache(const std::string& cache_dir);
 
 // A compiled kernel: the module that owns it plus the function handle and the
 // block shape the source declared.
@@ -79,13 +92,16 @@ public:
 	ComputeContext(const ComputeContext&) = delete;
 	ComputeContext& operator=(const ComputeContext&) = delete;
 
-	// `cuda` must outlive this object. `cache_dir` enables the on-disk kernel
-	// cache (compiling ~25 kernels through NVRTC costs tens of seconds).
+	// `cuda` must outlive this object. `cache_dir` is where compiled cubins are kept
+	// between processes; passing "" compiles in memory only (a read-only install, or
+	// a caller with no writable data directory), which is slower on every run but
+	// never wrong. The directory is created if it does not exist.
 	void create(CudaContext& cuda, const std::string& cache_dir);
 	void destroy();
 	bool valid() const { return cuda_ != nullptr; }
 
-	// Compiles (or loads from cache) `source` and returns the kernel for `entry`.
+	// Returns the kernel for `entry`, compiling `source` through NVRTC if it is not
+	// already in `kernels_` and not already cached as a cubin under `cache_dir`.
 	// `block` overrides the block shape parsed out of the source (autotune uses
 	// this, because its tile sizes are text-substituted into the source and the
 	// block size follows them).
@@ -94,6 +110,19 @@ public:
 	                    ShaderModel min_model = ShaderModel::SM6_4, u32 block_x = 0,
 	                    u32 block_y = 0, u32 block_z = 0);
 	bool has_pipeline(const std::string& key) const;
+	// How many kernels this context is holding. 0 means nothing is left compiled;
+	// the media tools read it after a generation (see `report_media_state`) to make
+	// the "a call leaves nothing behind" claim checkable rather than asserted.
+	int kernel_count() const { return (int)kernels_.size(); }
+
+	// Unloads every compiled kernel and forgets the handles: the driver's modules go
+	// with them. This is a *teardown* hook - a lost device, engine shutdown - and
+	// deliberately not part of a generation's release path: a compiled kernel is
+	// re-derivable, but not free, and the whole point of the cache is that the next
+	// request finds it. Callers must not hold a `GpuKernel*` when it runs (the
+	// engine's convention: a kernel is fetched through `pipeline()` at the point of
+	// dispatch).
+	void release_kernels();
 
 	// Records one dispatch: the launch is enqueued immediately, and begin()/
 	// submit() only bracket it. Buffers are bound as device addresses, so no

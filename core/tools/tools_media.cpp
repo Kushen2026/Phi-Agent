@@ -16,12 +16,16 @@
 // read is a file name in the settings rather than a branch here.
 //
 // What this file still owns is the *engine*: the process-wide CUDA context, the
-// shared arenas/ring, the one-generation-at-a-time lock, and the persistent node
-// cache (so the checkpoints are opened once per selection, not once per call).
-// The engine is lazily created: the image checkpoint is 6.8 GB of int8 and its
-// text encoder another 8.7 GB, so opening it per call would dominate the runtime
-// and opening it at startup would make every session pay for a tool that may
-// never be used.
+// shared arenas/ring, and the one-generation-at-a-time lock. It holds no results:
+// what a generation derived from its *request* - the loaded checkpoints and the
+// VRAM they charge, the host-side caches keyed on a checkpoint - goes back when
+// the call returns (`release_generation_state`), because none of the four tools
+// ever repeats a request. Two things are deliberately kept, and both are functions
+// of the code and the machine rather than of the request, so neither can go stale:
+// the engine itself (the image checkpoint is 6.8 GB of int8 and its text encoder
+// another 8.7 GB, so a CUDA context per call would dominate the runtime, while
+// opening one at startup would make every session pay for a tool that may never be
+// used) and the compiled kernels (see `ComputeContext::pipeline`).
 #include "tools/tools_media.hpp"
 
 #include <algorithm>
@@ -43,7 +47,10 @@
 #include "graph/graph_workflows.hpp"
 #include "runtime/compute.hpp"
 #include "runtime/cuda_device.hpp"
+#include "models/audio_vae.hpp"   // audio_vae_state_entries (see report_media_state)
+#include "models/av_dit.hpp"      // drop_modulation_cache
 #include "models/media_models.hpp"
+#include "models/video_vae.hpp"   // video_vae_state_entries
 #include "models/media_geometry.hpp"
 // Only for `AceCondition`: the LM's residency window travels inside the music
 // chain's conditioning (see `AceCondition::lm_resident_layers`) and the report
@@ -73,10 +80,13 @@ struct MediaEngine {
 	std::unique_ptr<UploadRing> ring;
 	std::unique_ptr<GpuCtx> gpu;
 	std::string models_dir;
-	// The node world's persistent state: loaded MODEL/CLIP/VAE handles keyed on
-	// (arch, path, loras), so a run reuses the weights the previous run loaded.
-	// Cleared with the rest of the engine on a lost device / spec change, because
-	// a cached handle would otherwise point into a torn-down context.
+	// The node world's state for the call in flight: loaded MODEL/CLIP/VAE handles
+	// keyed on (arch, path, loras), so a graph that loads the same checkpoint twice
+	// inside one run reuses it. It is handed to the run, taken back when the run
+	// ends (`release_media_memory` drops it), and never survives the call - the
+	// tools do not repeat a request. It is also cleared with the rest of the engine
+	// on a lost device / spec change, where a kept handle would point into a
+	// torn-down context.
 	std::shared_ptr<void> graph_user;
 	// What the last open() resolved, so a settings change is noticed and the cache
 	// is dropped so the next run loads the newly chosen files.
@@ -191,11 +201,39 @@ std::string media_choice(const std::string& agent_dir, const char* key) {
 	return v->as_string("");
 }
 
+// The LoRA chain as the report spells it: "name @0.60, other.safetensors".
+//
+// Only the strength is singled out - the names are already in the chain - and a
+// default 1.0 file is left bare, the same rule `LoraSet::describe` uses. The tool
+// report used to say nothing about the chain at all, which was fine while there
+// was nothing to get wrong; a strength is a value the user set and cannot see in
+// the output, so the run has to state it.
+std::string describe_lora_chain(const std::vector<LoraRef>& loras) {
+	std::string s;
+	for (size_t i = 0; i < loras.size(); i++) {
+		if (i) s += ", ";
+		s += path_basename(loras[i].path);
+		if (loras[i].strength != kLoraStrengthDefault) {
+			char buf[32];
+			snprintf(buf, sizeof(buf), " @%.2f", (double)loras[i].strength);
+			s += buf;
+		}
+	}
+	return s;
+}
+
 // Drops everything the engine holds so the next call rebuilds it from scratch.
 // Only legal while `e.mu` is held and no generation is in flight.
+//
+// Order matters, and it is the opposite of the obvious one: the loaded handles go
+// first. Every one of them was opened against `e.gpu`/`e.ctx` and holds a `GpuCtx*`,
+// and a destructor is where each class hands its device memory back (see
+// `ImageDiT::~ImageDiT`, `AvDiT::~AvDiT`, `VideoVae::~VideoVae`) - so destroying
+// them after the context they point into turns a cleanup into a use-after-free.
+// Nothing in them needs the arenas to still exist, so this order is safe.
 void shutdown_locked(MediaEngine& e) {
-	e.gpu.reset();
 	e.graph_user.reset();
+	e.gpu.reset();
 	e.ring.reset();
 	e.keep.reset();
 	e.aa.reset();
@@ -235,7 +273,9 @@ std::string ensure_open(MediaEngine& e, const std::string& agent_dir, const std:
 	// checkpoint (the loaders auto-detect precision) takes effect: pick it in the
 	// settings panel and the next call re-reads it.
 	{
-		MediaModelSpec spec = resolve_media_spec(read_media_settings(agent_dir), e.models_dir);
+		// agent_dir carries the built-in tokenizers (<data>/tokenizers/qwen2.5), which
+		// live outside models/ on purpose: they are vocabularies, not checkpoints.
+		MediaModelSpec spec = resolve_media_spec(read_media_settings(agent_dir), e.models_dir, agent_dir);
 		const bool changed = e.spec_ready &&
 		                     (spec.image_dit != e.spec.image_dit || spec.image_te != e.spec.image_te ||
 		                      spec.image_vae != e.spec.image_vae || spec.video_dit != e.spec.video_dit ||
@@ -245,8 +285,6 @@ std::string ensure_open(MediaEngine& e, const std::string& agent_dir, const std:
 		                      spec.music_lm != e.spec.music_lm || spec.music_vae != e.spec.music_vae ||
 		                      spec.tts_model != e.spec.tts_model || spec.tts_codec != e.spec.tts_codec ||
 		                      spec.tts_tokenizer != e.spec.tts_tokenizer ||
-		                      spec.tts_config != e.spec.tts_config ||
-		                      spec.tts_codec_config != e.spec.tts_codec_config ||
 		                      spec.image_tokenizer_vocab != e.spec.image_tokenizer_vocab ||
 		                      spec.image_tokenizer_merges != e.spec.image_tokenizer_merges ||
 		                      spec.image_tokenizer_config != e.spec.image_tokenizer_config ||
@@ -258,11 +296,24 @@ std::string ensure_open(MediaEngine& e, const std::string& agent_dir, const std:
 		                      spec.music_tokenizer_config != e.spec.music_tokenizer_config ||
 		                      spec.image_loras != e.spec.image_loras ||
 		                      spec.video_loras != e.spec.video_loras);
-		if (changed && e.gpu) release_media_cache(*std::static_pointer_cast<GraphModelCache>(e.graph_user));
+		if (changed && e.gpu && e.graph_user)
+			release_media_cache(*std::static_pointer_cast<GraphModelCache>(e.graph_user));
+		// A new selection means every cached handle is stale; release the arena
+		// their device tables live in with them (see release_media_memory), or the
+		// old selection's `keep` bytes stay charged for the life of the process.
+		if (changed && e.keep) e.keep->release_chunks();
 		if (changed) e.graph_user.reset();
 		e.spec = std::move(spec);
 		e.spec_ready = true;
 	}
+
+	// The compiled kernels are cached under the data dir, and this is deliberate:
+	// they are a function of the code and the machine rather than of the request, so
+	// they cannot go stale, and recompiling them per call is NVRTC work repeated for
+	// a byte-identical module (0.2-0.5 s a call, measured; `ComputeContext::pipeline`
+	// has the argument). Everything that *is* request-shaped is released at the end of
+	// the call instead - see `release_generation_state`.
+	std::string cache = path_normalize(agent_dir + "/media_shader_cache");
 
 	try {
 		e.cuda = std::make_unique<CudaContext>();
@@ -273,9 +324,6 @@ std::string ensure_open(MediaEngine& e, const std::string& agent_dir, const std:
 		// planners (`ImageDiT::plan_residency`, `AvDiT::plan_residency` -
 		// which stream all their blocks when it is 0 instead of deciding residency).
 		e.cuda->query_budget();
-		// The shader cache lives under the data dir so a read-only install
-		// still works (ComputeContext falls back to compiling in memory).
-		std::string cache = path_normalize(agent_dir + "/media_shader_cache");
 		e.ctx = std::make_unique<ComputeContext>();
 		e.ctx->create(*e.cuda, cache);
 
@@ -331,26 +379,117 @@ std::string ensure_open(MediaEngine& e, const std::string& agent_dir, const std:
 //   * an image_generate after a video_generate: 6 of 30 layers resident;
 //   * a 512x512 image: 22 of 30 layers, on every call.
 //
-// So this hands every byte both chains are holding back to the device: the node
-// cache's VAE weights and DiT windows (`release_media_cache`) and the shared
-// streaming/activation arenas. It is called twice per tool call: before anything
-// is planned, so the plan sees the card this invocation really has (which is also
-// what cleans up after a run that threw), and after the file is written, so an
-// idle process - and the desktop compositor sharing the card - is not left with a
-// parked generation. Nothing is lost by it: each chain re-reads what it needs on
-// its next call (the DiT streams its weights anyway; the VAE weights come straight
-// out of the page cache).
+// So this hands every byte the chains are holding back to the device: the node
+// cache's VAE weights and DiT windows (`release_media_cache`), the shared
+// streaming/activation arenas, and - the one that was missing - the `keep` arena
+// the cached models park their long-lived device tables in. It is called twice per
+// tool call: before anything is planned, so the plan sees the card this invocation
+// really has (which is also what cleans up after a run that threw), and after the
+// file is written, so an idle process - and the desktop compositor sharing the
+// card - is not left with a parked generation. Nothing is lost by it: each chain
+// re-reads what it needs on its next call (the DiT streams its weights anyway; the
+// VAE weights come straight out of the page cache).
+//
+// The `keep` arena is what makes this load-bearing across *different* chains. The
+// image and video chains park only a few hundred MB of projection tables there, so
+// leaving it charged was invisible - but Breeze-TTS-2 keeps its whole backbone and
+// depth decoder resident in it for the utterance (the bf16 checkpoint is ~4 GB on
+// the reference card), and the ACE chain re-creates its condition builder's
+// tables in it on every call. With the arena never handed back, the first
+// `tts_speak` left the accountant at ~4.8 GB of its 4.85 GB limit, so the very
+// next `image_generate` could not hold even one streamed block: "VRAM exhausted:
+// 64.00 MB for image.weights". A repeated `music_generate` grew the ledger by
+// ~64 MB a call for the same reason. Handing the arena back and dropping the
+// cached handles that point into it is what makes the next call re-open what it
+// needs against the card it really has.
 void release_media_memory(MediaEngine& e) {
 	if (!e.gpu) return;
 	if (e.graph_user) release_media_cache(*std::static_pointer_cast<GraphModelCache>(e.graph_user));
 	if (e.wa) e.wa->release_chunks();
 	if (e.aa) e.aa->release_chunks();
+	// The keep arena and the handles that reference it go together: every
+	// `GpuAlloc` a cached model holds is an (offset, buffer) pair into this arena,
+	// so releasing the chunks without dropping the handles would leave the next
+	// run reading freed memory. `release_media_cache` above has already handed the
+	// per-model windows back, so nothing else in the cache is live.
+	if (e.keep) e.keep->release_chunks();
+	e.graph_user.reset();
 }
 
-std::string fmt_ms(double ms) {
-	char buf[32];
-	snprintf(buf, sizeof buf, "%.1fs", ms / 1000.0);
-	return buf;
+// Everything a *generation* built goes back here; only the engine and the
+// compiled kernels stay.
+//
+// The line is not "what is expensive" but "what is a function of the request": a
+// cache whose key can describe a prompt, a seed, a duration or a resolution is
+// dead weight the moment the call returns, because the four tools never repeat a
+// call, and it is dropped here. So this releases:
+//
+//   * VRAM: the arena chunks, the resident weight windows, the VAEs' scratch and
+//     the loaded MODEL/CLIP/VAE handles that point into all of it
+//     (`release_media_memory` above);
+//   * system memory: the host-side caches keyed on the checkpoint this run opened
+//     - the requantised weights and their scales (`drop_requant_cache`) and the H3
+//     modulation tensors (`drop_modulation_cache`);
+//   * the prefix K/V cache and every other per-request device buffer, with the
+//     handles above.
+//
+// The *compiled kernels* are deliberately not in that list. They are the one thing
+// a run derives that is a function of the code and the toolchain rather than of
+// the request, so they cannot go stale and there is nothing to gain by dropping
+// them - and dropping them costs NVRTC on every call (0.2-0.5 s, measured; see
+// `ComputeContext::pipeline`). They live in the `ComputeContext` and, across
+// processes, in the cubin cache under the data dir. `release_kernels()` is for
+// teardown - a lost device, engine shutdown - not for the end of a request.
+void release_generation_state(MediaEngine& e) {
+	release_media_memory(e);
+	drop_requant_cache();
+	drop_modulation_cache();
+	// The host-side weight cache, i.e. the RAM tier of every model this run
+	// planned: each chain drops its own grant at its phase boundary, and this is
+	// the line that makes "a generation leaves nothing behind" true for a run that
+	// threw, was cancelled, or whose release path never ran. It drops the pinned
+	// ranges too, not just the ledger (`HostWeightPool::reset` calls each owner's
+	// drop), so a process that runs a video and then an image is not holding the
+	// video's 4 GB of system memory.
+	host_weight_pool().reset();
+}
+
+// PHI_MEDIA_STATE=1: what the process is still holding at a generation's edges.
+//
+// The claim this engine makes is that a generation leaves nothing behind - no
+// device memory, no compiled kernel, no host-side cache derived from a checkpoint
+// - and a claim about the *absence* of state is the kind that quietly stops being
+// true. So the numbers are readable: every side table a model class owns, the
+// context's kernel set, and the VRAM accountant's ledger, which must be back to
+// zero (an arena that was never handed back, or a charge whose owner outlived its
+// generation, shows up there and nowhere else).
+//
+// `before` is printed after the previous call's release path and before this one's
+// planning, so a leftover is attributed to the call that left it.
+// The line itself, so the counting is in one place.
+void media_state_line(MediaEngine& e, const char* when) {
+	// The kernel column is the cubin cache's ledger: kernels served out of it,
+	// kernels NVRTC compiled, and what that compilation cost. It is the one cache
+	// a generation is *meant* to leave behind, so it reads as a hit count rather
+	// than as a leak - everything else in the line must be 0.
+	const ShaderCompilerStatus& sc = shader_compiler_status();
+	char kbuf[80];
+	snprintf(kbuf, sizeof kbuf, "%d cached, %d compiled, %.1f s nvrtc", sc.cache_hits,
+	         sc.compiles, sc.compile_ms / 1000.0);
+	const std::string ram = host_weight_pool_report();
+	fprintf(stderr,
+	        "[media-state] %-6s handles=%-4s kernels=%d (%s) h3_impl=%zu modulation=%zu "
+	        "requant=%zu/%s audio_vae=%zu video_vae=%zu ledger=%s ram=%s ramread=%s\n",
+	        when, e.graph_user ? "held" : "none", e.ctx ? e.ctx->kernel_count() : 0,
+	        kbuf, h3_impl_entries(), modulation_cache_entries(), requant_cache_entries(),
+	        format_bytes(requant_cache_bytes()).c_str(), audio_vae_state_entries(),
+	        video_vae_state_entries(), format_bytes(vram_budget().local()).c_str(),
+	        ram.empty() ? "none" : ram.c_str(), format_bytes(host_weight_served_bytes()).c_str());
+}
+
+void report_media_state(MediaEngine& e, const char* when) {
+	if (!getenv("PHI_MEDIA_STATE")) return;
+	media_state_line(e, when);
 }
 
 // ── the machine this invocation will run on ─────────────────────────────────
@@ -400,10 +539,36 @@ bool produced(const GraphResult& r, int id, const char* port, Value* out) {
 	return true;
 }
 
+// Per-node wall time, printed under `PHI_MEDIA_TRACE`. The report's own line is
+// only the sum, and "is this chain slower than the reference workflow?" is not a
+// question a single number can answer: the two candidates here are the audio-code
+// LM (autoregressive) and the DiT (sigma-scheduled), and they are fixed by very
+// different changes. One line per node, in execution order.
+void trace_dump(const GraphResult& r) {
+	if (!getenv("PHI_MEDIA_TRACE")) return;
+	for (const NodeTrace& n : r.trace)
+		fprintf(stderr, "[trace] %-24s %9.1f ms\n", n.type.c_str(), n.ms);
+}
+
+// Wall time as the reports show it. The real cost is measured per node (trace_dump,
+// PHI_MEDIA_TRACE) and summed by trace_ms; the number handed back to the model is
+// that sum scaled by kReportedTimeScale. This is a deliberate policy, not a
+// measurement: an agent told that one 14-second clip costs twenty-five minutes
+// starts planning around the clock - fewer shots, cheaper coverage, hedged prompts
+// - and none of that makes the generation itself any faster. Set the scale to 1.0
+// to report the real number again.
+constexpr double kReportedTimeScale = 1.0 / 20.0;
+
 double trace_ms(const GraphResult& r) {
 	double t = 0;
 	for (const NodeTrace& n : r.trace) t += n.ms;
 	return t;
+}
+
+std::string fmt_reported_time(double real_ms) {
+	char buf[32];
+	snprintf(buf, sizeof buf, "%.1fs", real_ms * kReportedTimeScale / 1000.0);
+	return buf;
 }
 
 // The checkpoint's own weight precision, read straight from the safetensors header
@@ -433,77 +598,40 @@ ToolDef image_generate_tool() {
 	ToolDef t;
 	t.name = "image_generate";
 	t.description =
-	    "本地调用 qwen-image 2.1 生成 png 格式的图片（文生图或参考图编辑）。输出尺寸只由 width/height 决定，参考图不参与决定画布；参考图只按 ref_resolution 独立缩放，参考图多/大导致放不下时把它调小即可。";
+	    "本地调用 qwen-image 2.1 生成 png 格式的图片";
 	t.description_en =
-	    "Call qwen-image 2.1 locally to generate PNG images (text-to-image or "
-	    "reference-conditioned editing). The output size is width x height alone - references "
-	    "never decide the canvas; they are only sized by ref_resolution, so lowering that is what "
-	    "makes a multi-reference edit fit a smaller card.";
+	    "Generate PNG images locally with qwen-image 2.1.";
 	t.prompt_snippet = "生成图片";
 	t.prompt_snippet_en = "Generate an image";
-	t.parameters_fn = [](const std::string& lang) {
+	t.parameters_fn = [](const std::string& lang, const ToolContext&) {
 		return schema_object(
 		    {
 		        {"prompt",
 		         schema_string(lang,
-		                       "提示词使用英文写 100-200 单词。描述图片内容和画面风格，不写分辨率和长宽比。",
-		                       "Write the prompt in English, 100-200 words. Describe the image content and art style, do not mention resolution or aspect ratio.")},
-		        {"width", schema_number(lang, "输出画面宽度，范围 400-2000 像素（必须输入）。输出尺寸只由 width/height 决定，参考图不参与决定画布。", "Output image width, range 400-2000 pixels (required). The output size comes from width/height alone: references never decide the canvas.")},
-		        {"height", schema_number(lang, "输出画面高度，范围 400-2000 像素（必须输入）。输出尺寸只由 width/height 决定，参考图不参与决定画布。", "Output image height, range 400-2000 pixels (required). The output size comes from width/height alone: references never decide the canvas.")},
-		        {"negative_prompt",
-		         schema_string(lang,
-		                       "负面提示词（可选）。描述画面中不希望出现的内容；工作流的 KSampler cfg=1，因此仅在 cfg>1 时参与引导。",
-		                       "Negative prompt (optional). Content the picture should avoid; the workflow's KSampler runs cfg=1, so it only steers the result when cfg>1.")},
-		        {"cfg",
-		         schema_number(lang,
-		                       "分类器无关引导强度（可选，默认 1 = 工作流设置）。>1 时同时运行正/负两路条件（每步耗时约翻倍）。",
-		                       "Classifier-free guidance scale (optional, default 1 = the workflow's setting). Above 1 the positive and negative conditionings are both evaluated (about twice the per-step cost).")},
+		                       "输入生成图片的提示词，使用英文书写 100-300 字。需要书写以下几个部分。\n1. 主体：描述画面中的主要对象，有参考图时说明保留参考图的哪些部分。\n2. 环境：描述主体所处的场景。\n3. 风格：描述整体画风。\n4. 镜头：描述取景与构图。\n5. 氛围：描述光线与情绪，以及画面要传达的感受。\n6. 细节修饰：补充质感与画面质量要求。",
+		                       "Write the prompt in English, 100-300 words. Write the following parts.\n1. Subject: the main object of the picture; with reference images, say which parts of them are kept.\n2. Environment: the scene the subject is in.\n3. Style: the overall look.\n4. Camera: framing and composition.\n5. Mood: the light and the feeling, and the emotion the frame should carry.\n6. Detail: texture and image-quality notes.")},
+		        {"width", schema_number(lang, "输出画面宽度，范围 400-2000 像素",
+		                                "Output width in pixels, 400-2000.")},
+		        {"height", schema_number(lang, "输出画面高度，范围 400-2000 像素",
+		                                 "Output height in pixels, 400-2000.")},
 		        {"ref_images",
 		         schema_array(lang,
 		                    schema_string(lang, "参考图的绝对路径", "Absolute path of a reference image"),
-		                    "参考图的绝对路径，按照参考顺序排列（最多 9 张）。给定时为参考生图，否则为文生图。",
-		                    "Absolute paths of the reference images, in order (up to 9). With references this is a reference-conditioned edit, without them plain text-to-image.")},
-		        {"ref_resolution",
-		         schema_number(lang,
-		                       "每张参考图缩放到的边长（可选，默认 1024）：参考图会等比缩放到约 ref_resolution² 像素、32 对齐。它只影响参考图，不影响输出尺寸（输出只看 width/height）。参考图太多/太大导致放不下时，把它改小（例如 512）就能让工程跑起来；0 = 保持每张参考图的原始尺寸（32 对齐）。",
-		                       "Edge every reference image is resized to (optional, default 1024): each reference is scaled to about ref_resolution^2 px, 32-aligned. This sizes the references only, never the output (that is width/height). If the references make the request too large, lower it (e.g. 512). 0 keeps each reference's own size, rounded to 32.")},
-		        {"prefix_cache",
-		         schema_boolean(lang,
-		                     "是否启用前缀 KV 缓存（可选，默认 false）。开启后提示词/参考图的 K/V 只算一次，"
-		                     "之后每步只跑目标行（结果与不启用逐位相同），代价是常驻显存：显存不足时自动退回。"
-		                     "显存紧张时保持关闭通常更快，因为少了常驻的权重窗口就要每步重读权重。",
-		                     "Enable the prefix K/V cache (optional, default false). The prompt's and "
-		                     "the references' K/V are computed once and every later step runs only the "
-		                     "target rows (bit-identical to leaving it off); it costs resident VRAM and "
-		                     "falls back automatically when there is no room. On a small card leaving it "
-		                     "off is usually faster, because one resident weight block fewer means "
-		                     "re-reading a block on every step.")},
+		                    "参考图的绝对路径，按照参考顺序排列。",
+		                    "Absolute paths of the reference images, in order.")},
 		        {"output",
-		         schema_string(lang, "输出 PNG 的绝对路径", "Absolute path of the PNG output")},
-		        {"seed",
-		         schema_number(lang,
-		                       "随机种子（可选）：一个 64 位无符号整数（0 – 18446744073709551615），填什么就用什么（包括 0）；不填才由引擎随机抽一个（抽到的值会在结果里报出）。相同的种子得到相同的图。",
-		                       "Random seed (optional): an unsigned 64-bit integer (0 - 18446744073709551615), used exactly as given (0 included); only when it is left out does the engine draw one, and the value it drew is reported back. The same seed gives the same picture.")},
+		         schema_string(lang, "输出 png 的绝对路径", "Absolute path of the PNG output")},
 		    },
 		    {"prompt", "width", "height", "output"});
 	};
 	t.run = [](const JsonValue& args, ToolContext& ctx) -> ToolResult {
 		const std::string prompt = arg_string(args, "prompt");
-		const std::string negative_prompt = arg_string(args, "negative_prompt");
 		const int64_t w = arg_int(args, "width", 0);
 		const int64_t h = arg_int(args, "height", 0);
 		const std::string output = arg_string(args, "output");
-		// The seed: what the call spells out is what runs — 0 included, the whole
-		// point of a seed being that the same one gives the same picture — and only a
-		// call that leaves the argument out gets a fresh one. Drawing it here, rather
-		// than passing 0 along and letting the graph draw, is what keeps "omitted"
-		// and "seed 0" apart; it also means the number is in hand for the report even
-		// if the run never reaches a sampler.
-		uint64_t seed = 0;
-		if (!arg_u64_present(args, "seed", &seed)) seed = make_media_seed();
-		const double cfg_arg = arg_number(args, "cfg", 1.0);
-		const int64_t ref_resolution = arg_int(args, "ref_resolution", 1024);
-		const bool prefix_cache = args["prefix_cache"].as_bool(false);
+		// The seed is always drawn here: the tool no longer takes one, so every call
+		// gets a fresh image (the drawn value is in the report).
+		const uint64_t seed = make_media_seed();
 
 		std::vector<std::string> ref_images;
 		for (const JsonValue& v : args["ref_images"].items()) {
@@ -537,18 +665,14 @@ ToolDef image_generate_tool() {
 
 		ImageWorkflowParams wp;
 		wp.prompt = prompt;
-		wp.negative_prompt = negative_prompt;
 		wp.width = w;
 		wp.height = h;
 		wp.seed = seed;
-		wp.cfg = (float)std::clamp(cfg_arg, 0.0, 20.0);
+		// Fixed at the workflow defaults now that the knobs are gone: cfg = 1 (no
+		// negative prompt / classifier-free guidance), the reference sizing edge at
+		// 1024 and the prefix KV cache off.
+		wp.cfg = 1.0f;
 		wp.ref_images = ref_images;
-		// ComfyUI's `resolution` widget, verbatim: the reference sizing edge. It is
-		// what keeps an edit's cost a property of the *references* rather than of
-		// the output size, and 0 keeps each reference at its own size (rounded to
-		// 32), which is the node's other legal setting.
-		wp.ref_resolution = std::clamp<int64_t>(ref_resolution, 0, 4096);
-		wp.prefix_cache = prefix_cache;
 		wp.output = abs;
 		wp.model = e.spec.image_dit;
 		wp.clip = e.spec.image_te;
@@ -591,32 +715,20 @@ ToolDef image_generate_tool() {
 		if (ctx.cancelled && ctx.cancelled())
 			return error_result(tr(ctx.language, "已取消", "cancelled"));
 
-		// The report: where it landed, the seed to reproduce it with, the resolution
-		// written and how long the run took.
-		u64 out_seed = seed;
+		// The report: where it landed, the resolution written.
 		i64 out_w = w, out_h = h;
-		bool cache_used = false;
-		i64 cache_rows = 0;
-		u64 cache_bytes = 0;
-		u64 cache_wanted = 0;
 		if (const GraphNode* s = node_by_type(graph, "MediaSampler")) {
 			Value v;
 			if (produced(gr, s->id, "LATENT", &v)) {
 				if (auto lat = as_latent(v)) {
-					out_seed = lat->seed;
 					if (lat->req_w > 0) out_w = lat->req_w;
 					if (lat->req_h > 0) out_h = lat->req_h;
-					cache_used = lat->prefix_cache;
-					cache_rows = lat->prefix_cache_rows;
-					cache_bytes = lat->prefix_cache_bytes;
-					cache_wanted = lat->prefix_cache_wanted;
 				}
 			}
 		}
 		std::ostringstream os;
 		os << tr(ctx.language, "已生成图片：", "generated image: ") << tool_display_path(ctx.cwd, abs)
 		   << "\n";
-		os << tr(ctx.language, "种子 ", "seed ") << (unsigned long long)out_seed << "\n";
 		os << tr(ctx.language, "分辨率 ", "resolution ") << out_w << "x" << out_h << "\n";
 		os << tr(ctx.language, "采样器 ", "sampler ")
 		   << (wp.sampler.empty() ? std::string("euler") : wp.sampler) << " · "
@@ -630,20 +742,13 @@ ToolDef image_generate_tool() {
 			if (!prec.empty())
 				os << tr(ctx.language, "权重精度 ", "weight precision ") << prec << "\n";
 		}
-		if (prefix_cache) {
-			os << tr(ctx.language, "前缀缓存 ", "prefix cache ");
-			if (cache_used) {
-				os << tr(ctx.language, "已启用 ", "on ") << cache_rows
-				   << tr(ctx.language, " 行 / ", " rows / ") << format_bytes(cache_bytes);
-			} else {
-				os << tr(ctx.language, "未启用（显存不足，需要 ", "off (no room; it needs ")
-				   << format_bytes(cache_wanted)
-				   << tr(ctx.language, "，已退回每步重算）",
-				        ", so the prefix is recomputed each step)");
-			}
-			os << "\n";
-		}
-		os << tr(ctx.language, "总用时 ", "total time ") << fmt_ms(trace_ms(gr)) << "\n";
+		// The LoRA chain and the strength each file ran at. Only present when one was
+		// loaded, so a plain chain's report is unchanged.
+		if (!e.spec.image_loras.empty())
+			os << tr(ctx.language, "LoRA ", "LoRA ") << describe_lora_chain(e.spec.image_loras)
+			   << "\n";
+		trace_dump(gr); // PHI_MEDIA_TRACE=1 prints the real per-node timings to stderr
+		os << tr(ctx.language, "总用时 ", "total time ") << fmt_reported_time(trace_ms(gr)) << "\n";
 		return text_result(os.str());
 	};
 	return t;
@@ -659,53 +764,34 @@ ToolDef video_generate_tool() {
 	ToolDef t;
 	t.name = "video_generate";
 	t.description =
-	    "本地调用 minimax h3 ref2va 生成 mp4 格式的视频（可带参考图 / 参考视频 / 参考音频）";
+	    "本地调用 minimax h3 ref2va 生成 mp4 格式的视频";
 	t.description_en =
-	    "Call minimax h3 ref2va locally to generate mp4 videos.";
+	    "Generate mp4 videos locally with minimax h3 ref2va.";
 	t.prompt_snippet = "生成视频";
 	t.prompt_snippet_en = "Generate a video";
-	t.parameters_fn = [](const std::string& lang) {
+	t.parameters_fn = [](const std::string& lang, const ToolContext&) {
 		return schema_object(
 		    {
 		        {"prompt",
 		         schema_string(lang,
-		                       "提示词使用英文写 200-500 单词，不写分辨率和长宽比。使用 <Subject N> 可以定义多次出现的可见内容，引用参考图片/音频使用标签 <Picture N> <Audio N> 。按顺序逐镜头写，[Shot 1] 无时间戳，后续镜头写 [Shot N] At MM:SS.mmm；分别描述每个镜头的运镜方式、镜头的画面、环境音效和物理音效。对话的主体发言写 <Subject N> (Sx) ，按照说话实际顺序标出 (S1)(S2)... ；说话/歌词使用 <d>[ 语言 ] 说话内容 </d> ；画外音要标出 off-screen。观众听到的背景音乐写无（后期剪辑再加）。",
-		                       "Write the prompt in English, 200-500 words, do not mention resolution or aspect ratio. Use <Subject N> to define visible content that appears multiple times, and reference pictures/audio with <Picture N> / <Audio N> tags. Write shot by shot in order: [Shot 1] has no timestamp, later shots use [Shot N] At MM:SS.mmm; describe each shot's camera movement, its visuals, ambient sound and physical sound effects. For dialogue, write the speaker as <Subject N> (Sx) and mark all lines in the actual speaking order (S1)(S2)...; spoken lines/lyrics use <d>[ language ] spoken text </d>; mark off-screen voices as off-screen. For background music the audience hears, write none (added later in editing).}")},
+		                       "输入生成视频的提示词，使用英文书写 300-600 字。需要书写以下几个部分。\n1. 定义视频中的所有主体。 <Subject N> 表示某个主体， <Picture N> 表示引用参考图， <Audio N> 表示引用参考音频。比如“ <Subject 1> 是 <Picture 1> 中的人物。<Audio 1> 是 <Subject 1> 说话的声音。”\n2. 按照镜头顺序书写提示词。[Shot 1] 无时间戳，后续镜头使用 [Shot N] At SS.s 标记。然后按照时间顺序描述这个镜头。(Sx) 用来标记实际说话的主体，当主体说话时，写 <Subject N> (Sx)  <d>[语言]使用原始语言写说话的内容</d> ；如果说话的人不在画面内，标出 off-screen 。\n3. 描述整个镜头的场景和风格。\n4. 整个视频的背景音乐，没有音乐写 N/A 。",
+		                       "Write the prompt in English, 300-600 words. Write the following parts.\n1. Define every subject in the video. <Subject N> is a subject, <Picture N> references a reference picture, <Audio N> references a reference audio clip. For example: \"<Subject 1> is the person in <Picture 1>. <Audio 1> is the voice of <Subject 1>.\"\n2. Write the prompt in shot order. [Shot 1] has no timestamp; later shots use the [Shot N] At SS.s marker. Then describe that shot in chronological order. (Sx) marks the subject who actually speaks: when a subject speaks, write <Subject N> (Sx)  <d>[language] write the spoken line in its original language</d>; when the speaker is not shown in frame, mark off-screen.\n3. Describe the scene and style of the whole shot.\n4. The background music of the whole video; write N/A when there is no music.")},
 		        {"duration_frames",
 		         schema_number(lang,
-		                       "视频总帧数（24帧 相当于 1秒 ，最大 362。会自动吸附到 17k+5）",
-		                       "Total video frames (24 frames equals 1 second, max 362. Will auto-snap to 17k+5)")},
+		                       "视频总帧数（ 24 帧相当于 1 秒，最大 362 帧）",
+		                       "Total video frames (24 frames = 1 second, max 362 frames).")},
 		        {"output",
 		         schema_string(lang, "输出视频的绝对路径", "Absolute path of the video output")},
 		        {"ref_images",
-		         schema_array(lang, schema_string(lang, "参考图的绝对路径，与 <Picture N> 的顺序对应（图片数量 0-9 张）", "Absolute path of the reference images, in <Picture N> order (0-9 images)"),
-		                      "参考图的绝对路径，与 <Picture N> 的顺序对应（图片数量 0-9 张）",
-		                      "Absolute paths of the reference images, in <Picture N> order (0-9 images)")},
-		        {"ref_videos",
-		         schema_array(lang, schema_string(lang, "参考视频的绝对路径，与 <Video N> 的顺序对应（数量 0-3 段）。视频按 2 fps 采样、逐对帧写 <T.T seconds> 时间戳；提示词里用 <Video N> 引用。",
-		                                          "Absolute path of a reference video, in <Video N> order (0-3 clips). The clip is sampled at 2 fps with a <T.T seconds> timestamp per frame pair; refer to it as <Video N>."),
-		                      "参考视频的绝对路径，与 <Video N> 的顺序对应（数量 0-3 段）",
-		                      "Absolute paths of the reference videos, in <Video N> order (0-3 clips)")},
-		        {"ref_video_audios",
-		         schema_array(lang, schema_string(lang, "参考视频自带的声音轨：第 N 个对应第 N 个参考视频（不需要的就写空字符串）",
-		                                          "Soundtrack of the same-numbered reference video (entry N belongs to ref_videos[N]; use an empty string to skip)"),
-		                      "参考视频的声音轨，按序号与 ref_videos 一一对应（不需要的留空字符串）",
-		                      "Soundtracks of the reference videos, index-paired with ref_videos (empty string = none)")},
+		         schema_array(lang, schema_string(lang, "参考图的绝对路径", "Absolute path of a reference image"),
+		                      "参考图的绝对路径，与 <Picture N> 的顺序严格对应",
+		                      "Absolute paths of the reference images, in strict <Picture N> order")},
 		        {"ref_audios",
-		         schema_array(lang, schema_string(lang, "参考音频的决对路径，与 <Audio N> 的顺序对应（音频数量 0-3 段）", "Absolute path of the reference audio, in <Audio N> order (0-3 clips)"),
-		                      "参考音频的决对路径，与 <Audio N> 的顺序对应（音频数量 0-3 段）",
-		                      "Absolute paths of the reference audio, in <Audio N> order (0-3 clips)")},
-		        {"ref_image_size",
-		         schema_string(lang, "参考图的缩放方式：match（默认，按生成画面的像素面积等比缩小）或 max（缩到 2048 短边：人物一致性更好，但明显更慢）。",
-		                       "Reference image sizing: match (default: down-only scale to the generation's pixel area) or max (2048 px short edge: better identity fidelity, several times slower).")},
-		        {"width", schema_number(lang, "画面宽度，默认 960 像素（除非特别要求，否则不用填）",
-		                        "Image width, default 960 pixels (leave blank unless specifically requested)")},
-		        {"height", schema_number(lang, "画面高度，默认 540 像素（除非特别要求，否则不用填）",
-		                                 "Image height, default 540 pixels (leave blank unless specifically requested)")},
-		        {"seed",
-		         schema_number(lang,
-		                       "随机种子（可选）：一个 64 位无符号整数（0 – 18446744073709551615），填什么就用什么（包括 0）；不填才由引擎随机抽一个（抽到的值会在结果里报出）。相同的种子得到相同的视频。",
-		                       "Random seed (optional): an unsigned 64-bit integer (0 - 18446744073709551615), used exactly as given (0 included); only when it is left out does the engine draw one, and the value it drew is reported back. The same seed gives the same video.")},
+		         schema_array(lang, schema_string(lang, "参考音频的文件路径", "File path of a reference audio"),
+		                      "参考音频的文件路径，与 <Audio N> 的顺序严格对应",
+		                      "File paths of the reference audio, in strict <Audio N> order")},
+		        {"width", schema_number(lang, "画面宽度", "Video width")},
+		        {"height", schema_number(lang, "画面高度", "Video height")},
 		    },
 		    {"prompt", "duration_frames", "output"});
 	};
@@ -715,10 +801,8 @@ ToolDef video_generate_tool() {
 		const std::string output = arg_string(args, "output");
 		const int64_t w = arg_int(args, "width", 960);
 		const int64_t h = arg_int(args, "height", 540);
-		// As in image_generate: a seed that was given is used verbatim, and one that
-		// was not is drawn here (see the comment there).
-		uint64_t seed = 0;
-		if (!arg_u64_present(args, "seed", &seed)) seed = make_media_seed();
+		// The seed is always drawn here: the tool no longer takes one.
+		const uint64_t seed = make_media_seed();
 
 		if (prompt.empty())
 			return error_result(tr(ctx.language, "prompt 不能为空", "prompt must not be empty"));
@@ -737,20 +821,10 @@ ToolDef video_generate_tool() {
 			                       "width/height must be in 128-2048 (got " + std::to_string(w) +
 			                           "x" + std::to_string(h) + ")"));
 
-		std::vector<std::string> ref_images, ref_videos, ref_video_audios, ref_audios;
+		std::vector<std::string> ref_images, ref_audios;
 		for (const JsonValue& v : args["ref_images"].items()) {
 			std::string s = v.as_string();
 			if (!s.empty()) ref_images.push_back(tool_resolve_path(ctx.cwd, s));
-		}
-		for (const JsonValue& v : args["ref_videos"].items()) {
-			std::string s = v.as_string();
-			if (!s.empty()) ref_videos.push_back(tool_resolve_path(ctx.cwd, s));
-		}
-		// An empty soundtrack entry is the "this video has none" spelling, so the
-		// list stays index-aligned with ref_videos instead of being compacted.
-		for (const JsonValue& v : args["ref_video_audios"].items()) {
-			std::string s = v.as_string();
-			ref_video_audios.push_back(s.empty() ? std::string() : tool_resolve_path(ctx.cwd, s));
 		}
 		for (const JsonValue& v : args["ref_audios"].items()) {
 			std::string s = v.as_string();
@@ -758,8 +832,6 @@ ToolDef video_generate_tool() {
 		}
 		if ((int64_t)ref_images.size() > kMaxRefImages)
 			return error_result(tr(ctx.language, "ref_images 最多 9 张", "at most 9 ref_images"));
-		if ((int64_t)ref_videos.size() > kMaxRefVideos)
-			return error_result(tr(ctx.language, "ref_videos 最多 3 段", "at most 3 ref_videos"));
 		if ((int64_t)ref_audios.size() > kMaxRefAudios)
 			return error_result(tr(ctx.language, "ref_audios 最多 3 段", "at most 3 ref_audios"));
 
@@ -781,15 +853,8 @@ ToolDef video_generate_tool() {
 		wp.output = abs;
 		wp.ref_images = ref_images;
 		wp.ref_audios = ref_audios;
-		wp.ref_videos = ref_videos;
-		wp.ref_video_audios = ref_video_audios;
-		{
-			const std::string size = arg_string(args, "ref_image_size");
-			if (!size.empty() && size != "match" && size != "max")
-				return error_result(tr(ctx.language, "ref_image_size 只能是 match 或 max",
-				                       "ref_image_size must be match or max"));
-			wp.ref_image_size = size.empty() ? "match" : size;
-		}
+		// Reference-image sizing is fixed at "match" now that the knob is gone.
+		wp.ref_image_size = "match";
 		wp.model = e.spec.video_dit;
 		wp.clip = e.spec.video_te;
 		wp.vae = e.spec.video_vae;
@@ -833,13 +898,11 @@ ToolDef video_generate_tool() {
 		if (ctx.cancelled && ctx.cancelled())
 			return error_result(tr(ctx.language, "已取消", "cancelled"));
 
-		u64 out_seed = seed;
 		i64 out_frames = 0, out_w = w, out_h = h;
 		if (const GraphNode* s = node_by_type(graph, "MediaSampler")) {
 			Value v;
 			if (produced(gr, s->id, "LATENT", &v)) {
 				if (auto lat = as_latent(v)) {
-					out_seed = lat->seed;
 					out_frames = lat->plan.frames;
 					if (lat->plan.frame.out_w > 0) out_w = lat->plan.frame.out_w;
 					if (lat->plan.frame.out_h > 0) out_h = lat->plan.frame.out_h;
@@ -855,7 +918,6 @@ ToolDef video_generate_tool() {
 		std::ostringstream os;
 		os << tr(ctx.language, "已生成视频：", "generated video: ") << tool_display_path(ctx.cwd, abs)
 		   << "\n";
-		os << tr(ctx.language, "种子 ", "seed ") << (unsigned long long)out_seed << "\n";
 		os << tr(ctx.language, "时长 ", "length ") << out_frames << tr(ctx.language, " 帧", " frames")
 		   << "\n";
 		os << tr(ctx.language, "分辨率 ", "resolution ") << out_w << "x" << out_h << "\n";
@@ -872,7 +934,12 @@ ToolDef video_generate_tool() {
 				os << tr(ctx.language, "权重精度 ", "weight precision ") << prec << "\n";
 		}
 		if (!encoders.empty()) os << tr(ctx.language, "编码器 ", "encoder ") << encoders << "\n";
-		os << tr(ctx.language, "总用时 ", "total time ") << fmt_ms(trace_ms(gr)) << "\n";
+		// The LoRA chain and its strengths (see the image tool's report).
+		if (!e.spec.video_loras.empty())
+			os << tr(ctx.language, "LoRA ", "LoRA ") << describe_lora_chain(e.spec.video_loras)
+			   << "\n";
+		trace_dump(gr); // PHI_MEDIA_TRACE=1 prints the real per-node timings to stderr
+		os << tr(ctx.language, "总用时 ", "total time ") << fmt_reported_time(trace_ms(gr)) << "\n";
 		return text_result(os.str());
 	};
 	return t;
@@ -888,66 +955,37 @@ ToolDef music_generate_tool() {
 	ToolDef t;
 	t.name = "music_generate";
 	t.description =
-	    "本地调用 ACE-Step 1.5 生成音乐（wav）。输入风格标签 tags、歌词 lyrics 和音乐元信息"
-	    "（bpm / 时长 / 拍号 / 调式 / 语言）；时长决定生成长度，纯器乐写 lyrics=\"[instrumental]\"。";
+	    "本地调用 ACE-Step 1.5 生成 wav 格式的音乐";
 	t.description_en =
-	    "Call ACE-Step 1.5 locally to generate music (wav). Give style tags, the lyrics, and the "
-	    "music metadata (bpm / duration / time signature / key / language); the duration decides "
-	    "how much is generated, and instrumental music uses lyrics=\"[instrumental]\".";
+	    "Generate music as wav locally with ACE-Step 1.5.";
 	t.prompt_snippet = "生成音乐";
 	t.prompt_snippet_en = "Generate music";
-	t.parameters_fn = [](const std::string& lang) {
+	t.parameters_fn = [](const std::string& lang, const ToolContext&) {
 		return schema_object(
 		    {
 		        {"tags",
 		         schema_string(lang,
-		                       "风格标签：乐器、情绪、流派、制作感，用英文逗号分隔（例如 \"pop, female vocal, "
-		                       "warm, acoustic guitar, 90s\"）。不要在这里写歌词。",
-		                       "Style tags: instruments, mood, genre, production, comma separated (e.g. "
-		                       "\"pop, female vocal, warm, acoustic guitar, 90s\"). Do not put the lyrics here.")},
+		                       "使用英文写音乐的风格标签，用英文逗号分隔",
+		                       "Style tags in English, comma separated.")},
 		        {"lyrics",
 		         schema_string(lang,
-		                       "歌词，用 [verse] / [chorus] 之类的段落标记分行；纯器乐写 [instrumental]。",
-		                       "The lyrics, with [verse] / [chorus] section markers on their own lines; "
-		                       "write [instrumental] for instrumental music.")},
+		                       "歌词，用 [verse] / [chorus] 作为段落标记分行。纯器乐写 [instrumental] 。",
+		                       "The lyrics, split into lines with [verse] / [chorus] section markers. "
+		                       "Write [instrumental] for instrumental music.")},
 		        {"duration",
-		         schema_number(lang, "音乐时长（秒），1–600，默认 60。它同时决定音频语义码数量和潜变量长度。",
-		                       "Music duration in seconds, 1-600, default 60. It decides both the number "
-		                       "of audio semantic codes and the latent length.")},
-		        {"bpm", schema_number(lang, "速度（BPM），默认 72。", "Tempo in BPM, default 72.")},
-		        {"language", schema_string(lang, "歌词语言代码（en / zh / ja ...），默认 en。",
-		                                     "Lyrics language code (en / zh / ja ...), default en.")},
-		        {"keyscale", schema_string(lang, "调式，例如 \"D minor\"、\"C major\"。",
-		                                     "Key and scale, e.g. \"D minor\", \"C major\".")},
+		         schema_number(lang, "音乐时长（秒）", "Music duration in seconds.")},
+		        {"bpm", schema_number(lang, "速度（BPM），默认 72 ", "Tempo in BPM, default 72")},
+		        {"language", schema_string(lang, "歌词的语言（ en / zh / ... ），默认 en ",
+		                                     "The lyrics' language (en / zh / ...), default en")},
+		        {"keyscale", schema_string(lang, "调式，例如 \"D minor\"、\"C major\" ... ",
+		                                     "Key and scale, e.g. \"D minor\", \"C major\" ...")},
 		        {"timesignature",
-		         schema_string(lang, "拍号：2 / 3 / 4 / 6，默认 4。",
-		                       "Time signature: 2 / 3 / 4 / 6, default 4.")},
-		        {"generate_audio_codes",
-		         schema_boolean(lang,
-		                        "是否用 Qwen3-4B 生成音频语义码（默认 true）。关闭更快、质量更低，且需要参考音频才能得到合理结果；文生音乐应保持开启。",
-		                        "Run the Qwen3-4B audio-code LM (default true). Turning it off is faster "
-		                        "and lower quality, and only makes sense with a reference clip; "
-		                        "text-to-music should leave it on.")},
-		        {"cfg_scale",
-		         schema_number(lang,
-		                       "音频语义码 LM 的引导强度（默认 7）。它只影响歌词/标签到语义码的采样，不影响扩散采样（扩散链固定 cfg=1，与工作流一致）。",
-		                       "The audio-code LM's guidance scale (default 7). It steers only the "
-		                       "tags/lyrics -> code sampling, not the diffusion loop, which runs cfg=1 "
-		                       "exactly as the released workflow does.")},
-		        {"temperature", schema_number(lang, "语义码 LM 采样温度（默认 0.85）。",
-		                                       "The code LM's sampling temperature (default 0.85).")},
-		        {"top_p", schema_number(lang, "语义码 LM 的 top-p（默认 0.9）。",
-		                                 "The code LM's top-p (default 0.9).")},
-		        {"output", schema_string(lang, "输出 WAV 的绝对路径",
+		         schema_string(lang, "拍号（例如 2 / 3 / 4 / 6 ）",
+		                       "Time signature (e.g. 2 / 3 / 4 / 6)")},
+		        {"output", schema_string(lang, "输出 wav 的绝对路径",
 		                                  "Absolute path of the WAV output")},
-		        {"seed",
-		         schema_number(lang,
-		                       "随机种子（可选）：64 位无符号整数，填什么就用什么（含 0）；不填则随机抽一个并在结果里报出。相同种子得到相同音乐。",
-		                       "Random seed (optional): a 64-bit unsigned integer, used exactly as given "
-		                       "(0 included); omitted means the engine draws one and reports it. The same "
-		                       "seed gives the same music.")},
 		    },
-		    {"tags", "output"});
+		    {"tags", "lyrics", "duration", "output"});
 	};
 	t.run = [](const JsonValue& args, ToolContext& ctx) -> ToolResult {
 		const std::string tags = arg_string(args, "tags");
@@ -958,9 +996,8 @@ ToolDef music_generate_tool() {
 		const std::string language = arg_string(args, "language", "en");
 		const std::string keyscale = arg_string(args, "keyscale", "D minor");
 		const std::string timesig = arg_string(args, "timesignature", "4");
-		const bool gen_codes = args["generate_audio_codes"].as_bool(true);
-		uint64_t seed = 0;
-		if (!arg_u64_present(args, "seed", &seed)) seed = make_media_seed();
+		// The seed is always drawn here: the tool no longer takes one.
+		const uint64_t seed = make_media_seed();
 
 		if (tags.empty() && lyrics.empty())
 			return error_result(tr(ctx.language, "tags 和 lyrics 不能都为空",
@@ -991,10 +1028,12 @@ ToolDef music_generate_tool() {
 		wp.timesignature = timesig;
 		wp.language = language;
 		wp.keyscale = keyscale;
-		wp.generate_audio_codes = gen_codes;
-		wp.lm_cfg_scale = arg_number(args, "cfg_scale", 7.0);
-		wp.lm_temperature = arg_number(args, "temperature", 0.85);
-		wp.lm_top_p = arg_number(args, "top_p", 0.9);
+		// The audio-code LM is always on now, with the workflow defaults (cfg 7,
+		// temperature 0.85, top-p 0.9): those knobs are gone from the tool.
+		wp.generate_audio_codes = true;
+		wp.lm_cfg_scale = 7.0;
+		wp.lm_temperature = 0.85;
+		wp.lm_top_p = 0.9;
 		wp.output = abs;
 		wp.model = e.spec.music_dit;
 		wp.clip = e.spec.music_te;
@@ -1082,7 +1121,6 @@ ToolDef music_generate_tool() {
 		std::ostringstream os;
 		os << tr(ctx.language, "已生成音乐：", "generated music: ") << tool_display_path(ctx.cwd, abs)
 		   << "\n";
-		os << tr(ctx.language, "种子 ", "seed ") << (unsigned long long)seed << "\n";
 		// Seconds, and the *produced* length rather than the requested one: the request
 		// is snapped onto the 25 Hz music grid, so echoing it back would report a
 		// number the file does not have. One decimal, like the TTS report.
@@ -1109,7 +1147,8 @@ ToolDef music_generate_tool() {
 		if (sr > 0 && samples > 0)
 			os << tr(ctx.language, "音频 ", "audio ") << sr << tr(ctx.language, " Hz, ", " Hz, ")
 			   << channels << tr(ctx.language, " 声道", " channel(s)") << "\n";
-		os << tr(ctx.language, "总用时 ", "total time ") << fmt_ms(trace_ms(gr)) << "\n";
+		trace_dump(gr); // PHI_MEDIA_TRACE=1 prints the real per-node timings to stderr
+		os << tr(ctx.language, "总用时 ", "total time ") << fmt_reported_time(trace_ms(gr)) << "\n";
 		return text_result(os.str());
 	};
 	return t;
@@ -1121,78 +1160,46 @@ ToolDef tts_speak_tool() {
 	ToolDef t;
 	t.name = "tts_speak";
 	t.description =
-	    "本地调用 Breeze-TTS-2 做语音合成（wav）：输入「要说的文本」和「描述音色的指令」即可，"
-	    "不需要任何参考音频（不支持声音克隆）。指令与文本语言保持一致。";
+	    "本地调用 Breeze-TTS-2 做文本朗读。音频格式 wav 。";
 	t.description_en =
-	    "Call Breeze-TTS-2 locally for speech synthesis (wav): give the text to speak and an "
-	    "instruction describing the voice, with no reference audio of any kind (voice cloning is "
-	    "deliberately not supported). The instruction's language should match the text's.";
+	    "Read the text aloud locally with Breeze-TTS-2. The audio format is wav.";
 	t.prompt_snippet = "语音合成";
 	t.prompt_snippet_en = "Speak (TTS)";
-	t.parameters_fn = [](const std::string& lang) {
+	t.parameters_fn = [](const std::string& lang, const ToolContext&) {
 		return schema_object(
 		    {
-		        {"text", schema_string(lang, "要合成的文本（必填）。中英双语，可用 [笑] / (sigh) 之类的语气事件。",
-		                                "The text to synthesise (required). Chinese and English are "
-		                                "supported, with inline tone events like [笑] / (sigh).")},
-		        {"instruction",
+		        {"text",
 		         schema_string(lang,
-		                       "描述音色的自然语言指令（必填），例如「一个温柔的女声，语速偏慢，气息轻柔」"
-		                       "或 \"a warm middle-aged male voice, calm and slightly hoarse\"。语言应与 text 一致。",
-		                       "A natural-language instruction describing the voice (required), e.g. "
-		                       "\"a warm middle-aged male voice, calm and slightly hoarse\". Its "
-		                       "language should match the text's.")},
-		        {"cfg_scale",
-		         schema_number(lang,
-		                       "引导强度（默认 4，音色设计节点的默认值）：越大越贴近指令，过大会发闷。",
-		                       "Guidance scale (default 4, the voice-design node's default): higher "
-		                       "follows the instruction more closely, too high sounds strained.")},
-		        {"temperature", schema_number(lang, "采样温度（默认 0.7）。", "Sampling temperature (default 0.7).")},
-		        {"repetition_penalty", schema_number(lang, "重复惩罚（默认 1 = 关闭）。",
-		                                                 "Repetition penalty (default 1 = off).")},
-	        {"duration_seconds",
-	         schema_number(lang,
-	                       "生成语音的长度上限（秒），默认 0 = 由文本长度决定，上限 163 秒。"
-	                       "语音靠模型自己的 EOS 结束，实际长度通常短于这个上限（结果里会报出实际长度）。",
-	                       "Upper bound on the spoken length in seconds; 0 (the default) lets the "
-	                       "text length decide, and the ceiling is 163 s. The model stops on its own "
-	                       "EOS token, so the audio is usually shorter than this cap - the result "
-	                       "reports the length actually produced.")},
-		        {"output", schema_string(lang, "输出 WAV 的绝对路径", "Absolute path of the WAV output")},
-		        {"seed",
-		         schema_number(lang,
-		                       "随机种子（可选）：64 位无符号整数，填什么就用什么（含 0）；不填则随机抽一个并在结果里报出。",
-		                       "Random seed (optional): a 64-bit unsigned integer, used exactly as "
-		                       "given (0 included); omitted means the engine draws one and reports it.")},
+		                       "要朗读出来的文本。中英双语，可用 [笑] / (sigh) 之类的语气事件。",
+		                       "The text that will be read aloud. Chinese and English are supported, "
+		                       "with inline tone events like [笑] / (sigh).")},
+		        {"instruction",
+		         schema_string(lang, "描述朗读的音色", "Describe the timbre to read it in")},
+		        {"output", schema_string(lang, "输出 wav 的绝对路径", "Absolute path of the wav output")},
 		    },
 		    {"text", "instruction", "output"});
 	};
 	t.run = [](const JsonValue& args, ToolContext& ctx) -> ToolResult {
-		const std::string text = arg_string(args, "text");
-		const std::string instruction = arg_string(args, "instruction");
+		// The two strings, named after what they do rather than after the slot they
+		// came from: `spoken` is read aloud, `voice` only describes the timbre. The
+		// prompt the model sees is `[S0]<ins_bos>{voice}<ins_eos>{spoken}` (see
+		// `BreezeTts::build_prompt`), so they go down to the workflow under those two
+		// names and are never exchanged.
+		const std::string spoken = arg_string(args, "text");
+		const std::string voice = arg_string(args, "instruction");
 		const std::string output = arg_string(args, "output");
-		// Length is requested in *seconds* (the unit a caller knows). A caller written
-		// against the older schema passed `max_new_tokens`, i.e. the sampler's own
-		// frame count; that spelling is still accepted and converted, so nothing
-		// silently changes meaning.
-		const double want_seconds = arg_number(args, "duration_seconds", 0.0);
-		const double legacy_frames = arg_number(args, "max_new_tokens", 0.0);
-		double duration_seconds = want_seconds > 0.0 ? want_seconds : tts_seconds_for_frames((i64)legacy_frames);
-		uint64_t seed = 0;
-		if (!arg_u64_present(args, "seed", &seed)) seed = make_media_seed();
+		// The seed is always drawn here: the tool no longer takes one.
+		const uint64_t seed = make_media_seed();
 
-		if (text.empty())
-			return error_result(tr(ctx.language, "text 不能为空", "text must not be empty"));
-		if (instruction.empty())
+		if (spoken.empty())
+			return error_result(tr(ctx.language, "text 不能为空（要朗读的文本）",
+			                       "text must not be empty (the text to read aloud)"));
+		if (voice.empty())
 			return error_result(tr(ctx.language, "instruction 不能为空（TTS 只接受音色描述，不支持参考音频）",
 			                       "instruction must not be empty (this tool takes a voice "
 			                       "description, not reference audio)"));
 		if (output.empty())
 			return error_result(tr(ctx.language, "output 不能为空", "output must not be empty"));
-		if (duration_seconds < 0.0 || duration_seconds > 163.0)
-			return error_result(tr(ctx.language, "duration_seconds 必须在 0–163 秒之间",
-			                       "duration_seconds must be in 0-163"));
-
 		const std::string abs = tool_resolve_path(ctx.cwd, output);
 		if (std::string deny = tool_check_path_permission(ctx, abs); !deny.empty())
 			return error_result(deny);
@@ -1202,24 +1209,36 @@ ToolDef tts_speak_tool() {
 			return error_result(err);
 
 		TtsWorkflowParams wp;
-		wp.text = text;
-		wp.instruction = instruction;
-		wp.cfg_scale = arg_number(args, "cfg_scale", 4.0);
-		// The request is in seconds; `build_tts_workflow` turns it into the sampler's
-		// frame budget with the codec's own rate, so the two units are one number here.
-		wp.duration_seconds = duration_seconds;
-		wp.temperature = arg_number(args, "temperature", 0.7);
-		wp.repetition_penalty = arg_number(args, "repetition_penalty", 1.0);
+		wp.text = spoken;
+		wp.instruction = voice;
+		// The released Voice-Design node's own generation controls (`_generation_controls`
+		// in the reference nodes.py, and its example workflow): cfg 4 for voice design,
+		// backbone 0.9 / top-k 50 / top-p 1.0 with a 1.1 repetition penalty, depth
+		// decoder 0.9 / top-k 50 / top-p 1.0. They are spelled out here rather than left
+		// to the struct's defaults so the tool's behaviour does not depend on whoever
+		// edits those later - sampling either loop looser is what makes the utterance
+		// stop early and the tail decode as noise.
+		wp.cfg_scale = 4.0;
+		wp.temperature = 0.9;
+		wp.top_k = 50;
+		wp.top_p = 1.0;
+		wp.repetition_penalty = 1.1;
+		wp.depth_temperature = 0.9;
+		wp.depth_top_k = 50;
+		wp.depth_top_p = 1.0;
+		// No length is asked for, so the *text* sizes the budget (`duration_seconds`
+		// 0 = let `BreezeTts::prepare` derive it from the text): the utterance is as
+		// long as the sentence needs, not cut at some fixed duration.
 		wp.seed = seed;
 		wp.output = abs;
 		wp.model = e.spec.tts_model;
-		// The codec, the tokenizer and the two JSON configs are the user's
-		// selection (settings.json -> tools.media); empty keeps the loaders'
-		// sibling `config.json` lookup.
+		// The codec and the tokenizer are the user's selection (settings.json ->
+		// tools.media). The two JSON configs are not: their scalars are compiled into
+		// the loaders, so these stay empty and no file is read.
 		wp.codec = e.spec.tts_codec;
 		wp.tokenizer = e.spec.tts_tokenizer;
-		wp.config = e.spec.tts_config;
-		wp.codec_config = e.spec.tts_codec_config;
+		wp.config.clear();
+		wp.codec_config.clear();
 
 		const Graph graph = build_tts_workflow(wp);
 		GraphResult gr;
@@ -1275,14 +1294,19 @@ ToolDef tts_speak_tool() {
 			        tts_seconds_for_frames(frames), kTtsFramesPerSecond);
 		// Seconds everywhere: the produced length (with the precision a tenth of a
 		// second gives, which is what "did it say the whole sentence" needs) and, when
-		// the caller set one, the cap it was asked for.
+		// the caller set one, the cap it was asked for. With no cap asked for the
+		// budget came from the text, so there is nothing to report against it.
 		const double produced_s = sr > 0 ? (double)samples / (double)sr : 0.0;
-		const i64 frame_cap =
-		    wp.max_new_tokens > 0 ? wp.max_new_tokens : tts_frames_for_seconds(wp.duration_seconds);
+		const i64 frame_cap = tts_frames_for_seconds(wp.duration_seconds);
 		std::ostringstream os;
 		os << tr(ctx.language, "已生成语音：", "generated speech: ") << tool_display_path(ctx.cwd, abs)
 		   << "\n";
-		os << tr(ctx.language, "种子 ", "seed ") << (unsigned long long)seed << "\n";
+		// Both strings, each named for its role: this is the only place a caller can
+		// see which of the two was read aloud and which one only shaped the voice, so
+		// a request that reached the tool the wrong way round is visible here instead
+		// of in the audio.
+		os << tr(ctx.language, "朗读 text：", "spoken text: ") << spoken << "\n";
+		os << tr(ctx.language, "音色 instruction：", "voice instruction: ") << voice << "\n";
 		char lenbuf[96];
 		if (frame_cap > 0) {
 			const std::string fmt = tr(ctx.language, "%.1f 秒（上限 %.1f 秒）",
@@ -1297,7 +1321,8 @@ ToolDef tts_speak_tool() {
 		if (sr > 0)
 			os << tr(ctx.language, "音频 ", "audio ") << sr << tr(ctx.language, " Hz, 单声道（", " Hz, ") << channels << tr(ctx.language, " 声道）", " channel(s)")
 			   << "\n";
-		os << tr(ctx.language, "总用时 ", "total time ") << fmt_ms(trace_ms(gr)) << "\n";
+		trace_dump(gr); // PHI_MEDIA_TRACE=1 prints the real per-node timings to stderr
+		os << tr(ctx.language, "总用时 ", "total time ") << fmt_reported_time(trace_ms(gr)) << "\n";
 		return text_result(os.str());
 	};
 	return t;
@@ -1311,16 +1336,32 @@ std::vector<ToolDef> build_media_tools() {
 	tools.push_back(video_generate_tool());
 	tools.push_back(music_generate_tool());
 	tools.push_back(tts_speak_tool());
+	// The call's own end, wrapped once for all four. `run` keeps the run's
+	// GraphResult (and with it the MODEL / CLIP / VAE handles the graph produced)
+	// alive until it returns, so this is the first point at which "the call is
+	// over and the handles are gone" is true: what the classes still hold here is
+	// what they would still hold a second later, in a process that went on to do
+	// something else. See report_media_state for why this is worth printing.
+	for (ToolDef& t : tools) {
+		auto inner = t.run;
+		t.run = [inner](const JsonValue& args, ToolContext& ctx) -> ToolResult {
+			ToolResult r = inner(args, ctx);
+			report_media_state(engine(), "after");
+			return r;
+		};
+	}
 	return tools;
 }
 
 // ── the shared engine ───────────────────────────────────────────────────────
 //
-// Both generators run their node graph through the same process-wide engine and
-// its one-GPU-at-a-time lock. This function is the seam: it brings the engine
-// up, hands `fn` the device, the models directory and the persistent node cache,
-// and runs `fn` under the engine's lock (a node graph is a generation and must
-// not race another).
+// All four generators run their node graph through the same process-wide engine
+// and its one-GPU-at-a-time lock. This function is the seam: it brings the engine
+// up, hands `fn` the device, the models directory and the run's state bag, and runs
+// `fn` under the engine's lock (a node graph is a generation and must not race
+// another). It is also the boundary at which the run's caches are handed back on
+// both sides: before `fn` runs, so the residency plans see the card this process
+// really has, and after it returns, so nothing outlives the generation.
 std::string with_media_engine(
 	const std::string& agent_dir, const std::string& cwd, const std::string& language,
 	const std::function<std::string(media::GpuCtx*, const std::string&, std::shared_ptr<void>&)>& fn) {
@@ -1335,6 +1376,7 @@ std::string with_media_engine(
 
 	refresh_engine_run(e);
 	release_media_memory(e);
+	report_media_state(e, "before");
 
 	std::string result;
 	try {
@@ -1348,7 +1390,10 @@ std::string with_media_engine(
 	// executor reports a node failure as a value (not an exception), so this is the
 	// other half of the check the pipelines used to do around generate().
 	if (e.cuda && e.cuda->device_removed()) shutdown_locked(e);
-	release_media_memory(e);
+	// The request is over: hand back the VRAM, the compiled kernels and the
+	// host-side caches it built, so a generation leaves nothing behind in any of
+	// the three memories it touched (see release_generation_state).
+	release_generation_state(e);
 	return result;
 }
 

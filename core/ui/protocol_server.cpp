@@ -168,6 +168,9 @@ JsonValue profile_to_client(const StoredProfile& p) {
 		j["subagent"] = sub;
 	}
 	if (!p.system_prompt_language.empty()) j["systemPromptLanguage"] = p.system_prompt_language;
+	// 设置 → API 配置 → 多模态：空值（旧配置）按默认 "image" 回给界面，所以面板上
+	// 永远有一项是选中的
+	j["vision"] = p.vision.empty() ? "image" : p.vision;
 	return j;
 }
 
@@ -447,6 +450,7 @@ static void handle_ws_message(ProtocolServer::Impl& impl, WebSocketConnection& w
 			p.base_url = draft["baseUrl"].as_string("");
 			p.api_format = draft["apiFormat"].as_string("");
 			p.system_prompt_language = draft["systemPromptLanguage"].as_string("");
+			p.vision = draft["vision"].as_string("");
 			if (const JsonValue* sub = draft.find("subagent")) {
 				if (!sub->is_null()) {
 					SubagentConfig sc;
@@ -461,6 +465,12 @@ static void handle_ws_message(ProtocolServer::Impl& impl, WebSocketConnection& w
 			// language takes effect on the running session for the active profile
 			if (!p.system_prompt_language.empty() && host.configs().list().active == p.name) {
 				host.set_system_prompt_language(p.system_prompt_language);
+			}
+			// 多模态档位同样立刻生效：网关模型按它生成 input，会话按它决定 read
+			// 能不能读图片/视频，所以保存后重新应用一次当前配置（重启会话不必）
+			if (host.configs().list().active == p.name && host.is_active()) {
+				host.apply_profile_after_start();
+				impl.broadcast_models();
 			}
 			impl.send_response(ws, id, true, configs_result(host), "");
 		} else if (type == "delete_config") {
@@ -529,6 +539,8 @@ static void handle_ws_message(ProtocolServer::Impl& impl, WebSocketConnection& w
 			}
 			result["files"] = files;
 			result["modelsDir"] = mdir;
+			// 分词器不在这个列表里：它已经内置（data/tokenizers/），不是可选模型文件，
+			// 面板也不再有对应的下拉（见 ui/app.js 的 MEDIA_ROLES）。
 			impl.send_response(ws, id, true, result, "");
 		} else if (type == "save_media_settings") {
 			const JsonValue& media = req["media"];

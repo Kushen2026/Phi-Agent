@@ -136,10 +136,20 @@ static float f8_lut(bool e4m3, u8 b) {
 	const int man = b & ((1 << mbits) - 1);
 	const int bias = e4m3 ? 7 : 15;
 	float v;
-	if (exp == emax) {
-		// all-ones exponent: E4M3 makes 0x7F/0xFF NaN, everything else inf
-		v = (e4m3 && man == (1 << mbits) - 1) ? std::numeric_limits<float>::quiet_NaN()
-		                                      : std::numeric_limits<float>::infinity();
+	if (e4m3 && exp == emax) {
+		// E4M3FN (what `torch.float8_e4m3fn` and safetensors' `F8_E4M3` both are)
+		// has **no infinity**: only the two all-ones-mantissa patterns are NaN, and
+		// the rest of the all-ones exponent holds ordinary finite values up to 448
+		// ((1 + man/8) * 2^8). Mapping them to inf - which this table used to do -
+		// turns any weight whose magnitude reaches 256..448 into an infinity, and a
+		// single one of those makes the whole model answer NaN.
+		v = man == (1 << mbits) - 1 ? std::numeric_limits<float>::quiet_NaN()
+		                            : (float)((1 << mbits) + man) * std::ldexp(1.0f, emax - bias - mbits);
+	} else if (exp == emax) {
+		// E5M2 is IEEE-shaped: a zero mantissa at the all-ones exponent is inf and
+		// anything else there is NaN.
+		v = man == 0 ? std::numeric_limits<float>::infinity()
+		             : std::numeric_limits<float>::quiet_NaN();
 	} else if (exp == 0) {
 		v = (float)man * std::ldexp(1.0f, 1 - bias - mbits);  // subnormal
 	} else {
