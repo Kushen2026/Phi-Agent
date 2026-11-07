@@ -45,6 +45,41 @@ bool ModelDef::supports_image() const {
 	return false;
 }
 
+bool ModelDef::supports_video() const {
+	for (const auto& modality : input) {
+		if (modality == "video") return true;
+	}
+	return false;
+}
+
+// ── multimodal capability ──────────────────────────────────────────────────
+// The three tiers of 设置 → API 配置 → 多模态. The key is what webui-configs.json
+// stores; a profile that predates the setting carries no key at all and reads as
+// "image", which is exactly how it behaved before.
+
+VisionMode vision_mode_from_key(const std::string& key) {
+	if (key == "none") return VisionMode::None;
+	if (key == "image_video") return VisionMode::ImageVideo;
+	return VisionMode::Image;
+}
+
+std::string vision_mode_key(VisionMode mode) {
+	switch (mode) {
+		case VisionMode::None: return "none";
+		case VisionMode::ImageVideo: return "image_video";
+		case VisionMode::Image: break;
+	}
+	return "image";
+}
+
+std::vector<std::string> vision_mode_inputs(VisionMode mode) {
+	std::vector<std::string> out{"text"};
+	if (mode == VisionMode::None) return out;
+	out.push_back("image");
+	if (mode == VisionMode::ImageVideo) out.push_back("video");
+	return out;
+}
+
 ModelDef model_def_from_json(const std::string& provider, const JsonValue& j) {
 	ModelDef m;
 	m.provider = j["provider"].as_string(provider);

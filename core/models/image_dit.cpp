@@ -153,7 +153,7 @@ void ImageDiT::probe() {
 	i64 l = 0;
 	while (st_.find("transformer_blocks." + std::to_string(l) + ".attn.to_q.weight")) l++;
 	cfg_.n_layers = l;
-	cfg_.t_freq = st_.require("time_text_embed.timestep_embedder.linear_1.weight").shape[1];
+	cfg_.t_freq = st_.logical_cols(st_.require("time_text_embed.timestep_embedder.linear_1.weight"));
 	if (st_.require("modulation.1.weight").shape[0] != 4 * cfg_.dim)
 		throw MediaError("qwen_image: the modulation projection is not 4*dim wide");
 	if (cfg_.head_dim != 128) throw MediaError("qwen_image: head_dim != 128");
@@ -166,6 +166,18 @@ void ImageDiT::probe() {
 		for (u64 b : layer_alloc_sizes(0)) lb += b;
 		res_layer_bytes_ = lb;
 	}
+
+	// ── the tier plan's units ──────────────────────────────────────────────
+	//
+	// One unit per transformer block, in the order the sampling loop walks them:
+	// `plan(n)` reads "units [0, n) are on the card", and the blocks past the window
+	// are the ones re-read on every step. The ranges are every tensor under the
+	// block's prefix, which is exactly what `upload_layer` asks the reader for - the
+	// DiT has no per-block tensor outside `transformer_blocks.<i>.` (the input/output
+	// projections and the modulation table live in the `keep` arena, loaded once).
+	wr_.attach(&st_, "qwen_image", HostWeightPool::Rank::Primary);
+	for (i64 i = 0; i < cfg_.n_layers; i++)
+		wr_.add_unit(weight_unit_of(st_, "transformer_blocks." + std::to_string(i) + "."));
 }
 
 void ImageDiT::open(const std::string& path, GpuCtx* gpu) {
@@ -214,6 +226,10 @@ void ImageDiT::release_resident() {
 	// sampling loop is running, and the VAE decode that follows wants the card.
 	free_prefix_cache();
 	release_resident_window();
+	// The RAM tier belongs to the same phase. The VAE decode that follows re-reads
+	// its own checkpoint, and the pool must see these bytes free - the grant goes
+	// back with the pins, so the next phase (or the next generation) can take them.
+	wr_.drop();
 }
 
 void ImageDiT::release_resident_window() {
@@ -616,6 +632,28 @@ void ImageDiT::plan_residency(i64 H, i64 W, i64 n_txt, const std::vector<i64>& r
 		        format_bytes(plan_reserve_).c_str(), format_bytes(in_flight).c_str(),
 		        format_bytes(resident_now).c_str(), format_bytes(kSlack).c_str(),
 		        format_bytes(cap).c_str());
+	// ── the RAM tier ──────────────────────────────────────────────────────
+	//
+	// What the window did not take is re-read off the checkpoint on every step: at
+	// 1024x1024 with 7 of 30 blocks resident, that is 5.48 GB per step, 25 of them
+	// per request, out of a 7.25 GB file this NVMe hands over at ~1.2 GB/s. System
+	// memory moves the same bytes ~10x faster, so the blocks the card did not take
+	// are pinned once - in index order, which is the order the loop walks them - from
+	// the process-wide ledger (host/residency.hpp). Until this existed the image
+	// chain pinned nothing at all: it came last in its own chain, after the text
+	// tower, and no cache was ever filled for it.
+	//
+	// Planned here, at the end of the VRAM plan, because `res_n_` is final only now.
+	//
+	// The boundary this fixes is the *plan's*; `tune_residency` may move the window
+	// by a few blocks during the loop, and the bytes it moves out of the RAM tier
+	// stay pinned until the phase ends. That is deliberate: re-planning would re-read
+	// the whole tier to save at most a few hundred MB, and a pinned block that ended
+	// up resident is read once more at most.
+	wr_.plan(res_n_);
+	if (getenv("PHI_DIT_PLAN"))
+		fprintf(stderr, "[qi] weights: %s\n",
+		        weight_plan_line(wr_, "qwen_image", weight_precision()).c_str());
 	res_planned_ = true;
 }
 
@@ -818,6 +856,15 @@ bool ImageDiT::alloc_prefix_cache(i64 n_prefix, i64 n_img) {
 	cache_key_rows_ = 0;
 	return true;
 }
+
+// Destruction hands back the prefix cache. Everything else this class holds is a
+// member with its own destructor (`res_arena_` releases the accountant's charge for
+// the resident window, `st_` closes the mapping and drops the pinned host ranges)
+// but the prefix cache's two device buffers are the `ComputeContext`'s, created on
+// its behalf, and the charge for them is the accountant's: without this the ledger
+// would keep a cache nobody holds any more, and a later generation would be refused
+// memory the card in fact has.
+ImageDiT::~ImageDiT() { free_prefix_cache(); }
 
 void ImageDiT::free_prefix_cache() {
 	if (cache_k_.res && g_ && g_->ctx) g_->ctx->release_buffer(cache_k_.res);

@@ -273,6 +273,12 @@ struct Impl {
 	// blocks that do not fit the VRAM cache can be read *while the previous one
 	// computes* (see SafeTensors::prefetch_ranges) instead of in front of it.
 	std::vector<std::vector<std::pair<u64, u64>>> block_ranges;
+	// The Vram / Ram / Disk tier plan for this checkpoint (host/residency.hpp):
+	// attached in `open()` once the block ranges exist, planned on the first tile
+	// (where `dec_n` - the decoder blocks the card kept - is final), dropped with
+	// `release_gpu_memory`. The pointer it holds is `VideoVae::st_`, which outlives
+	// this table (the destructor only releases the pool grant).
+	WeightResidency wr;
 };
 
 std::map<const VideoVae*, std::unique_ptr<Impl>> g_impl;
@@ -960,12 +966,19 @@ EncOut encoder_forward(Runner& r, const Encoder& e, const std::vector<float>& pi
 BlockW load_block(SafeTensors& st, GpuCtx& g, GpuArena& arena, const std::string& p) {
 	BlockW b;
 	// The precision the checkpoint stores the block's first projection in decides
-	// the whole block: a convrot int8 checkpoint has all four as int8 + a per-row
-	// scale, an fp16 one has all four as fp16. `upload_quant_linear_i8` is the
-	// engine's own int8 loader - it requantises whatever the file holds into the
-	// rotated int8 bus the GEMM reads, caches the result, and is what the H3 DiT
-	// already streams its blocks through.
-	b.i8 = st.require(p + ".attn.to_qkv.weight").dtype == DType::I8 && i8_blocks_on();
+	// the whole block: a quantised family (int8 tensorwise, w4a8, w6a8, the packed
+	// convrot int4) has all four on the int8 bus + a per-row scale, a float / fp8 /
+	// nvfp4 one has all four as fp16. `upload_quant_linear_i8` is the engine's own
+	// int8 loader - it requantises whatever the file holds into the rotated int8 bus
+	// the GEMM reads, caches the result, and is what the H3 DiT already streams its
+	// blocks through.
+	//
+	// The test is the *layout* (`weight_is_dense_float`), not the dtype, so the
+	// reader's own answer decides: a family added there is routed here without this
+	// line changing, and a U8-stored pack (nvfp4's container) is treated as the same
+	// family its I8 twin is. The int8 bus is also the cheaper side for a pack: the
+	// fp16 path decodes every block on every tile.
+	b.i8 = !weight_is_dense_float(st, st.require(p + ".attn.to_qkv.weight")) && i8_blocks_on();
 	if (b.i8) {
 		I8Upload qkv = upload_quant_linear_i8(g, st, p + ".attn.to_qkv", arena, nullptr);
 		I8Upload out = upload_quant_linear_i8(g, st, p + ".attn.to_out", arena, nullptr);
@@ -1448,44 +1461,27 @@ std::vector<float> decode_pixels(SafeTensors& st, Impl& im, Runner& r, const std
 				        format_bytes(192ull << 20).c_str());
 		}
 	}
-	// ── pin whatever did not fit, once ───────────────────────
+	// ── the RAM tier: the blocks the card did not take ─────────────────────
 	//
 	// The blocks past `dec_n` are re-read off the file on *every* tile - 134 MB
 	// each, 100+ tiles - and the file is 5 GB, so the OS page cache cannot hold
 	// the working set and the reads land on an NVMe that delivers ~1.2 GB/s for
-	// them. System memory delivers them at ~10 GB/s, and the same `pin_range`
-	// policy the DiT uses applies: pin the fixed set that recurs, stream the
-	// rest. The set is small precisely *because* the residency worked out - 9
-	// blocks here, 1.2 GB - and it is what turns the per-tile re-read into a
-	// memcpy. Skipped when the machine has no room for it; the reads then simply
-	// stay cold.
+	// them. System memory delivers them at ~10 GB/s, so the same tier policy the
+	// DiTs use applies: pin what recurs, stream the rest (host/residency.hpp).
+	//
+	// A *Secondary* grant, because this phase comes after the sampling loop that
+	// needed the machine's RAM more: the decoder blocks are re-read once per tile
+	// (~1.5 s apart) while the DiT's are re-read once per step, so the pool is
+	// right to hand these bytes back if anything Primary asks for them.
+	//
+	// Planned once, on the first tile, because `dec_n` is final only after the
+	// growth loop above has run with a real tile standing in the activation arena.
 	if (!im.dec_pinned && im.dec_n > 0 && im.dec_n < kLayers && !im.block_ranges.empty()) {
 		im.dec_pinned = true;
-		u64 want = 0;
-		for (i64 l = im.dec_n; l < kLayers; l++)
-			for (const auto& rr : im.block_ranges[(size_t)l]) want += rr.second;
-		const u64 have = SafeTensors::host_free_bytes();
-		if (have == 0 || want > have / 2) {
-			fprintf(stderr, "[h3vae] %lld streamed blocks not pinned (%.2f GB wanted, %.2f GB free)\n",
-			        (long long)(kLayers - im.dec_n), (double)want / 1073741824.0,
-			        (double)have / 1073741824.0);
-		} else {
-			double t0 = now_ms();
-			for (i64 l = im.dec_n; l < kLayers; l++) {
-				for (const auto& rr : im.block_ranges[(size_t)l]) {
-					try {
-						st.pin_range(rr.first, rr.second);
-					} catch (const std::exception&) {
-						break;
-					}
-				}
-			}
-			fprintf(stderr,
-			        "[h3vae] pinned %lld streamed blocks (%.2f GB) in %.1f s; the remaining tiles "
-			        "read them out of RAM\n",
-			        (long long)(kLayers - im.dec_n), (double)st.pinned_bytes() / 1073741824.0,
-			        (now_ms() - t0) / 1000.0);
-		}
+		const WeightResidency::Plan& p = im.wr.plan(im.dec_n);
+		fprintf(stderr, "[h3vae] weights: %s\n",
+		        weight_plan_line(im.wr, "h3vae", checkpoint_precision_label(st).c_str()).c_str());
+		(void)p;
 	}
 
 	std::vector<float> host((size_t)(3 * OT * OH * OW));
@@ -2219,6 +2215,11 @@ void VideoVae::open(const std::string& path, GpuCtx* gpu) {
 		im->block_ranges.push_back(std::move(r));
 	}
 
+	// The tier plan's units: the decoder blocks, in the order the tile loop walks
+	// them. `plan(dec_n)` then reads "the first dec_n are on the card".
+	im->wr.attach(&st_, "h3vae", HostWeightPool::Rank::Secondary);
+	for (const auto& rs : im->block_ranges) im->wr.add_unit(rs);
+
 	gpu->ctx->submit();
 	gpu->ring->rewind();
 
@@ -2467,10 +2468,14 @@ void VideoVae::release_activation_memory() {
 		im->dec_w.clear();
 		im->dec_n = 0;
 		im->dec_tried = false;
-		// The pinned file ranges stay: they are host memory holding bytes that
-		// will be wanted again the moment the next decode re-fills the stack,
-		// and re-reading 1.2 GB off the disk to get them back would cost more
-		// than the RAM they occupy.
+		// The pinned file ranges stay *within a decode call*: they are host memory
+		// holding bytes that will be wanted again the moment the next tile re-fills
+		// the stack. `release_activation_memory` is the per-call boundary, so the
+		// grant is handed back here - the pool has to see these bytes free for the
+		// next phase, and `release_gpu_memory` below is what ends the VAE's turn
+		// completely.
+		im->wr.drop();
+		im->dec_pinned = false;
 		im->dec_logged = -1;
 	}
 	act_bytes_ = 0;
@@ -2490,6 +2495,17 @@ void VideoVae::release_gpu_memory() {
 	g_impl.erase(this);   // the allocs in `warena_` dangle from here on
 	warena_.release_chunks();
 }
+
+// Destruction is the other half of `release_gpu_memory`'s contract, and the one
+// that cannot be skipped: the entry in `g_impl` is keyed by `this`, so an entry
+// that outlived its object would be served to whatever `VideoVae` the allocator
+// put at the same address next - as if the checkpoint it was built from were
+// still open, which it is not (the `SafeTensors` mapping, the decoder's host
+// tables and the encoder's allocations all belong to the Impl). Erasing it runs
+// the Impl's destructor, and the two arenas - which are members of this object and
+// own the chunks the Impl's GpuAllocs point into - go back with it, in that order.
+VideoVae::~VideoVae() { g_impl.erase(this); }
+size_t video_vae_state_entries() { return g_impl.size(); }
 
 // Test-only export of the fused-gate activation (see the internal header).
 void h3vae_test_silu_gate_fused(GpuCtx& g, GpuArena& arena, const std::vector<float>& gx,

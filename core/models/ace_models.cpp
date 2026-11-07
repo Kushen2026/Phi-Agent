@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include "kernels/gpu_ops.hpp"
 #include "kernels/kernels.hpp"   // attn_query_tile()
@@ -310,6 +311,25 @@ struct AceDitLayer {
 	GpuAlloc sst;                // scale_shift_table, fp32 [6, hidden]
 };
 
+// The tensors one decoder block reads, in `upload_layer`'s own order: the eleven
+// projections (`ace_upload_linear` reads `<name>.weight` for each) and then the
+// eight vectors (three RMSNorms of `hidden`, four of `head_dim`, and the
+// scale/shift table), which are widened to fp32 on upload.
+//
+// One list, three consumers: the residency probe prices a block from it, the
+// host weight cache pins its file ranges, and the block loop prefetches the next
+// block from it. Keeping them on one table is what makes the three agree about
+// what "one block" is - a cache that pinned four fifths of a block would still
+// be a cache miss on every step.
+const char* const kAceBlockMats[] = {
+    "self_attn.q_proj",  "self_attn.k_proj",  "self_attn.v_proj",  "self_attn.o_proj",
+    "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.o_proj",
+    "mlp.gate_proj",     "mlp.up_proj",       "mlp.down_proj"};
+const char* const kAceBlockVecs[] = {
+    "self_attn_norm.weight",  "cross_attn_norm.weight", "mlp_norm.weight",
+    "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+    "cross_attn.q_norm.weight", "cross_attn.k_norm.weight", "scale_shift_table"};
+
 struct AceDitConfig {
 	i64 hidden = 0, n_layers = 0, n_heads = 0, n_kv_heads = 0, head_dim = 0, intermediate = 0;
 	i64 in_ch = 0, out_ch = 0, patch = 0, cond_dim = 0, t_dim = 0;
@@ -324,6 +344,11 @@ struct AceDitConfig {
 struct AceDiT::Impl {
 	GpuCtx* g = nullptr;
 	SafeTensors st_;
+	// The Vram / Ram / Disk tier plan for this bundle (host/residency.hpp):
+	// attached and given its units in `probe()`, planned on the first forward()
+	// (where `res_n` is final), dropped with the device-side window.
+	// Declared after `st_` so it is destroyed first.
+	WeightResidency wr;
 	AceDitConfig cfg;
 	// Resident (keep arena): everything outside the 32 blocks.
 	GpuAlloc proj_in_w, proj_in_b, norm_out_w, sst2;
@@ -348,14 +373,41 @@ struct AceDiT::Impl {
 	u64 plan_reserve = 0;      // act + inflight + held, the plan's own floor
 	bool planned = false;
 
+	// ── the host-side weight cache and the one-block look-ahead (see `forward`) ──
+	//
+	// A block outside the resident window is re-read from the checkpoint on
+	// *every* sampling step, and on a card that cannot hold the 10 GB bundle that
+	// is most of them (~4 GB per step of 254 MB blocks here). The bytes never
+	// change, so the ones that fit are pinned in system memory once and served
+	// out of it for the rest of the session, and the read for block i+1 runs on a
+	// worker thread while block i's forward uses the GPU - exactly the two levers
+	// `AvDiT::forward` uses for the H3 chain, for the same measured reason (see
+	// `SafeTensors::pin_range` / `prefetch_ranges` in host/st.hpp).
+	//
+	// `block_ranges[i]` is the (file offset, bytes) of every tensor
+	// `upload_layer(i)` reads, in that call's order.
+	std::vector<std::vector<std::pair<u64, u64>>> block_ranges;
+	// The streamed blocks [pinned_lo, pinned_lo + pinned_blocks) are in system
+	// memory; the rest still come off the device. `pinned_lo` is the window's
+	// `res_n` at the moment the cache was filled (a later re-plan can move the
+	// window, and the pinned ranges stay where they are - they are a property of
+	// the *file*, not of the window). Both are read back from the tier plan; they
+	// are kept because the sampler's report has always named them.
+	i64 pinned_lo = 0;
+	i64 pinned_blocks = 0;
+	bool host_cache_ready = false;
+
 	void probe();
 	void upload_layer(i64 index, AceDitLayer& L, GpuArena* into);
+	// Fills `block_ranges` on first use and pins as many streamed blocks as the
+	// host cache budget (and the machine's free memory) allows. Idempotent.
+	void ensure_host_cache();
 };
 
 void AceDiT::Impl::probe() {
 	const SafeTensors& st = st_;
 	const StTensor& qp = st.require("decoder.layers.0.self_attn.q_proj.weight");
-	cfg.hidden = qp.shape[1];
+	cfg.hidden = st.logical_cols(qp);
 	cfg.head_dim = st.require("decoder.layers.0.self_attn.q_norm.weight").shape[0];
 	if (cfg.head_dim != 128)
 		throw MediaError("ace dit: head_dim " + std::to_string(cfg.head_dim) + " != 128");
@@ -372,8 +424,8 @@ void AceDiT::Impl::probe() {
 	cfg.patch = pin.shape[2];
 	const StTensor& pout = st.require("decoder.proj_out.1.weight");
 	cfg.out_ch = pout.shape[1];
-	cfg.cond_dim = st.require("decoder.condition_embedder.weight").shape[1];
-	cfg.t_dim = st.require("decoder.time_embed.linear_1.weight").shape[1];
+	cfg.cond_dim = st.logical_cols(st.require("decoder.condition_embedder.weight"));
+	cfg.t_dim = st.logical_cols(st.require("decoder.time_embed.linear_1.weight"));
 
 	// One block's own tensor bytes. The plan divides the card by this after the
 	// activation frame and the streamed block have taken their share; the upload
@@ -381,14 +433,8 @@ void AceDiT::Impl::probe() {
 	// block's eleven matrices do not tile the arena's chunk granularity.
 	{
 		const std::string p = "decoder.layers.0.";
-		static const char* kMats[] = {"self_attn.q_proj",   "self_attn.k_proj",
-		                              "self_attn.v_proj",   "self_attn.o_proj",
-		                              "cross_attn.q_proj",  "cross_attn.k_proj",
-		                              "cross_attn.v_proj",  "cross_attn.o_proj",
-		                              "mlp.gate_proj",      "mlp.up_proj",
-		                              "mlp.down_proj"};
 		u64 b = 0;
-		for (const char* n : kMats) {
+		for (const char* n : kAceBlockMats) {
 			const StTensor& t = st.require(p + n + ".weight");
 			// What `ace_upload_linear` actually allocates, which is not
 			// `numel * dtype_size` for every family: a quantised weight lands on the
@@ -397,13 +443,15 @@ void AceDiT::Impl::probe() {
 			// raw `numel * dtype_size` here made the resident window a block too
 			// large for a quantised bundle, which is exactly the overrun the plan
 			// exists to prevent.
+			const u64 rows = (u64)t.shape[0];
+			const u64 kk = (u64)st.logical_cols(t);   // the *logical* K (see the note above)
 			if (weight_is_dense_float(st, t)) {
 				const DType as = t.dtype == DType::F32    ? DType::F32
 				                 : t.dtype == DType::BF16 ? DType::BF16
 				                                          : DType::F16;   // fp8 / nvfp4 -> f16
-				b += (u64)t.shape[0] * (u64)t.shape[1] * dtype_size(as);
+				b += rows * kk * dtype_size(as);
 			} else {
-				b += (u64)t.shape[0] * (u64)t.shape[1] + (u64)t.shape[0] * 4;
+				b += rows * kk + rows * 4;
 			}
 		}
 		// The seven RMSNorm vectors (3 x hidden + 2 x hidden + 2 x kv-dim) and the
@@ -413,6 +461,56 @@ void AceDiT::Impl::probe() {
 		     4;
 		res_layer_bytes = b;
 	}
+
+	// The file ranges of every block, in `upload_layer`'s own order - what the
+	// host weight cache pins and what the block loop looks one block ahead for.
+	// Built here because the probe is the one place that already walks a block's
+	// tensor list and has the reader open; `ensure_host_cache` fills the cache
+	// from it once the residency window (and therefore `res_n`) is known.
+	block_ranges.assign((size_t)cfg.n_layers, {});
+	for (i64 i = 0; i < cfg.n_layers; i++) {
+		const std::string p = "decoder.layers." + std::to_string(i) + ".";
+		auto& rs = block_ranges[(size_t)i];
+		for (const char* n : kAceBlockMats) {
+			const StTensor& t = st.require(p + n + ".weight");
+			rs.push_back({t.offset, t.nbytes});
+		}
+		for (const char* n : kAceBlockVecs) {
+			const StTensor& t = st.require(p + n);
+			rs.push_back({t.offset, t.nbytes});
+		}
+	}
+
+	// The tier plan's units, in the order the loop touches them: `plan(res_n)`
+	// reads "units [0, n) are on the card", and the blocks past the window are the
+	// ones that stream.
+	wr.attach(&st_, "acedit", HostWeightPool::Rank::Primary);
+	for (const auto& rs : block_ranges) wr.add_unit(rs);
+}
+
+// ── the RAM tier ───────────────────────────────────────────────────────────
+//
+// See the field comment on `block_ranges` and `AvDiT`'s own plan: the streamed
+// blocks are re-read from the checkpoint on every sampling step, and on this box's
+// NVMe that is ~1.2 GB/s no matter how the read is driven - the H3 chain's
+// measurements put 14.8 s of an 18.9 s step in the disk. System memory moves the
+// same bytes ~10x faster, so the blocks that fit are pinned once.
+//
+// The plan pins from the first *streamed* block forward, which is also the order
+// the loop touches them, and draws on the process-wide ledger rather than on a
+// budget of this bundle's own (host/residency.hpp) - the music chain's two weight
+// walks and the text tower that precedes them compete for the same RAM, and only
+// one of them can be sized as if it owned the machine.
+void AceDiT::Impl::ensure_host_cache() {
+	if (host_cache_ready) return;
+	host_cache_ready = true;
+	if (block_ranges.size() != (size_t)cfg.n_layers) return;
+	const WeightResidency::Plan& p = wr.plan(res_n);
+	pinned_lo = res_n;
+	pinned_blocks = p.ram_units;
+	if (getenv("PHI_ACE_PLAN") || p.ram_units > 0)
+		fprintf(stderr, "[acedit] weights: %s\n",
+		        weight_plan_line(wr, "acedit", checkpoint_precision_label(st_).c_str()).c_str());
 }
 
 void AceDiT::Impl::upload_layer(i64 index, AceDitLayer& L, GpuArena* into) {
@@ -508,9 +606,15 @@ void AceDiT::open(const std::string& path, GpuCtx* gpu) {
 		if (w.shape.size() != 3 || w.shape[0] != cfg.hidden || w.shape[1] != cfg.out_ch ||
 		    w.shape[2] != cfg.patch)
 			throw MediaError("ace dit: proj_out shape");
-		if (w.dtype != DType::BF16)
-			throw MediaError("ace dit: proj_out is not bf16 (the tap restack is byte-wise)");
-		const u16* src = (const u16*)m.st_.data_of(w);
+		// The tap restack is byte-wise over bf16 operands (the kernel that reads
+		// `out_w` is a bf16 GEMM), so a source in any other precision - f16, f32, fp8,
+		// or one of the quantised families - is decoded to bf16 first. `materialize`
+		// is the one place that knows every family, and a 3-D conv weight decodes as
+		// the same row-major walk a 2-D one does.
+		std::vector<u8> wb = m.st_.materialize(w, DType::BF16);
+		if (wb.size() != (size_t)(cfg.hidden * cfg.out_ch * cfg.patch) * 2)
+			throw MediaError("ace dit: proj_out did not decode to its bf16 shape");
+		const u16* src = (const u16*)wb.data();
 		std::vector<u16> sw((size_t)(cfg.out_ch * cfg.patch) * (size_t)cfg.hidden);
 		for (i64 ic = 0; ic < cfg.hidden; ic++)
 			for (i64 oc = 0; oc < cfg.out_ch; oc++)
@@ -733,6 +837,22 @@ std::vector<float> AceDiT::forward(const float* x, i64 T, float sigma, const Ace
 	// resets the streaming weight arena, not that one, so skipping the reset is
 	// what keeps them live. Everything past the window streams through the weight
 	// arena exactly as it did before the window existed.
+	//
+	// The streamed ones are the expensive half on any card that cannot hold the
+	// whole bundle, and `plan_residency` has already run (it is what set `res_n`),
+	// so this is the first point where the host weight cache can pin the blocks
+	// that will be re-read once per step (see `ensure_host_cache`). Idempotent: the
+	// second and later steps find the cache already decided.
+	m.ensure_host_cache();
+	// True while the block at index j is streamed and not pinned - the only case
+	// where reading it ahead of time buys anything.
+	auto prefetch_wanted = [&](i64 j) {
+		if (j < m.res_n || j >= cfg.n_layers) return false;
+		if (j < (i64)m.block_ranges.size() && j >= m.pinned_lo &&
+		    j < m.pinned_lo + m.pinned_blocks)
+			return false;   // already in system memory: the DMA reads it directly
+		return true;
+	};
 	for (i64 li = 0; li < cfg.n_layers; li++) {
 		AceDitLayer streamed;
 		AceDitLayer* lp = nullptr;
@@ -742,8 +862,23 @@ std::vector<float> AceDiT::forward(const float* x, i64 T, float sigma, const Ace
 			// so this only opens the next command list.
 			g.ctx->begin();
 		} else {
+			// ── one block ahead on the disk (see SafeTensors::prefetch_ranges) ──
+			//
+			// The loader and the GPU used to take turns - read 254 MB, compute on it,
+			// read the next 254 MB - which leaves the card idle for the whole read.
+			// The read for *this* block was issued at the end of the previous
+			// iteration and has been running on a worker thread while the previous
+			// block's forward used the GPU; joining it here is free when it has already
+			// finished. The loop's own `read_file`s then come out of that slot, so
+			// `upload_layer` itself is unchanged. A block the host cache pinned is not
+			// prefetched: it is already in memory and the DMA reads it directly.
+			if (prefetch_wanted(li)) m.st_.prefetch_wait();
 			g.new_layer();
 			m.upload_layer(li, streamed, nullptr);
+			// This block's bytes are on the device, so the slot is free for the next
+			// read - kicked off before the forward below submits.
+			if (prefetch_wanted(li + 1))
+				m.st_.prefetch_ranges(m.block_ranges[(size_t)(li + 1)]);
 			lp = &streamed;
 		}
 		AceDitLayer& L = *lp;
@@ -1021,6 +1156,14 @@ void AceDiT::release_resident() {
 	m.res_n = 0;
 	m.res_bytes = 0;
 	m.planned = false;
+	// The RAM tier is part of the same phase: the VAE decode that follows re-reads
+	// its own checkpoint, and holding the bundle's streamed blocks pinned would be
+	// memory the next phase cannot have. The grant goes back to the pool with it, so
+	// the next generation - which re-plans on its first forward - can take it again.
+	m.wr.drop();
+	m.host_cache_ready = false;
+	m.pinned_lo = 0;
+	m.pinned_blocks = 0;
 }
 
 void AceDiT::plan_residency(i64 T, i64 n_enc) {
@@ -1203,12 +1346,12 @@ void AceConditionBuilder::open(const std::string& path, GpuCtx* gpu) {
 	GpuCtx& g = *gpu;
 	const SafeTensors& st = m.st_;
 
-	m.text_dim = st.require("encoder.text_projector.weight").shape[1];
+	m.text_dim = st.logical_cols(st.require("encoder.text_projector.weight"));
 	m.enc_dim = st.require("encoder.text_projector.weight").shape[0];
 	if (m.enc_dim != 2048)
 		throw MediaError("ace condition: the encoder hidden is " + std::to_string(m.enc_dim) +
 		                 ", expected 2048");
-	m.fsq_dim = st.require("tokenizer.quantizer.project_in.weight").shape[1];
+	m.fsq_dim = st.logical_cols(st.require("tokenizer.quantizer.project_in.weight"));
 
 	g.new_step();
 	g.ctx->begin();
@@ -1228,16 +1371,20 @@ void AceConditionBuilder::open(const std::string& path, GpuCtx* gpu) {
 	// plain bf16 matrix, which is what `ace_upload_linear` gives.
 	{
 		const StTensor& t = st.require("encoder.timbre_encoder.embed_tokens.weight");
-		m.timbre_emb_w = g.kalloc(t.numel * dtype_size(t.dtype));
-		g.upload_tensor_into(st, t, t.dtype, m.timbre_emb_w);
+		// `bf16_linear` reads the table as bf16, so a source in any other precision is
+		// decoded to bf16 here (a raw bf16 one is uploaded verbatim off the file).
+		m.timbre_emb_w = g.kalloc((u64)t.numel * 2);
+		g.upload_tensor_into(st, t, DType::BF16, m.timbre_emb_w);
 		m.timbre_emb_b = vec("encoder.timbre_encoder.embed_tokens.bias");
 	}
 
 	// ── the tokenizer ──
 	{
 		const StTensor& t = st.require("tokenizer.audio_acoustic_proj.weight");
-		m.acp_w = g.kalloc(t.numel * dtype_size(t.dtype));
-		g.upload_tensor_into(st, t, t.dtype, m.acp_w);
+		// Same as the timbre embedder: `bf16_linear`'s operand, decoded to bf16 for
+		// any source precision.
+		m.acp_w = g.kalloc((u64)t.numel * 2);
+		g.upload_tensor_into(st, t, DType::BF16, m.acp_w);
 	}
 	m.acp_b = vec("tokenizer.audio_acoustic_proj.bias");
 	m.load_tower("tokenizer.attention_pooler.", &m.pool_cfg, &m.pool_norm_w);

@@ -46,6 +46,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "models/model_common.hpp"
@@ -277,9 +278,22 @@ public:
 private:
 	// `h` [hidden] one row -> `logits` [n] over the tied embedding rows [lo, hi).
 	void logits(const std::vector<float>& h, i32 lo, i32 hi, std::vector<float>& out);
+	// Pins as many of the non-resident layers as the process-wide RAM ledger allows
+	// (host/residency.hpp), so the per-token re-reads come out of system memory
+	// instead of the device (see the comment on the member). Idempotent; called by
+	// `generate` once the residency window is fixed. `max_new` is the decode length
+	// this call was asked for; it no longer gates the pin (the pool revokes a
+	// Secondary's grant when the DiT plans, so the old first-come-first-served
+	// heuristic is unnecessary - see `ensure_host_cache` in the .cpp).
+	void ensure_host_cache(i64 max_new);
 
 	GpuCtx* g_ = nullptr;
 	SafeTensors st_;
+	// The Vram / Ram / Disk tier plan for this tower (host/residency.hpp). Attached
+	// and given its layers in `open()`, planned by `ensure_host_cache` once the
+	// resident window is fixed, dropped with the window in `release_resident`.
+	// Declared after `st_` so it is destroyed first.
+	WeightResidency wr_;
 	AceQwen3Config cfg_;
 	// The tied embedding rows the head reads, uploaded once per range. These are
 	// the checkpoint's own bf16 bytes (the head *is* the embedding table).
@@ -287,6 +301,11 @@ private:
 	GpuAlloc head_w_;
 	GpuAlloc eos_w_;
 	i32 eos_row_ = -1;
+	// The dense dtype the tied head's rows are held in, and its row size in bytes.
+	// A raw embedding table keeps the file's own f16 / bf16 / f32; a quantised or
+	// fp8 one is decoded to bf16 (see `ace_head_rows`). Decided once in `open()`.
+	DType head_dtype_ = DType::BF16;
+	u64 head_row_bytes_ = 0;
 
 	// ── the resident window (`plan_residency`) ──
 	// The arena the window lives in. Its chunk granularity is the weight arena's,
@@ -323,6 +342,28 @@ private:
 	i64 plan_n_codes_ = 0;
 	std::vector<i64> plan_pre_rows_;
 	u64 plan_head_bytes_ = 0;
+
+	// ── the host-side weight cache and the one-layer look-ahead ──
+	//
+	// The decode streams every non-resident layer once *per decoded token* - up to
+	// 300 passes over the same bytes on a 60 s request - and the read is orders of
+	// magnitude longer than a one-row pass's arithmetic, so a card that cannot hold
+	// the whole LM puts the entire run on the device's I/O path (measured here with
+	// the 4B LM on a 6 GB card: 2.5 s per decoded token, against 44 ms per diffusion
+	// block). The bytes never change, so the layers that do not fit the VRAM window
+	// are pinned in system memory once and served out of it for the rest of the call;
+	// `ace_stack_multi` also reads one layer ahead. The same two levers
+	// `AceDiT::forward` and `AvDiT::forward` use, for the same measured reason (see
+	// `SafeTensors::pin_range` / `prefetch_ranges` in host/st.hpp) - with the pin
+	// gated on the decode length, because the music chain's two weight walks compete
+	// for the machine's RAM (see `ensure_host_cache` in the .cpp).
+	//
+	// `layer_ranges_[i]` is the (file offset, bytes) of every tensor
+	// `ace_qwen3_upload_layer(i)` reads, in that call's order; filled by `open()`.
+	std::vector<std::vector<std::pair<u64, u64>>> layer_ranges_;
+	i64 pinned_lo_ = 0;       // the first streamed layer the cache pinned (`res_n_`)
+	i64 pinned_layers_ = 0;   // how many it pinned
+	bool host_cache_ready_ = false;
 };
 
 }  // namespace phi::media

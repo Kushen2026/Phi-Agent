@@ -306,39 +306,22 @@ void MimiCodec::open(const std::string& path, GpuCtx* gpu, const std::string& co
 	const std::string l0 = p + "decoder.pre_transformer.layers.0.";
 	const StTensor& qw = st_.require(l0 + "self_attn.q_proj.weight");
 	if (qw.shape[1] != hidden_) throw MediaError("mimi: attention input width mismatch");
-	// head_dim cannot be read off a shape (16 heads of 64 and 8 of 128 look the
-	// same), so it comes from the sibling config.json - the one the reference
-	// builds the codec from - and the shapes are then checked against it.
-	heads_ = 16;
-	head_dim_ = 64;
-	sliding_window_ = 72;
-	rms_eps_ = 1e-5f;
-	rope_theta_ = 10000.0f;
-	{
-		const size_t slash = path.find_last_of("/\\");
-		// The tokenizer's own config.json, unless the caller selected one.
-		const std::string cfg =
-		    !config_json.empty()
-		        ? config_json
-		        : (slash == std::string::npos ? std::string()
-		                                      : path.substr(0, slash + 1)) + "config.json";
-		std::vector<u8> raw;
-		if (read_file_bytes(cfg, raw)) {
-			std::string err;
-			auto j = json_parse(std::string((const char*)raw.data(), raw.size()), &err);
-			const JsonValue* dc = j ? j->find("decoder_config") : nullptr;
-			if (dc && dc->is_object()) {
-				if (const JsonValue* v = dc->find("num_attention_heads")) heads_ = v->as_int(heads_);
-				if (const JsonValue* v = dc->find("head_dim")) head_dim_ = v->as_int(head_dim_);
-				if (const JsonValue* v = dc->find("sliding_window"))
-					sliding_window_ = v->as_int(sliding_window_);
-				if (const JsonValue* v = dc->find("rms_norm_eps"))
-					rms_eps_ = (float)v->as_number(rms_eps_);
-				if (const JsonValue* v = dc->find("rope_theta"))
-					rope_theta_ = (float)v->as_number(rope_theta_);
-			}
-		}
-	}
+	// The decoder's scalars are properties of the shipped Mimi 12 Hz codec, not of
+	// the installation: they used to be read from audio_tokenizer_config.json beside
+	// the weights, and are now constants. head_dim in particular cannot be read off
+	// a weight shape (16 heads of 64 and 8 of 128 look the same), so the shapes are
+	// checked against these values instead.
+	constexpr i64 kHeads = 16;
+	constexpr i64 kHeadDim = 64;
+	constexpr i64 kSlidingWindow = 72;
+	constexpr float kRmsEps = 1e-5f;
+	constexpr float kRopeTheta = 10000.0f;
+	heads_ = kHeads;
+	head_dim_ = kHeadDim;
+	sliding_window_ = kSlidingWindow;
+	rms_eps_ = kRmsEps;
+	rope_theta_ = kRopeTheta;
+	(void)config_json;   // the codec config file is no longer read
 	const i64 q_dim = heads_ * head_dim_;
 	if (qw.shape[0] != q_dim || st_.require(l0 + "self_attn.k_proj.weight").shape[0] != q_dim)
 		throw MediaError("mimi: attention width is not num_attention_heads * head_dim");
@@ -485,6 +468,15 @@ void MimiCodec::open(const std::string& path, GpuCtx* gpu, const std::string& co
 
 void MimiCodec::quantize_frames(const i32* codes, i64 frames, float* out) const {
 	const i64 K = codebooks_;
+	// The reference clamps on the low side only (`clamp(audio_codes, min=0)`); the
+	// upper clamp is this port's safety net for a caller handing the decoder codes
+	// of its own. It is worth knowing how quiet it is: an out-of-range code does
+	// not fail, it becomes one fixed codebook entry, which the vocoder renders as a
+	// steady tone - "a noise at the tail" rather than an error. Breeze-TTS-2's own
+	// sampling path cannot produce one (both sites suppress
+	// [codec_codebook_size, vocab) and the depth decoder's support ends at its
+	// head's width - see `sample_logits` in breeze_tts.cpp), so a run that lands
+	// here has an upstream bug, not a codec one.
 	auto clamp_code = [&](i32 c) {
 		if (c < 0) return (i32)0;
 		if (c >= codebook_size_) return (i32)codebook_size_ - 1;

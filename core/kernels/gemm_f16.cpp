@@ -107,8 +107,11 @@ extern "C" __global__ void gemm_f16(Args a) {
                 const unsigned k = kBase + c2 * 2;
                 float2 v = (m < M && (k + 1) < K) ? loadHalf2(A, aOff + (m * K + k) * 2)
                                                   : make_float2(0.0f, 0.0f);
-                if (m < M && k < K) sA[r][c2 * 2] = v.x;
-                if (m < M && (k + 1) < K) sA[r][c2 * 2 + 1] = v.y;
+                // Every slot of the tile is written, out-of-range included: the
+                // multiply below walks the full `BK` and would otherwise read a
+                // shared lane that was never staged (see the header).
+                sA[r][c2 * 2] = (m < M && k < K) ? v.x : 0.0f;
+                sA[r][c2 * 2 + 1] = (m < M && (k + 1) < K) ? v.y : 0.0f;
             }
         }
         if (bIsF32) {
@@ -137,12 +140,19 @@ extern "C" __global__ void gemm_f16(Args a) {
                     v = bIsBf16 ? loadBf16x2(B, bOff + (n * K + k) * 2)
                                 : loadHalf2(B, bOff + (n * K + k) * 2);
                 }
-                if (n < N && k < K) sB[r][c2 * 2] = v.x;
-                if (n < N && (k + 1) < K) sB[r][c2 * 2 + 1] = v.y;
+                sB[r][c2 * 2] = (n < N && k < K) ? v.x : 0.0f;
+                sB[r][c2 * 2 + 1] = (n < N && (k + 1) < K) ? v.y : 0.0f;
             }
         }
         __syncthreads();
 
+        // Walks the whole tile: `K` need not be a multiple of `BK`, and every
+        // staged slot is written (zero past K) precisely so this can stay a
+        // fixed-bound, fully unrolled loop. Reading a lane the staging skipped
+        // multiplied uninitialised shared memory into the result - which is
+        // how the video VAE's 24-wide x_embedder produced NaN and stale bytes
+        // in a few output columns, i.e. the flickering black blocks and green
+        // grid in the decoded video.
         #pragma unroll
         for (unsigned kkn = 0; kkn < BK; kkn++) {
             float av[TM], bv[TN];

@@ -18,7 +18,7 @@ void TextEncoder8B::open(const std::string& path, GpuCtx* gpu) {
 	const StTensor& emb = st_.require("model.embed_tokens.weight");
 	if (emb.shape.size() != 2) throw MediaError("qwen3vl: unexpected embedding shape");
 	cfg_.vocab = emb.shape[0];
-	cfg_.hidden = emb.shape[1];
+	cfg_.hidden = st_.logical_cols(emb);
 
 	i64 l = 0;
 	while (st_.find("model.layers." + std::to_string(l) + ".input_layernorm.weight")) l++;
@@ -31,16 +31,31 @@ void TextEncoder8B::open(const std::string& path, GpuCtx* gpu) {
 	cfg_.n_heads = qp.shape[0] / cfg_.head_dim;
 	cfg_.n_kv_heads = kp.shape[0] / cfg_.head_dim;
 	cfg_.intermediate = st_.require("model.layers.0.mlp.gate_proj.weight").shape[0];
-	if (qp.shape[1] != cfg_.hidden)
+	// The *logical* K: `shape[1]` for every family whose header shape was rewritten to it,
+	// and twice it for the I8-backed convrot int4, which keeps its packed width there.
+	if (st_.logical_cols(qp) != cfg_.hidden)
 		throw MediaError("qwen3vl: q_proj input width does not match the embedding width");
-	// The tower may arrive as the shipped int8 tensorwise checkpoint or as any
-	// f16 / bf16 tensorwise quantisation of the same weights; load_quant_linear()
-	// normalises all of them onto the engine's int8 GEMM path, so no branch is
-	// needed here beyond refusing a file that is neither.
-	if (!(qp.dtype == DType::I8 || qp.dtype == DType::F16 || qp.dtype == DType::BF16 ||
-	      qp.dtype == DType::F32 || qp.dtype == DType::F8_E4M3 || qp.dtype == DType::F8_E5M2))
-		throw MediaError("qwen3vl: unsupported weight precision for q_proj");
+	// The tower may arrive in any precision the reader can decode. `load_quant_linear`
+	// is what decides the path - a float / fp8 / nvfp4 source keeps its precision and
+	// runs the dense GEMM, and everything else (int8 tensorwise, w4a8, w6a8, the
+	// packed convrot int4) lands on the engine's int8 tensor-core pair - so there is
+	// no format to enumerate here. Only a tensor that is neither a float nor a
+	// quantisation this engine knows is refused, by name.
+	if (weight_precision_of(st_, qp) == WeightPrecision::Other)
+		throw MediaError("qwen3vl: unsupported weight precision for q_proj (" + qp.name + ")");
 	if (cfg_.out_layer < 0 || cfg_.out_layer >= cfg_.n_layers) cfg_.out_layer = cfg_.n_layers - 1;
+
+	// ── the tier plan's units ──────────────────────────────────────────────
+	//
+	// One unit per layer the encode walks, in order: `plan(n)` reads "units [0, n)
+	// are on the card", and the layers past the resident window are read once per
+	// call. The tower runs once per prompt, and the DiT that follows re-reads its own
+	// weights many times per step - so this registers as a *Secondary*: the pool
+	// takes these bytes back when the DiT plans, which is exactly when the text phase
+	// is over (see host/residency.hpp).
+	wr_.attach(&st_, "te8", HostWeightPool::Rank::Secondary);
+	for (i64 i = 0; i <= cfg_.out_layer; i++)
+		wr_.add_unit(weight_unit_of(st_, "model.layers." + std::to_string(i) + "."));
 }
 
 void TextEncoder8B::upload_layer(i64 index, Layer& L, GpuArena* into) {
@@ -116,11 +131,18 @@ void TextEncoder8B::release_resident() {
 	res_n_ = 0;
 	res_bytes_ = 0;
 	res_planned_ = false;
+	// The RAM tier goes with the window: the DiT's plan runs right after this call
+	// and wants the machine's RAM for blocks it re-reads on every sampling step,
+	// while this tower has already produced its prompt's rows.
+	wr_.drop();
 }
 
 void TextEncoder8B::plan_residency(i64 S) {
 	(void)S;   // the frame is already charged: this runs after the activations exist
 	release_resident();
+	// The RAM tier is planned on the way out, from whatever `res_n_` ends up
+	// being (every early return below is a legitimate answer).
+	TierPlanOnExit tier(wr_, res_n_);
 	res_planned_ = true;
 	const i64 n_total = cfg_.out_layer + 1;
 	if (!g_ || !g_->ctx || n_total <= 0) return;

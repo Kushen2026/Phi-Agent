@@ -1,3 +1,5 @@
+#include <atomic>
+
 #include "host/st.hpp"
 
 #include <windows.h>
@@ -27,10 +29,18 @@ namespace {
 SafeTensors::HostAllocFn g_host_alloc = nullptr;
 SafeTensors::HostFreeFn g_host_free = nullptr;
 u64 g_lock_cap = 0;
+// Every byte this process has ever read out of the RAM tier (see
+// `host_weight_served_bytes`). Bumped from the three places a read can be served
+// by pointer or by memcpy out of the pinned set, which is the only evidence that
+// the tier is doing anything: a pin nobody reads costs RAM and buys nothing.
+std::atomic<u64> g_served{0};
 u64 g_lock_used = 0;
 std::mutex g_lock_mutex;
 
 }  // namespace
+
+u64 host_weight_served_bytes() { return g_served.load(std::memory_order_relaxed); }
+void reset_host_weight_served() { g_served.store(0, std::memory_order_relaxed); }
 
 void SafeTensors::set_host_allocator(HostAllocFn alloc, HostFreeFn free, u64 lock_cap) {
 	g_host_alloc = alloc;
@@ -237,7 +247,12 @@ void SafeTensors::parse_header() {
 			t.shape.push_back(v);
 			t.numel *= v;
 		}
-		if (t.shape.empty()) t.numel = 0;
+		// A safetensors scalar is written with an empty shape and holds exactly one
+		// element - the per-tensor scale of an fp8 or nvfp4 weight is stored that way,
+		// so it has to be reported as one value: `numel == 0` made every such weight
+		// read as *unscaled* (`row_scale_value` answers 1.0 for an empty table), i.e.
+		// an fp8 checkpoint an order of magnitude out.
+		if (t.shape.empty()) t.numel = 1;
 		const JsonValue& off = entry["data_offsets"];
 		if (!off.is_array() || off.size() != 2) continue;
 		u64 start = (u64)off[(size_t)0].as_int(0);
@@ -288,19 +303,66 @@ const StTensor* SafeTensors::find(std::string_view name) const {
 // ── precision ───────────────────────────────────────────────────────────────
 
 bool SafeTensors::is_quantized(const StTensor& t) const {
-	return t.dtype == DType::I8 || t.dtype == DType::I4;
+	if (t.dtype == DType::I8 || t.dtype == DType::I4) return true;
+	// A U8 payload is the quantised container for the families whose codes are not
+	// signed: nvfp4 (E2M1 nibbles in a byte) is the one the shipped files use, and a
+	// packer is free to store a 4- or 6-bit pack in U8 too. Only a U8 tensor that
+	// *has* a quant sidecar carries a decodable weight - a bare U8 tensor is a mask,
+	// a token table or the `comfy_quant` blob itself - so the layout answers it.
+	// Without this a U8 nvfp4 weight was read as its raw code bytes (0..255 as
+	// floats) by every host consumer of `materialize` / `tensor_to_f32`.
+	if (t.dtype != DType::U8) return false;
+	// Only a *weight* stores its payload in the U8 container; the sidecars beside it
+	// (`weight_scale`, `weight_s_rel`, the codebook) are read as their own numbers,
+	// so their names must not be mistaken for a quantised matrix.
+	if (!ends_with(t.name, ".weight")) return false;
+	const WeightLayout L = weight_layout(t.name);
+	return L.known_family || L.packed || L.rel_scale != nullptr;
 }
 
 bool SafeTensors::is_raw(const StTensor& t) const {
 	return t.dtype == DType::F32 || t.dtype == DType::F16 || t.dtype == DType::BF16;
 }
 
+// ── the RAM tier, offered to the readers that copy out of the mapping ─────
+//
+// `read_file` has always resolved the tiers (pinned set -> look-ahead slot ->
+// device); the *decode* paths did not, so a model whose non-resident blocks were
+// pinned still faulted them in through the mapping - the pinning only helped the
+// loaders that upload verbatim, which is the H3 chain's and the video VAE's.
+// Both of these answer the same question for a decode: "is this tensor in system
+// memory, and where?".
+PinnedBytes SafeTensors::pinned_span(u64 offset, u64 len) const {
+	if (len == 0) return PinnedBytes();
+	std::lock_guard<std::mutex> lk(cache_mutex_);
+	if (cache_.empty()) return PinnedBytes();
+	// The set is keyed by the range's own offset, so the only candidate is the
+	// greatest key not past `offset`.
+	auto it = cache_.upper_bound(offset);
+	if (it == cache_.begin()) return PinnedBytes();
+	--it;
+	const u64 rel = offset - it->first;
+	if (rel > it->second->size() || len > it->second->size() - rel) return PinnedBytes();
+	pin_served_bytes_ += len;
+	g_served.fetch_add(len, std::memory_order_relaxed);
+	return PinnedBytes(it->second);
+}
+
+SafeTensors::TensorSource SafeTensors::tensor_source(const StTensor& t) const {
+	TensorSource s;
+	s.pin = pinned_span(t.offset, t.nbytes);
+	s.base = s.pin ? (const u8*)s.pin.data() : (const u8*)mapping_ + t.offset;
+	return s;
+}
+
 u64 SafeTensors::row_bytes(const StTensor& t) const {
 	if (t.row_bytes_stored) return t.row_bytes_stored;
 	const i64 cols = t.shape.empty() ? 0 : t.shape.back();
 	if (cols <= 0) return 0;
-	// rows are dense, at the dtype's own element size. int4 is packed two per byte
-	// along the row and is not readable through this path.
+	// rows are dense, at the dtype's own element size. A bare int4 payload is packed
+	// two per byte along the row and has no single reading of `shape.back()` here
+	// (its own decode in `dequant_rows` uses the stored byte count), so it is not
+	// readable through this accessor.
 	if (t.dtype == DType::I4)
 		throw MediaError("row access: '" + t.name + "' is int4-packed; use the int4 loader");
 	return (u64)cols * (u64)dtype_size(t.dtype);
@@ -333,7 +395,8 @@ void SafeTensors::dequant_int4_rows(const StTensor& t, i64 row0, i64 rows, float
 	const i64 stored = t.shape.empty() ? 0 : t.shape.back();
 	const i64 k = stored * 2;
 	const i64 stride = row_bytes(t);
-	const u8* base = (const u8*)mapping_ + t.offset + (u64)row0 * (u64)stride;
+	const TensorSource src = tensor_source(t);
+	const u8* base = src.base + (u64)row0 * (u64)stride;
 	for (i64 r = 0; r < rows; r++) {
 		const float s = L.row_scale ? row_scale_value(*L.row_scale, row0 + r) : 1.0f;
 		const u8* codes = base + (u64)r * (u64)stride;
@@ -352,7 +415,8 @@ void SafeTensors::dequant_packed_rows(const StTensor& t, i64 row0, i64 rows, flo
 	const WeightLayout L = weight_layout(t.name);
 	const i64 k = stored_cols * 8 / L.bits;
 	const u64 stride = (u64)stored_cols;  // packed payloads are byte-aligned
-	const u8* rows_base = (const u8*)mapping_ + t.offset + (u64)row0 * stride;
+	const TensorSource src = tensor_source(t);
+	const u8* rows_base = src.base + (u64)row0 * stride;
 	const i64 rel_cols = (L.rel_scale && !L.rel_scale->shape.empty()) ? L.rel_scale->shape.back() : 0;
 	const DType rel_dtype = L.rel_scale ? L.rel_scale->dtype : DType::F32;
 	const void* rel_base = L.rel_scale ? data_of(*L.rel_scale) : nullptr;
@@ -364,14 +428,10 @@ void SafeTensors::dequant_packed_rows(const StTensor& t, i64 row0, i64 rows, flo
 		                 std::to_string(row0) + ".." + std::to_string(row0 + rows - 1) + " of '" +
 		                 t.name + "'");
 
-	// A six-bit pack must *look* like one: the codes of a rotated weight are a
-	// bell around their group's scale, so the histogram of the codes carries far
-	// less than six bits. A payload whose bits are independent (an encrypted or
-	// scrambled file) decodes to uniform codes instead, and this is the only place
-	// that difference can be caught - otherwise a wrong payload would be
-	// requantised into a wrong model and only show up as a bad generation minutes
-	// later. Checked once per tensor.
-	if (L.spec.format == "w6a8_int8" || L.spec.format == "w6a8") validate_packed6_payload(t);
+	// The "does this payload look like a quantisation?" diagnostic (see the header).
+	// Opt-in, and it only prints - ComfyUI decodes whatever the header declares, and
+	// a checkpoint it runs must not be refused here.
+	if (L.spec.format == "w6a8_int8" || L.spec.format == "w6a8") report_packed6_payload(t);
 
 	std::vector<float> codebook;
 	if (L.codebook) {
@@ -379,26 +439,67 @@ void SafeTensors::dequant_packed_rows(const StTensor& t, i64 row0, i64 rows, flo
 		convert_to_f32(L.codebook->dtype, data_of(*L.codebook), codebook.data(),
 		               (size_t)L.codebook->numel);
 	}
+
+	// The asymmetric recipe's additive plane, gathered per weight row: the stored
+	// tensor is [groups, rows], so one row's entries are strided. Built once for the
+	// whole row range (it is absent for every symmetric checkpoint, and small when
+	// it is there) so the decoders can take a plain pointer.
+	std::vector<float> corr;
+	const i64 corr_groups = L.correction ? std::max<i64>(1, L.group) : 0;
+	if (L.correction) {
+		const i64 cn = L.correction->shape.size() > 1 ? L.correction->shape[1] : 0;
+		if (cn < row0 + rows)
+			throw MediaError("'" + L.correction->name + "' does not cover rows " +
+			                 std::to_string(row0) + ".." + std::to_string(row0 + rows - 1) +
+			                 " of '" + t.name + "'");
+		std::vector<float> all((size_t)L.correction->numel);
+		convert_to_f32(L.correction->dtype, data_of(*L.correction), all.data(),
+		               (size_t)L.correction->numel);
+		corr.assign((size_t)(rows * corr_groups), 0.0f);
+		const i64 cg = L.correction->shape.empty() ? 0 : L.correction->shape[0];
+		for (i64 r = 0; r < rows; r++)
+			for (i64 g = 0; g < corr_groups && g < cg; g++)
+				corr[(size_t)(r * corr_groups + g)] = all[(size_t)(g * cn + row0 + r)];
+	}
+
+	// nvfp4's block-scale table is stored in the cuBLAS tiled layout, so the
+	// decoder needs its geometry, not a row stride.
+	const u8* nv_blocks = nullptr;
+	i64 nv_blocked_rows = 0, nv_blocked_cols = 0;
+	if ((L.spec.format == "nvfp4" || L.spec.format == "mxfp4") && L.rel_scale) {
+		nv_blocks = (const u8*)data_of(*L.rel_scale);
+		nv_blocked_rows = L.rel_scale->shape.size() > 0 ? L.rel_scale->shape[0] : 1;
+		nv_blocked_cols = L.rel_scale->shape.size() > 1 ? L.rel_scale->shape[1] : 0;
+	}
+
 	const std::string& f = L.spec.format;
 	for (i64 r = 0; r < rows; r++) {
 		const u8* codes = rows_base + (u64)r * stride;
 		float* out = dst + (size_t)r * (size_t)k;
 		const float s_channel = L.row_scale ? row_scale_value(*L.row_scale, row0 + r) : 1.0f;
+		const float* corr_row =
+		    corr.empty() ? nullptr : &corr[(size_t)r * (size_t)corr_groups];
 		const void* rel_row = nullptr;
 		if (rel_base && !rel_scalar)
 			rel_row = (const u8*)rel_base + (u64)(row0 + r) * (u64)rel_cols * dtype_size(rel_dtype);
 		else if (rel_base)
 			rel_row = rel_base;
 		if (f == "asym_w4a8_int8") {
-			dequant_codebook_int4_row(codes, k, codebook.data(), s_channel, rel_row, rel_dtype,
-			                          L.group, out);
+			// The codebook is optional: without one the family is the uniform
+			// symmetric form whose zero point is the middle of the 4-bit range.
+			dequant_codebook_int4_row(codes, k, codebook.empty() ? nullptr : codebook.data(),
+			                          s_channel, rel_row, rel_dtype, L.group, corr_row, out);
 		} else if (f == "w6a8_int8" || f == "w6a8") {
-			dequant_packed6_row(codes, k, s_channel, rel_row, rel_dtype, L.group, out);
+			dequant_packed6_row(codes, k, s_channel, rel_row, rel_dtype, L.group, corr_row, out);
 		} else if (f == "nvfp4" || f == "mxfp4") {
-			// `rel_scale` is the per-block fp8 table here, `global_scale` the
-			// per-tensor fp32 one.
+			// `rel_scale` is the per-block fp8 table (cuBLAS-tiled) and `global_scale`
+			// the per-tensor fp32 one.
 			const float global = L.global_scale ? row_scale_value(*L.global_scale, row0 + r) : 1.0f;
-			dequant_nvfp4_row(codes, k, rel_row, rel_dtype, global, L.group, out);
+			// The *global* row: the block table is in the cuBLAS tiled layout, so a
+			// row range that does not start at 0 needs its real row number to find
+			// its scales (a slab decode is what the streaming requantiser issues).
+			dequant_nvfp4_row(codes, row0 + r, k, nv_blocks, nv_blocked_rows, nv_blocked_cols,
+			                  rel_dtype, global, L.group, out);
 		} else if (L.bits == 8) {
 			// Grouped int8: signed codes with a relative scale per group of columns.
 			const i64 g = L.group > 0 ? L.group : k;
@@ -413,22 +514,24 @@ void SafeTensors::dequant_packed_rows(const StTensor& t, i64 row0, i64 rows, flo
 	}
 }
 
-// A six-bit payload has to *look* like one.
+// The "does this payload look like a quantisation?" diagnostic. Opt-in
+// (`PHI_PACKED6_CHECK=1`) and print-only: see the header for why it must not gate
+// a decode. Measured once per tensor.
 //
-// The codes of a rotated, per-group quantised weight are a bell around zero, so
-// their 64-bin histogram carries far fewer than the six bits a uniform one would.
-// A payload whose bits are independent - an encrypted, scrambled or wrongly
-// written file - decodes to uniform codes instead, and decoding it would feed the
-// sampler a random model that only shows up as a bad generation minutes later.
-// So the histogram is measured once per tensor and the tensor is refused by name.
+// It reports the two statistics that separate a genuine pack from a payload whose
+// bits are independent:
 //
-// The numbers for the shipped `minimax_h3_ref2va_pruned_w6a8.safetensors`: its
-// six-bit histogram entropy is 6.00 of a possible 6.00 bits, its bytes hold 7.88
-// of a possible 8.0 bits, the byte autocorrelation is <0.005 at every lag and the
-// values correlate with the same weights in another precision at |r|<0.002 -
-// while a genuine six-bit pack of those same weights measures 3.48 bits of byte
-// entropy. That file is not a quantisation of the weights it claims to hold.
-void SafeTensors::validate_packed6_payload(const StTensor& t) const {
+//   * code-histogram entropy, over the 64 possible codes (a genuine pack of a
+//     rotated, ALS-fitted weight measured 5.83 of a possible 6.00; independent
+//     uniform codes 5.99-6.00);
+//   * the fraction of code groups reaching an extreme code, i.e. within one of
+//     either end of the 6-bit range (a genuine pack measured 0.62; uniform codes,
+//     which the middle-point offset spreads evenly, measure far lower).
+//
+// No threshold is applied. The two numbers are printed with the tensor's name and
+// left for the operator to read against a file whose provenance they know.
+void SafeTensors::report_packed6_payload(const StTensor& t) const {
+	if (!getenv("PHI_PACKED6_CHECK")) return;
 	static std::mutex mu;
 	static std::set<std::string> checked;
 	{
@@ -441,17 +544,27 @@ void SafeTensors::validate_packed6_payload(const StTensor& t) const {
 	const i64 rows_total = t.numel / t.shape.back();
 	const i64 rows = std::min<i64>(std::max<i64>(rows_total, 1), 1024);
 	const i64 group = L.group > 0 ? L.group : 32;
+	// The row is k/2 bytes of low nibbles then k/4 bytes of top-2-bit codes: 3k/4
+	// bytes for k = stored_cols * 8 / 6 codes.
+	const i64 per_row = stored_cols * 8 / 6;
+	if ((per_row % 4) != 0 || stored_cols < per_row / 2 + per_row / 4) return;
 	const u8* base = (const u8*)mapping_ + t.offset;
 	i64 hist[64] = {0};
 	i64 seen = 0, groups = 0, extreme = 0;
-	const i64 per_row = stored_cols * 8 / 6;  // codes in one row
 	for (i64 r = 0; r < rows; r++) {
 		const u8* codes = base + (u64)r * (u64)stored_cols;
 		i64 in_group = 0;
 		bool lo = false, hi = false;
 		for (i64 c = 0; c + 4 <= per_row; c += 4) {
-			u8 v[4];
-			unpack_6bit_triple(codes + (c / 4) * 3, v);
+			const u8 lo0 = codes[c / 2];
+			const u8 lo1 = codes[c / 2 + 1];
+			const u8 hb = codes[per_row / 2 + c / 4];
+			const u8 v[4] = {
+			    (u8)((u8)(lo0 & 0x0F) | (u8)(((hb >> 0) & 0x03) << 4)),
+			    (u8)((u8)((lo0 >> 4) & 0x0F) | (u8)(((hb >> 2) & 0x03) << 4)),
+			    (u8)((u8)(lo1 & 0x0F) | (u8)(((hb >> 4) & 0x03) << 4)),
+			    (u8)((u8)((lo1 >> 4) & 0x0F) | (u8)(((hb >> 6) & 0x03) << 4)),
+			};
 			for (int j = 0; j < 4; j++) {
 				hist[v[j]]++;
 				seen++;
@@ -477,46 +590,28 @@ void SafeTensors::validate_packed6_payload(const StTensor& t) const {
 		const double p = (double)hist[i] / (double)seen;
 		h -= p * std::log2(p);
 	}
-	const double frac = (double)extreme / (double)groups;
-	// Two independent signatures of "not a quantisation", both measured against a
-	// genuine six-bit pack of the same weights (`media_packed_quant_test` builds
-	// one, and the int8 twin of this very tensor was measured in Python):
-	//
-	//   * code-histogram entropy:  genuine 5.4-5.8 bits, uniform 6.00;
-	//   * group extremes:          genuine 1.00 (a per-group normalisation puts
-	//                              each group's maximum at a top code),
-	//                              independent uniform codes ~0.64-0.70.
-	//
-	// Refusing needs *both*, so a file that is merely packed by a producer with an
-	// unusual scale policy (high entropy, but extremes present) still loads.
-	if (h > 5.9 && frac < 0.9) {
-		char buf[160];
-		snprintf(buf, sizeof(buf),
-		         "%.2f of 6.00 bits and only %.0f%% of its %lld code groups reach an extreme "
-		         "code (a genuine pack: ~100%%)",
-		         h, frac * 100.0, (long long)groups);
-		throw MediaError("'" + t.name +
-		                 "': this file declares a six-bit quantisation of its weights, but its "
-		                 "payload does not carry one - the codes are uniformly distributed (" +
-		                 buf +
-		                 "), i.e. its bits are independent and it is most likely scrambled, "
-		                 "encrypted or wrongly written. The decoder for the declared layout is "
-		                 "in the engine (media_packed_quant_test packs a file the way the format "
-		                 "declares and reads it back); re-export this checkpoint, or hand over "
-		                 "the packer that wrote it, and it will load.");
-	}
+	fprintf(stderr,
+	        "[packed6] %s: code entropy %.2f of 6.00 bits, %.0f%% of %lld code groups reach "
+	        "an extreme code (a genuine pack of the H3 weights measured 5.83 and 62%%; a "
+	        "payload with independent bits measures ~6.00 and much less). Printed for "
+	        "information only - the decode is unaffected.\n",
+	        t.name.c_str(), h, (double)extreme / (double)groups * 100.0, (long long)groups);
 }
 
 void SafeTensors::dequant_rows(const StTensor& t, i64 row0, i64 rows, float* dst) const {
 	const i64 stored_cols = t.shape.empty() ? 0 : t.shape.back();
 	if (stored_cols <= 0 || rows <= 0) return;
 	const WeightLayout layout = weight_layout(t.name);
+	// The tier this read is served from: the pinned (system memory) copy when the
+	// model's tier plan holds it, else the mapping. Held for the whole call, so the
+	// bytes cannot be freed under us by a `drop_cache` at a phase boundary.
+	const TensorSource src = tensor_source(t);
 
 	// fp8 payloads: one value per element, plus an optional per-row (or
 	// per-tensor) scale, which is how the fp8 checkpoints are published.
 	if (t.dtype == DType::F8_E4M3 || t.dtype == DType::F8_E5M2) {
 		const u64 stride = (u64)stored_cols;
-		const u8* base = (const u8*)mapping_ + t.offset + (u64)row0 * stride;
+		const u8* base = src.base + (u64)row0 * stride;
 		for (i64 r = 0; r < rows; r++) {
 			const float s = layout.row_scale ? row_scale_value(*layout.row_scale, row0 + r) : 1.0f;
 			dequant_fp8_row(base + (u64)r * stride, stored_cols, t.dtype, s,
@@ -538,12 +633,35 @@ void SafeTensors::dequant_rows(const StTensor& t, i64 row0, i64 rows, float* dst
 		dequant_int4_rows(t, row0, rows, dst, layout);
 		return;
 	}
+	// A bare packed int4 (the `I4`/`U4` safetensors dtype with no comfy_quant
+	// sidecar at all): two signed nibbles per byte along the last dim, times one
+	// scale per output row when the file carries a `weight_scale` beside it. None of
+	// the shipped checkpoints stores its int4 this way - they use the I8-backed
+	// `convrot_w4a4` above - but the reader accepts the dtype, and refusing it here
+	// would be the one hole in "every precision the file can store".
+	if (t.dtype == DType::I4 && !layout.packed) {
+		const i64 stored = t.shape.back();
+		const i64 k = stored * 2;
+		const u64 stride = (u64)stored;
+		const u8* base = src.base + (u64)row0 * stride;
+		for (i64 r = 0; r < rows; r++) {
+			const float sc = layout.row_scale ? row_scale_value(*layout.row_scale, row0 + r) : 1.0f;
+			const u8* codes = base + (u64)r * stride;
+			float* out = dst + (size_t)r * (size_t)k;
+			for (i64 c = 0; c < stored; c++) {
+				const u8 b = codes[c];
+				out[2 * c] = (float)unpack_i4_low(b) * sc;
+				out[2 * c + 1] = (float)unpack_i4_high(b) * sc;
+			}
+		}
+		return;
+	}
 	if (int_like && layout.spec.valid && !layout.known_family)
 		throw MediaError("'" + t.name + "': the quantisation format \"" + layout.spec.format +
 		                 "\" is not one this engine can decode");
 
 	const i64 cols = stored_cols;
-	const u8* base = (const u8*)mapping_ + t.offset + (u64)row0 * row_bytes(t);
+	const u8* base = src.base + (u64)row0 * row_bytes(t);
 	switch (t.dtype) {
 		case DType::F32:
 			memcpy(dst, base, (size_t)(rows * cols) * 4);
@@ -594,10 +712,24 @@ std::vector<u8> SafeTensors::materialize(const StTensor& t, DType target) const 
 	// that every consumer of this call has always received.
 	if (is_quantized(t) || t.dtype == DType::F8_E4M3 || t.dtype == DType::F8_E5M2) {
 		const i64 k = logical_cols(t);
-		const i64 total = t.numel;
-		if (k <= 0 || total <= 0) return {};
-		const i64 rows = total / k;
-		std::vector<u8> out((size_t)(total * (i64)dtype_size(target)));
+		if (k <= 0) return {};
+		// The row count comes from the *stored* row width, not from `numel / k`: the
+		// two agree only for a family whose header shape was rewritten to the logical
+		// K (`rewrite_packed_shapes`). The I8-backed `convrot_w4a4` deliberately keeps
+		// its packed width in `shape` (its consumer reads `shape[1]` as the packed K),
+		// so `numel / k` there is *half* the real row count - which is why a LoRA
+		// folding into a convrot_w4a4 weight used to materialise half a matrix.
+		i64 rows = 0;
+		if (t.stored_cols > 0) {
+			rows = t.shape.empty() ? 0 : (i64)(t.numel / t.shape.back());
+		} else if (t.dtype == DType::I4) {
+			rows = t.shape.empty() ? 0 : (i64)(t.nbytes / (u64)t.shape.back());
+		} else {
+			const u64 rb = row_bytes(t);
+			rows = rb ? (i64)(t.nbytes / rb) : 0;
+		}
+		if (rows <= 0) return {};
+		std::vector<u8> out((size_t)(rows * k * (i64)dtype_size(target)));
 		const i64 slab = std::max<i64>(1, (16ll << 20) / std::max<i64>(k * 4, 1));
 		// `convrot` weights are stored rotated (the int8 GEMMs want that basis, so
 		// `dequant_rows` hands it back untouched), but a *float* consumer is asking
@@ -712,38 +844,59 @@ SafeTensors::WeightLayout SafeTensors::weight_layout(std::string_view weight_nam
 	L.codebook = find(base + ".weight_codebook");
 	L.rel_scale = find(base + ".weight_s_rel");
 	L.global_scale = find(base + ".weight_scale_2");
+	L.correction = find(base + ".weight_correction");
 	L.row_scale = find(base + ".weight_s_channel");
 	if (!L.row_scale) L.row_scale = find(base + ".weight_scale");
-	if (L.spec.format == "nvfp4" && !L.rel_scale && L.row_scale) {
+	if (L.spec.format == "nvfp4" || L.spec.format == "mxfp4") {
 		// An nvfp4 weight's scale lives in two places: a per-16-block E4M3 table and
-		// one global fp32. Which tensor name holds which is a packer's choice, so the
-		// table is identified by its *shape*: it has one entry per block, so its last
-		// dim times its row count is not its element count. `weight_scale` is looked
-		// at first (the name comfy's own packer uses) and `weight_scale_2` second.
+		// one global fp32. ComfyUI's own packer writes the block table as
+		// `weight_scale` and the global as `weight_scale_2` (`state_dict_tensors`:
+		// "_scale": block_scale, "_scale_2": scale), which is the mapping used here.
+		//
+		// A *block table* is recognisable by its shape - it holds one entry per
+		// 16-element block, and lands in the cuBLAS tiled layout, so its last dim times
+		// its row count is not its element count - and a packer that wrote the two the
+		// other way round is put right here rather than silently read.
 		//
 		// What this must NOT do is drop the global scale: `dequant_packed_rows`
 		// passes `L.global_scale` through to `dequant_nvfp4_row`, and leaving it null
-		// there reads 1.0 instead of the real factor, i.e. every nvfp4 weight an
-		// order of magnitude out. The earlier form of this branch moved the global
-		// into `row_scale` (where the nvfp4 decode ignores it) and nulled
-		// `global_scale`, which is exactly that loss.
-		const i64 n = L.row_scale->shape.empty() ? 0 : L.row_scale->shape.back();
-		if (L.row_scale->shape.size() > 1 && n > 0 && n != L.row_scale->numel) {
+		// reads 1.0 instead of the real factor, i.e. every nvfp4 weight an order of
+		// magnitude out.
+		// A *global* scale is a single value (ComfyUI writes it as a 0-dim scalar)
+		// and a *block table* is a >=2-D tensor with one entry per 16-element block.
+		// The stored table is in the cuBLAS tiled layout, whose row and column
+		// counts multiply back to its element count - so "shape[1] != numel/rows"
+		// cannot tell them apart, while "is it one value or many" can.
+		auto is_block_table = [](const StTensor* p) {
+			return p && p->numel > 1 && p->shape.size() >= 2;
+		};
+		if (!L.rel_scale && L.row_scale && is_block_table(L.row_scale)) {
 			L.rel_scale = L.row_scale;   // the per-block table
 			L.row_scale = nullptr;       // nvfp4 has no per-row scale
-			// `global_scale` (weight_scale_2) is already where the decoder wants it.
+		} else if (is_block_table(L.global_scale) && !is_block_table(L.rel_scale)) {
+			// Written the other way round: the block table is under `weight_scale_2`.
+			L.rel_scale = L.global_scale;
+			L.global_scale = L.row_scale;
+			L.row_scale = nullptr;
 		}
 	}
 	L.bits = quant_bits_per_weight(L.spec.format);
 	const std::string& f = L.spec.format;
-	if (f == "asym_w4a8_int8") {
+	if (f == "asym_w4a8_int8" || f == "w6a8_int8" || f == "w6a8") {
 		L.packed = true;
-		L.group = L.spec.group_size > 0 ? L.spec.group_size : 16;
+		L.group = L.spec.group_size > 0 ? L.spec.group_size : (f == "asym_w4a8_int8" ? 16 : 32);
 		L.known_family = true;
-	} else if (f == "w6a8_int8" || f == "w6a8") {
-		L.packed = true;
-		L.group = L.spec.group_size > 0 ? L.spec.group_size : 32;
-		L.known_family = true;
+		// Both grouped families store a **ConvRot-rotated** weight: the packer runs
+		// `rotate_int8_convrot_weight` before it quantizes, and the `comfy_quant` blob
+		// carries `convrot_groupsize` rather than a `convrot` flag (see
+		// `_quantized_weight_state_dict` in comfy/ops.py). Recording the rotation here
+		// is what makes `materialize` hand a *float* consumer the weight itself - and,
+		// more importantly, what makes `requant_spec_for` leave the rotated basis
+		// alone: `dequant_rows` hands back the stored (rotated) rows, so a requantiser
+		// that rotated again would return the matrix to its original basis, i.e. feed
+		// the int8 GEMM a *different* weight of the same size and answer with noise.
+		L.spec.convrot = true;
+		if (L.spec.convrot_groupsize <= 0) L.spec.convrot_groupsize = 256;
 	} else if (f == "nvfp4" || f == "mxfp4") {
 		L.packed = true;
 		L.group = L.spec.group_size > 0 ? L.spec.group_size : 16;
@@ -755,6 +908,17 @@ SafeTensors::WeightLayout SafeTensors::weight_layout(std::string_view weight_nam
 		L.known_family = true;
 	} else if (f == "fp8" || f == "float8_e4m3fn" || f == "float8_e4m3" || f == "float8_e5m2") {
 		L.group = 0;
+		L.known_family = true;
+	} else if (f == "convrot_w4a4") {
+		// The signed-int4 nibble family. It has its own loader (`dequant_int4_rows`,
+		// `upload_quant_linear_w4a4`) because its I8 payload packs two values per byte
+		// along K, but its rotation is the same Hadamard convrot the other families
+		// name explicitly. Marking it here is what makes `materialize` hand a *float*
+		// consumer the un-rotated weight (a LoRA folds in the original basis) and
+		// `requant_spec_for` keep the rotated basis for the int8 GEMMs, instead of
+		// rotating the already-rotated stored matrix a second time.
+		L.spec.convrot = true;
+		if (L.spec.convrot_groupsize <= 0) L.spec.convrot_groupsize = 256;
 		L.known_family = true;
 	}
 	return L;
@@ -769,6 +933,8 @@ i64 SafeTensors::logical_cols(const StTensor& t) const {
 	// The signed int4 nibble family: two values per byte along K, but `shape` keeps
 	// the packed width (see `dequant_int4_rows`), so the unpacked K is twice it.
 	if (is_convrot_w4a4(L)) return stored * 2;
+	// A bare packed int4 dtype: same two-per-byte layout, no sidecar.
+	if (t.dtype == DType::I4) return stored * 2;
 	return stored;
 }
 
@@ -840,6 +1006,45 @@ const char* weight_precision_name(WeightPrecision p) {
 		case WeightPrecision::Fp8: return "fp8";
 		default: return "unknown";
 	}
+}
+
+// ── the spec a *decoded* weight is requantised with ─────────────────────────
+//
+// The int8 GEMMs were written against the rotated basis: on disk a weight is
+// `rot(W)` and the activation is rotated at run time, so the contraction comes out
+// in the original basis. A checkpoint whose sidecar says `"convrot": true`
+// (every shipped `*_int8_convrot`, and both grouped families - they carry
+// `convrot_groupsize` rather than the flag, see `weight_layout`) therefore already
+// stores exactly the bytes the kernels want, and `dequant_rows` hands them back in
+// that same basis - so requantising them must only rescale, not rotate.
+//
+// Rotating again is not a rounding difference: rot() is an involution, so the
+// second application returns the matrix to its *original* basis, i.e. it produces
+// a different matrix (energy-preserving, so it looks harmless, and then the model
+// answers with noise). Only a source that is *not* rotated - a plain float
+// checkpoint, or an int8 one without the flag - has to be rotated on the way in.
+//
+// It lives here, beside the layout knowledge it is a function of, rather than in
+// the model layer that happens to call it: the answer is a property of the file,
+// and the LoRA fold path (which is the caller that can get it wrong silently) is
+// testable on the host only if this does not drag the GPU code in with it.
+QuantSpec int8_convrot_spec() {
+	QuantSpec s;
+	s.format = "int8_tensorwise";
+	s.convrot = true;
+	s.convrot_groupsize = 256;
+	s.valid = true;
+	return s;
+}
+
+QuantSpec requant_spec_for(const SafeTensors& st, const std::string& base) {
+	QuantSpec spec = int8_convrot_spec();
+	const StTensor* t = st.find(base + ".weight");
+	if (t) {
+		const SafeTensors::WeightLayout L = st.weight_layout(t->name);
+		if (L.spec.valid && L.spec.convrot) spec.convrot = false;
+	}
+	return spec;
 }
 
 bool SafeTensors::is_plain_int8(const StTensor& t) const {
@@ -944,17 +1149,18 @@ bool SafeTensors::cache_serve(u64 offset, size_t len, void* dst) const {
 	if (it == cache_.begin()) return false;
 	--it;
 	const u64 rel = offset - it->first;
-	if (rel + len > it->second.size()) return false;
+	if (rel > it->second->size() || len > it->second->size() - rel) return false;
 	const double t0 = now_ms();
-	memcpy(dst, (const u8*)it->second.data() + rel, len);
+	memcpy(dst, (const u8*)it->second->data() + rel, len);
 	cache_ms_ += now_ms() - t0;
 	cache_served_bytes_ += len;
+	g_served.fetch_add(len, std::memory_order_relaxed);
 	return true;
 }
 
 // ── the look-ahead slot ───────────────────────────────────────────────────
 
-void SafeTensors::prefetch_reset_locked() {
+void SafeTensors::prefetch_reset_locked() const {
 	pf_ranges_.clear();
 	pf_total_ = 0;
 	pf_state_ = 0;
@@ -969,6 +1175,7 @@ void SafeTensors::prefetch_clear() {
 
 const void* SafeTensors::pinned_dma_at(u64 offset, size_t len) const {
 	if (len == 0) return nullptr;
+
 	// The look-ahead slot first: it holds the block the streamer is about to ask
 	// for, and it is the one buffer that is worth keeping locked even when the
 	// pinned set is not.
@@ -980,6 +1187,7 @@ const void* SafeTensors::pinned_dma_at(u64 offset, size_t len) const {
 				const u64 rel = offset - r.file_off;
 				if (rel + len > r.len) continue;
 				if (r.dest + rel + len > pf_buf_.size()) continue;
+				g_served.fetch_add(len, std::memory_order_relaxed);
 				return (const u8*)pf_buf_.data() + r.dest + rel;
 			}
 		}
@@ -990,10 +1198,11 @@ const void* SafeTensors::pinned_dma_at(u64 offset, size_t len) const {
 		auto it = cache_.upper_bound(offset);
 		if (it == cache_.begin()) return nullptr;
 		--it;
-		if (!it->second.locked()) return nullptr;
+		if (!it->second->locked()) return nullptr;
 		const u64 rel = offset - it->first;
-		if (rel + len > it->second.size()) return nullptr;
-		return (const u8*)it->second.data() + rel;
+		if (rel > it->second->size() || len > it->second->size() - rel) return nullptr;
+		g_served.fetch_add(len, std::memory_order_relaxed);
+		return (const u8*)it->second->data() + rel;
 	}
 }
 
@@ -1010,7 +1219,7 @@ bool SafeTensors::prefetch_ready() const {
 	return pf_state_ == 2;
 }
 
-void SafeTensors::prefetch_worker(std::vector<PfRange> ranges, u64 total) {
+void SafeTensors::prefetch_worker(std::vector<PfRange> ranges, u64 total) const {
 	// Each range is read with the same seek-free ReadFile path the synchronous
 	// loader uses, so a prefetched block costs exactly what it would have cost in
 	// the loop - it just costs it while the GPU is busy. A failure is silent: the
@@ -1042,7 +1251,7 @@ void SafeTensors::prefetch_worker(std::vector<PfRange> ranges, u64 total) {
 	pf_state_ = 2;
 }
 
-void SafeTensors::prefetch_ranges(const std::vector<std::pair<u64, u64>>& ranges) {
+void SafeTensors::prefetch_ranges(const std::vector<std::pair<u64, u64>>& ranges) const {
 	u64 total = 0;
 	std::vector<PfRange> laid;
 	laid.reserve(ranges.size());
@@ -1087,7 +1296,7 @@ bool SafeTensors::prefetch_serve(u64 offset, size_t len, void* dst) const {
 	return false;
 }
 
-void SafeTensors::pin_range(u64 offset, u64 len) {
+void SafeTensors::pin_range(u64 offset, u64 len, u64 slot_headroom) {
 	if (len == 0) return;
 	if (offset > file_size_ || len > file_size_ - offset)
 		throw MediaError("SafeTensors::pin_range out of range");
@@ -1106,12 +1315,12 @@ void SafeTensors::pin_range(u64 offset, u64 len) {
 	// place for the last few hundred megabytes because it holds the block the
 	// streamer has *not* asked for yet.
 	HostPin buf;
-	buf.resize(len, 768ull << 20);
+	buf.resize(len, slot_headroom);
 	read_file(offset, (size_t)len, buf.data());
 	std::lock_guard<std::mutex> lk(cache_mutex_);
 	if (cache_.count(offset)) return;
 	pinned_bytes_ += len;
-	cache_.emplace(offset, std::move(buf));
+	cache_.emplace(offset, std::make_shared<HostPin>(std::move(buf)));
 }
 
 u64 SafeTensors::pinned_bytes() const {
@@ -1180,7 +1389,16 @@ void SafeTensors::release_pages(u64 offset, size_t len) const {
 
 std::string SafeTensors::describe() const {
 	std::string s = path_basename(path_) + " (" + format_bytes(file_size_) + ", " +
-	                std::to_string(tensors_.size()) + " tensors)";
+	                std::to_string(tensors_.size()) + " tensors";
+	// The host-side tiers, when a model has filled them: what the pinned set holds and
+	// how much of it has actually been read. A pin nobody reads is RAM wasted, and
+	// that is invisible from the bytes alone - hence both numbers.
+	const u64 pinned = pinned_bytes();
+	if (pinned) {
+		s += ", " + format_bytes(pinned) + " pinned, " + format_bytes(cache_served_bytes_ + pin_served_bytes_) +
+		     " served from it";
+	}
+	s += ")";
 	return s;
 }
 

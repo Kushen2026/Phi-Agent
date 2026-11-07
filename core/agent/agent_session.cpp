@@ -8,6 +8,7 @@
 
 #include "util/base.hpp"
 #include "agent/system_prompt.hpp"
+#include "agent/token_estimate.hpp"
 #include "tools/tools.hpp"
 #include "tools/tools_helpers.hpp"
 #include "tools/tools_subagent.hpp"
@@ -37,25 +38,6 @@ static std::string flatten_text(const std::vector<ContentPart>& content) {
 		if (part.type == ContentPart::Type::Text) out += part.text;
 	}
 	return out;
-}
-
-// rough token estimate: ~1 token per CJK codepoint, ~4 chars per token for
-// ASCII text (bytes/4 badly underestimates Chinese text)
-static int64_t estimate_tokens(const std::string& text) {
-	int64_t tokens = 0, ascii = 0;
-	for (size_t i = 0; i < text.size();) {
-		unsigned char c = (unsigned char)text[i];
-		if (c < 0x80) {
-			ascii++;
-			i++;
-		} else if ((c & 0xC0) == 0x80) {
-			i++;  // stray continuation byte
-		} else {
-			tokens++;
-			i += c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
-		}
-	}
-	return tokens + ascii / 4;
 }
 
 static void validate_dir(const std::string& path) {
@@ -304,10 +286,14 @@ void AgentSessionHost::open_session(const std::string& session_id) {
 	}
 	auto archive = std::make_unique<SessionArchive>(agent_dir_, cwd_);
 	archive->attach(*path);
-	// 回放得到的元数据回填内存，随第一次 sync 以新格式重新落盘。
+	// 把文件里已有的元数据读回内存。这一步不是「准备落盘」，而是让后续的
+	// set_model / set_thinking 看到「值没变」从而不置 dirty —— 否则
+	// apply_profile_after_start() 一调 set_model 就会整份重写文件，把「最近
+	// 修改」时间刷成刚刚，即使这次只是打开、没有任何输入。
 	if (!content->provider.empty()) archive->set_model(content->provider, content->model_id);
 	if (!content->thinking_level.empty()) archive->set_thinking(content->thinking_level);
 	if (!content->title.empty()) archive->set_title(content->title);
+	archive->mark_clean();   // 上面回填的元数据与文件一致，不算待写
 	init_session(std::move(archive), content.get(), "", nullptr, "");
 	for (const auto& fix : content->repairs) emit_log("warn", fix);
 	apply_profile_after_start();
@@ -328,7 +314,6 @@ void AgentSessionHost::create_session(const std::string& name, const JsonValue* 
 void AgentSessionHost::init_session(std::unique_ptr<SessionArchive> archive, SessionContent* restored,
 	const std::string& name, const JsonValue* model_ref, const std::string& thinking_level) {
 	resources_->reload();
-	system_prompt_ = build_system_prompt_text();
 
 	// initial model: explicit -> restored -> settings default -> first with auth
 	std::optional<ModelDef> model;
@@ -386,6 +371,21 @@ void AgentSessionHost::init_session(std::unique_ptr<SessionArchive> archive, Ses
 	if (restored && !restored->title.empty() && session_name_.empty()) {
 		session_name_ = restored->title;
 	}
+	// 没有命名过：顶部显示的与会话列表里的一致，就是文件名里的时间戳
+	// ("2026-11-07-9:23:40")。这是同一个会话在三个地方的样子——列表、标题栏、
+	// 磁盘上的文件——所以三处都从文件名推出来，而不是各写各的。
+	if (session_name_.empty()) session_name_ = session_file_display_name(session_file_);
+
+	// 设置 → API 配置 → 多模态 是这一条配置对「模型能看什么」的声明，所以它盖过
+	// 模型目录自带的 input：网关模型本来就按档位生成 input，直连（目录）模型的
+	// input 是出厂值，用户改档位后不该被它压回去。
+	if (model && configs_) model->input = vision_mode_inputs(vision_mode_from_key(configs_->active_vision()));
+
+	// 提示词要等 model 定下来再拼：工具清单里 read 那一行说的是这个模型能收到
+	// 什么，所以它必须和上面刚定下的 input 一致（没有模型时与
+	// build_tools_json 的默认值一样：能收图片、不能收视频）
+	system_prompt_ = build_system_prompt_text(model ? model->supports_image() : true,
+	                                          model ? model->supports_video() : false);
 
 	Agent::Config config;
 	config.system_prompt = system_prompt_;
@@ -558,25 +558,30 @@ ToolPolicies AgentSessionHost::tool_policies() const {
 }
 
 void AgentSessionHost::rebuild_system_prompt() {
-	system_prompt_ = build_system_prompt_text();
-	// note: the prompt is fixed per session in this port; it refreshes on the
-	// next session create/open or cwd change
+	// 多模态档位在锁外先取：model_supports() 自己要拿 snapshot_mutex_
+	const bool can_images = multimodal_images();
+	const bool can_videos = multimodal_videos();
+	system_prompt_ = build_system_prompt_text(can_images, can_videos);
+	std::lock_guard<std::mutex> lock(snapshot_mutex_);
+	if (active_ && agent_) agent_->set_system_prompt(system_prompt_);
 }
 
-std::string AgentSessionHost::build_system_prompt_text() {
+std::string AgentSessionHost::build_system_prompt_text(bool can_images, bool can_videos) {
 	SystemPromptOptions opts;
 	opts.language = settings_->system_prompt_language();
 	opts.cwd = cwd_;
 	opts.cwd_files.clear();
 	collect_top_level_files(cwd_, opts.cwd_files);
-	const bool zh = lang_is_zh(opts.language);
 	// actual tool names + one-line snippets from the live tool set (localized to
-	// the session's system-prompt language)
+	// the session's system-prompt language, and to what the model can receive)
 	{
+		ToolContext snip_ctx;
+		snip_ctx.language = opts.language;
+		snip_ctx.can_read_images = can_images;
+		snip_ctx.can_read_videos = can_videos;
 		for (const auto& t : build_tools()) {
 			opts.selected_tools.push_back(t.name);
-			std::string snippet = zh || t.prompt_snippet_en.empty() ? t.prompt_snippet : t.prompt_snippet_en;
-			opts.tool_snippets.push_back({t.name, std::move(snippet)});
+			opts.tool_snippets.push_back({t.name, t.snippet(opts.language, snip_ctx)});
 		}
 	}
 	opts.docs_readme_path = path_join(docs_dir_, "readme.md");
@@ -609,15 +614,42 @@ void AgentSessionHost::prompt(const std::string& text, const std::string& mode, 
 			std::string name = att["name"].as_string("file");
 			std::string mime = att["mimeType"].as_string("application/octet-stream");
 			if (path.empty()) continue;
-			if (starts_with(mime, "image/")) {
+			const bool is_image = starts_with(mime, "image/");
+			const bool is_video = starts_with(mime, "video/");
+			// 图片 / 视频附件只有在对应档位下才真的送给模型；否则以文本形式告知
+			// 附件存在（模型读不了它，但至少知道用户给了这个文件），而不是往请求里
+			// 塞一个 provider 会拒掉整个请求的媒体块
+			if (is_image && !multimodal_images()) {
+				file_notes.push_back(name + " — " + path);
+				continue;
+			}
+			if (is_image) {
 				std::vector<uint8_t> bytes;
 				if (read_file_bytes(path, bytes)) {
 					// the same re-encode the read tool applies: an attachment is a
 					// full-size photo far more often than not, and it is kept in the
 					// transcript and re-sent with every later request
-					images.push_back(tool_model_image(bytes, mime).part);
+					// 附件本来就是 data/uploads 里的一个文件：会话文件只记它，不记 base64
+					ContentPart part = tool_model_image(bytes, mime).part;
+					part.source_path = path;
+					images.push_back(std::move(part));
 				} else {
 					emit_log("warn", "无法读取图片附件「" + name + "」");
+				}
+			} else if (is_video && multimodal_videos()) {
+				// 「图片和视频」档位：视频附件和 read 读到视频走同一条路——整段文件作为
+				// 一个 video 类型的媒体块。体积上限是 read 的截断限制（附件随每一轮
+				// 请求重发，不设上限会把会话撑爆），超过上限就退回文件名提醒。
+				const int64_t size = tool_file_size(path);
+				const int64_t cap = (int64_t)settings_->tool_settings()["outputLimits"]["read"].as_int(120000);
+				std::vector<uint8_t> bytes;
+				if (size > 0 && size <= cap && read_file_bytes(path, bytes) && !bytes.empty()) {
+					ContentPart part = ContentPart::image(base64_encode_bytes(bytes), mime);
+					part.source_path = path;
+					images.push_back(std::move(part));
+				} else {
+					emit_log("info", "视频附件「" + name + "」超过读取上限，已只提供文件名");
+					file_notes.push_back(name + " — " + path);
 				}
 			} else {
 				file_notes.push_back(name + " — " + path);
@@ -678,9 +710,18 @@ void AgentSessionHost::compact() {
 				}
 			}
 			std::vector<AgentMessage> to_summarize(messages.begin() + start, messages.end());
-			// context size before compaction: the most recent request's usage is
-			// the true figure (its input already includes all earlier turns);
-			// summing per-turn totals would double-count the shared history
+			// Context size before compaction: the most recent request's
+			// provider-reported usage is the true figure (its input already
+			// includes all earlier turns), so summing per-turn totals — which
+			// would double-count the shared history — is never an option.
+			//
+			// When no provider ever reported usage (a gateway that strips the
+			// usage block, a turn that failed before the sample landed), fall
+			// back to the estimator over the SAME request the model would have
+			// seen: system prompt, tool schemas and the compaction-transformed
+			// history. Pricing only the message text, as this used to, dropped
+			// the system prompt and the tool schemas — a fixed, and for a tool-
+			// heavy agent considerable, part of every request.
 			int64_t tokens_before = 0;
 			for (auto it = to_summarize.rbegin(); it != to_summarize.rend(); ++it) {
 				if (it->role == "assistant" && it->has_usage && it->usage.total_tokens > 0) {
@@ -688,16 +729,10 @@ void AgentSessionHost::compact() {
 					break;
 				}
 			}
-			if (tokens_before <= 0) {
-				// provider never reported usage — estimate from the text itself
-				std::string flat;
-				for (const auto& m : to_summarize) {
-					flat += flatten_text(m.content);
-					if (m.role == "compactionSummary") flat += m.summary;
-					flat += "\n";
-				}
-				tokens_before = estimate_tokens(flat);
-			}
+			// The pre-compaction request, otherwise: the whole live history (the
+			// summary below REPLACES it, so the figure the report calls "before"
+			// has to be the one that was actually in the window).
+			if (tokens_before <= 0) tokens_before = agent_->estimate_context_tokens();
 
 			auto L = [&](const std::string& zh, const std::string& en) { return isChinese() ? zh : en; };
 
@@ -759,19 +794,32 @@ void AgentSessionHost::compact() {
 			compaction.role = "compactionSummary";
 			compaction.summary = summary;
 			compaction.tokens_before = tokens_before;
-			// estimate post-compaction tokens from the summary text itself
-			compaction.tokens_after = estimate_tokens(summary);
 			compaction.timestamp = now_ms();
+			// Post-compaction size: the underlying request, not the bare summary.
+			// The summary text is only one part of what the next call sends —
+			// the system prompt and the tool schemas survive compaction, and
+			// "约 N tokens" that omits them reads as a ~40 % smaller window than
+			// the model will actually see. Install the summary first, then ask
+			// the agent to price the request it would build now.
 			// 压缩后的历史整体替换：置脏后由 sync 以完整新内容重写文件，
 			// 磁盘上不再残留被压缩掉的旧历史。
 			std::vector<AgentMessage> compacted;
-			compacted.push_back(std::move(compaction));
+			compacted.push_back(compaction);  // copy: the record below still needs it
 			agent_->set_messages(std::move(compacted));
+			int64_t tokens_after = agent_->estimate_context_tokens();
+			compaction.tokens_after = tokens_after;
+			// 摘要的 tokens_after 落在会话文件里，所以重写一次让它带上真实数字；
+			// 上面 set_messages 装的是还没有这个数的副本。
+			std::vector<AgentMessage> recorded = agent_->messages();
+			if (recorded.size() == 1 && recorded[0].role == "compactionSummary") {
+				recorded[0].tokens_after = tokens_after;
+				agent_->set_messages(std::move(recorded));
+			}
 			if (archive_) {
 				archive_->mark_dirty();
 				sync_archive();
 			}
-			emit_log("info", "会话已压缩：压缩前 " + std::to_string(tokens_before) + " tokens → 压缩后约 " + std::to_string(compaction.tokens_after) + " tokens");
+			emit_log("info", "会话已压缩：压缩前 " + std::to_string(tokens_before) + " tokens → 压缩后约 " + std::to_string(tokens_after) + " tokens");
 		} catch (const std::string& e) {
 			emit_log("error", e);
 		} catch (const std::exception& e) {
@@ -786,10 +834,15 @@ void AgentSessionHost::set_model(const std::string& provider, const std::string&
 	require_active();
 	auto model = runtime_->get_model(provider, id);
 	if (!model) throw std::string("Unknown model ") + provider + "/" + id;
+	// 换模型不能悄悄把多模态档位换掉：档位属于 API 配置，跟着配置走
+	if (configs_) model->input = vision_mode_inputs(vision_mode_from_key(configs_->active_vision()));
+	// 档位变了，提示词里 read 那一行也跟着变：同一个模型现在能收到图片/视频了
+	system_prompt_ = build_system_prompt_text(model->supports_image(), model->supports_video());
 	{
 		std::lock_guard<std::mutex> lock(snapshot_mutex_);
 		if (!active_ || !agent_) throw std::string("No active session. Create one first.");
 		agent_->set_model(*model);
+		agent_->set_system_prompt(system_prompt_);
 		if (archive_) {
 			archive_->set_model(provider, id);
 			// inline of sync_archive(): the pointers must stay pinned by
@@ -822,6 +875,23 @@ void AgentSessionHost::set_thinking(const std::string& level) {
 	emit_snapshot_now();
 }
 
+bool AgentSessionHost::model_supports(const char* modality) {
+	std::optional<ModelDef> model;
+	{
+		std::lock_guard<std::mutex> lock(snapshot_mutex_);
+		if (!agent_) return std::string(modality) == "text";
+		model = agent_->model();
+	}
+	if (!model) return false;
+	for (const auto& m : model->input) {
+		if (m == modality) return true;
+	}
+	return false;
+}
+
+bool AgentSessionHost::multimodal_images() { return model_supports("image"); }
+bool AgentSessionHost::multimodal_videos() { return model_supports("video"); }
+
 void AgentSessionHost::set_system_prompt_language(const std::string& language) {
 	settings_->set_system_prompt_language(language);
 	rebuild_system_prompt();
@@ -844,11 +914,16 @@ void AgentSessionHost::set_session_name(const std::string& name) {
 
 void AgentSessionHost::reload_resources() {
 	require_active();
+	// 多模态档位在 snapshot_mutex_ 之外先取：model_supports() 自己会去拿同一把
+	// 锁，锁里面再问一次就是自锁
+	const bool can_images = multimodal_images();
+	const bool can_videos = multimodal_videos();
 	{
 		std::lock_guard<std::mutex> lock(snapshot_mutex_);
 		if (!active_ || !agent_) throw std::string("No active session. Create one first.");
 		resources_->reload();
-		rebuild_system_prompt();
+		system_prompt_ = build_system_prompt_text(can_images, can_videos);
+		agent_->set_system_prompt(system_prompt_);
 	}
 	emit_snapshot_now();
 }
@@ -1018,7 +1093,8 @@ JsonValue AgentSessionHost::build_snapshot() {
 	for (size_t i = 0; i < snap_messages.size(); i++) {
 		const AgentMessage& m = snap_messages[i];
 		if (m.role == "toolResult") continue;
-		JsonValue jm = message_to_json(m);
+		// 快照是给界面的：媒体必须内联，否则聊天窗口里的图片/视频是空白
+		JsonValue jm = message_to_json(m, true);
 		jm["id"] = message_ids_[i];
 		// surface error/aborted stop reasons as message status: the UI only
 		// renders the error tag and error text for message.status — without this
@@ -1042,7 +1118,7 @@ JsonValue AgentSessionHost::build_snapshot() {
 
 	if (streaming && streaming_message && streaming_message->role == "assistant") {
 		if (streaming_id_.empty()) streaming_id_ = "m" + std::to_string(++id_counter_);
-		JsonValue jm = message_to_json(*streaming_message);
+		JsonValue jm = message_to_json(*streaming_message, true);
 		jm["id"] = streaming_id_;
 		jm["status"] = "streaming";
 		arr.push_back(jm);
@@ -1078,6 +1154,12 @@ JsonValue AgentSessionHost::build_snapshot() {
 	} else {
 		snap["model"] = JsonValue(nullptr);
 	}
+	// What the next request would cost, and the window it has to fit in. The
+	// client shows occupancy from these; without them the only number on screen
+	// was the summed usage of every turn, which counts each turn's shared
+	// history again and bears no relation to the window.
+	snap["contextTokens"] = agent_->estimate_context_tokens();
+	if (auto model = agent_->model()) snap["contextWindow"] = (int64_t)model->context_window;
 	snap["thinkingLevel"] = agent_->thinking_level();
 	snap["activeConfig"] = configs_.get() ? configs_->list().active : "";
 	snap["phase"] = phase_;
@@ -1113,7 +1195,7 @@ bool AgentSessionHost::build_stream_patch(JsonValue& patch) {
 
 	if (has_streaming) {
 		if (streaming_id_.empty()) streaming_id_ = "m" + std::to_string(++id_counter_);
-		JsonValue jm = message_to_json(*streaming_message);
+		JsonValue jm = message_to_json(*streaming_message, true);
 		jm["id"] = streaming_id_;
 		jm["status"] = "streaming";
 		patch["streaming"] = std::move(jm);

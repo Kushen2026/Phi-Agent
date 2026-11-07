@@ -58,6 +58,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -66,7 +68,6 @@
 #include "kernels/parallel_for.hpp"
 #include "models/video_vae_internal.hpp"   // dispatch_f32_to_f16
 #include "util/base.hpp"
-#include "util/json.hpp"
 
 namespace phi::media {
 
@@ -164,10 +165,23 @@ void rope_rows(float* x, i64 rows, i64 heads, i64 head_dim, const std::vector<fl
 
 // The reference's order, exactly: repetition penalty -> suppress tokens ->
 // (argmax when do_sample is off) -> temperature -> top_k -> top_p -> sample.
-i32 sample_logits(std::vector<float>& logits, float temperature, i64 top_k, float top_p,
+//
+// `n` is the number of logits the *head that produced them* actually wrote, and
+// it is a parameter rather than `logits.size()` on purpose: the caller's buffer
+// is scratch shared by both sampling sites, and it is sized for the wider of the
+// two heads (the backbone's `lm_head` has 2052 rows - the 2048 codebook entries,
+// the 2050 pad id, and the EOS id 2051 - while the depth decoder's
+// `codebooks_head` has 2051, i.e. codebook entries only). Reading past `n`
+// therefore samples a *leftover from the other head*: the backbone writes the
+// EOS logit at index 2051 and the depth decoder writes nothing there, so a depth
+// step that sampled index 2051 handed an out-of-range token to the codec - and
+// the codec's clamp turned it into one constant codebook entry, heard as a
+// steady tone over the last frames of the utterance. The width is the fix; the
+// reference has the same split (it samples a 2052-wide tensor for the backbone
+// and a 2051-wide one for the depth decoder).
+i32 sample_logits(float* logits, i64 n, float temperature, i64 top_k, float top_p,
                   float repetition_penalty, const std::vector<i32>* history, i64 suppress_from,
                   i64 suppress_to, BreezeTts::Rng& rng) {
-	const i64 n = (i64)logits.size();
 	if (history && repetition_penalty != 1.0f && !history->empty()) {
 		std::vector<i32> uniq = *history;
 		std::sort(uniq.begin(), uniq.end());
@@ -189,7 +203,7 @@ i32 sample_logits(std::vector<float>& logits, float temperature, i64 top_k, floa
 	for (i64 i = 0; i < n; i++) logits[(size_t)i] /= temperature;
 
 	if (top_k > 0 && top_k < n) {
-		std::vector<float> sorted(logits);
+		std::vector<float> sorted(logits, logits + n);
 		std::sort(sorted.begin(), sorted.end(), std::greater<float>());
 		const float thr = sorted[(size_t)(top_k - 1)];
 		for (i64 i = 0; i < n; i++)
@@ -325,32 +339,46 @@ void BreezeTts::TeMat::gemm(const float* x, i64 m, float* y) const {
 
 namespace {
 
-// Reads the checkpoint's config.json - the scalars a shape cannot carry:
-// epsilons, RoPE thetas, the sliding window, the RoPE scaling and the special
-// token ids. `override_path` (a settings selection) wins; otherwise the file is
-// read beside the weights. Returns Null when there is no file.
-JsonValue read_config(const std::string& model_path, const std::string& override_path) {
-	const size_t slash = model_path.find_last_of("/\\");
-	const std::string cfg =
-	    !override_path.empty()
-	        ? override_path
-	        : (slash == std::string::npos ? std::string() : model_path.substr(0, slash + 1)) +
-	              "config.json";
-	std::vector<u8> raw;
-	if (!read_file_bytes(cfg, raw)) return JsonValue();
-	std::string err;
-	auto j = json_parse(std::string((const char*)raw.data(), raw.size()), &err);
-	return j ? *j : JsonValue();
-}
+// ── the checkpoint's scalars, carried in code ──────────────────────────
+//
+// Breeze-TTS-2's config.json held the scalars a shape cannot carry. They are
+// properties of the shipped checkpoint - not of this installation, and not
+// something a user picks between - so they live here instead of in a file that
+// has to sit beside the weights. The values are the released ones (breeze_tts_2
+// config.json, transformers 4.57.3).
+//
+// Two of them matter more than the rest, and both used to fail silently when the
+// file was missing: kCodebookPadTokenId (a fallback of -1 matched no code, so
+// the end-of-utterance frame filter never fired) and the depth decoder's llama3
+// RoPE scaling (without it the frequencies fall back to plain theta^(-2i/D) and
+// every code the decoder emits is wrong, while nothing reports an error).
 
-i64 cfg_i(const JsonValue& o, const char* key, i64 def) {
-	const JsonValue* v = o.find(key);
-	return v ? v->as_int(def) : def;
-}
-float cfg_f(const JsonValue& o, const char* key, float def) {
-	const JsonValue* v = o.find(key);
-	return v ? (float)v->as_number(def) : def;
-}
+// The audio vocabulary: 2051 codes per codebook (2048 from the Mimi codec, plus
+// specials and the backbone's own EOS as the last row of lm_head).
+constexpr i64 kAudioVocabSize = 2051;
+constexpr i64 kNumCodebooks = 16;
+constexpr i64 kCodebookPadTokenId = 2050;  // a frame of all-pad codes is dropped
+constexpr i64 kCodebookEosTokenId = 0;
+constexpr i64 kCodecCodebookSize = 2048;
+
+// Backbone (Qwen3-flavoured), depth decoder (llama-flavoured) and text encoder
+// (T5Gemma2-flavoured) scalars.
+constexpr float kBackboneRmsNormEps = 1e-6f;
+constexpr float kBackboneRopeTheta = 1e6f;
+constexpr float kDepthRmsNormEps = 1e-5f;
+constexpr float kDepthRopeTheta = 5e5f;
+constexpr i64 kDepthHeadDim = 128;
+// llama3 RoPE scaling on the depth decoder. These are NOT the usual defaults:
+// low/high are 1/512 and 1/128, and original_max_position_embeddings is 16.
+constexpr float kDepthRopeFactor = 32.f;
+constexpr float kDepthRopeLowFreqFactor = 0.001953125f;   // 1/512
+constexpr float kDepthRopeHighFreqFactor = 0.0078125f;    // 1/128
+constexpr float kDepthRopeOriginalMaxPos = 16.f;
+constexpr float kTextEncoderRmsNormEps = 1e-6f;
+constexpr i64 kTextEncoderEoiTokenIndex = 256000;
+constexpr i64 kTextEncoderSlidingWindow = 512;
+constexpr float kTextEncoderQueryPreAttnScalar = 256.f;
+constexpr float kTextEncoderFullRopeFactor = 8.f;
 
 }  // namespace
 
@@ -369,13 +397,15 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 	tok_.load(tokenizer_json);
 	codec_.open(codec_path, gpu, codec_config_json);
 
-	const JsonValue cfg = read_config(model_path, config_json);
+	// The checkpoint's scalars are constants now (see kAudioVocabSize and friends):
+	// config.json is no longer read, so the weights alone are self-contained.
+	(void)config_json;
 
 	// ── shapes off the checkpoint, scalars off config.json ──
 	const StTensor& tq = st_.require("backbone_model.layers.0.self_attn.q_proj.weight");
 	const StTensor& tk = st_.require("backbone_model.layers.0.self_attn.k_proj.weight");
 	const StTensor& tg = st_.require("backbone_model.layers.0.mlp.gate_proj.weight");
-	bb_hidden_ = tq.shape[1];
+	bb_hidden_ = st_.logical_cols(tq);   // the logical K (see the note in `mat`)
 	bb_head_dim_ = st_.require("backbone_model.layers.0.self_attn.q_norm.weight").shape[0];
 	bb_heads_ = tq.shape[0] / bb_head_dim_;
 	bb_kv_ = tk.shape[0] / bb_head_dim_;
@@ -388,7 +418,7 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 	const StTensor& dq = st_.require("depth_decoder.model.layers.0.self_attn.q_proj.weight");
 	const StTensor& dk = st_.require("depth_decoder.model.layers.0.self_attn.k_proj.weight");
 	const StTensor& dg = st_.require("depth_decoder.model.layers.0.mlp.gate_proj.weight");
-	dp_hidden_ = dq.shape[1];
+	dp_hidden_ = st_.logical_cols(dq);
 	dp_inter_ = dg.shape[0];
 	l = 0;
 	while (st_.find("depth_decoder.model.layers." + std::to_string(l) + ".input_layernorm.weight")) l++;
@@ -397,14 +427,14 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 	const StTensor& dp_emb = st_.require("depth_decoder.model.embed_tokens.weight");
 	dp_embed_t_ = &dp_emb;
 	dp_embed_rows_ = dp_emb.shape[0];
-	dp_embed_dim_ = dp_emb.shape[1];
+	dp_embed_dim_ = st_.logical_cols(dp_emb);
 	const StTensor& dp_proj = st_.require("depth_decoder.model.inputs_embeds_projector.weight");
 	check("the depth projector is not hidden -> hidden",
-	      dp_proj.shape[0] == dp_hidden_ && dp_proj.shape[1] == dp_embed_dim_);
+	      dp_proj.shape[0] == dp_hidden_ && st_.logical_cols(dp_proj) == dp_embed_dim_);
 
 	const StTensor& te_q = st_.require("text_encoder.layers.0.self_attn.q_proj.weight");
 	const StTensor& te_k = st_.require("text_encoder.layers.0.self_attn.k_proj.weight");
-	te_hidden_ = te_q.shape[1];
+	te_hidden_ = st_.logical_cols(te_q);
 	te_head_dim_ = st_.require("text_encoder.layers.0.self_attn.q_norm.weight").shape[0];
 	te_heads_ = te_q.shape[0] / te_head_dim_;
 	te_kv_ = te_k.shape[0] / te_head_dim_;
@@ -416,94 +446,76 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 	const StTensor& te_emb = st_.require("text_encoder.embed_tokens.weight");
 	te_vocab_ = te_emb.shape[0];
 	check("the text encoder's embedding width does not match hidden_size",
-	      te_emb.shape[1] == te_hidden_);
+	      st_.logical_cols(te_emb) == te_hidden_);
 	te_eoi_embed_ = st_.data_f32(st_.require("text_encoder.embed_tokens.eoi_embedding"));
 	te_embed_t_ = st_.data_f32(te_emb);
 
 	const StTensor& lm = st_.require("lm_head.weight");
-	check("lm_head's input width is not the backbone's hidden size", lm.shape[1] == bb_hidden_);
+	check("lm_head's input width is not the backbone's hidden size",
+	      st_.logical_cols(lm) == bb_hidden_);
 	lm_head_n_ = lm.shape[0];
 
-	// The special ids: the checkpoint's config.json carries them, and `vocab_size`
-	// + 1 (the backbone's own EOS) is the last row of lm_head.
-	audio_vocab_ = cfg_i(cfg, "audio_vocab_size", lm_head_n_ - 1);
-	num_codebooks_ = cfg_i(cfg, "num_codebooks", dp_embed_rows_ / std::max<i64>(1, audio_vocab_));
-	codebook_pad_ = cfg_i(cfg, "codebook_pad_token_id", -1);
-	codebook_eos_ = cfg_i(cfg, "codebook_eos_token_id", 0);
-	backbone_eos_ = audio_vocab_;   // config.vocab_size: the token that stops the loop
-	{
-		const JsonValue* codec = cfg.find("codec_config");
-		codec_codebook_size_ = codec ? cfg_i(*codec, "codebook_size", 2048) : 2048;
-	}
+	// The special ids are part of the shipped checkpoint, not of the installation:
+	// they describe Breeze-TTS-2's own audio vocabulary (2051 codes across 16
+	// codebooks, 2050 = the pad id that marks a frame to drop, 2048 = the Mimi
+	// codebook size). They used to be read from config.json; carrying them here
+	// keeps the checkpoint self-contained, and removes the silent failure the
+	// fallback used to have (a missing file made `codebook_pad_` fall back to -1,
+	// which matches no code at all, so the end-of-utterance frame filter never
+	// dropped the tail padding and the audio ran long).
+	audio_vocab_ = kAudioVocabSize;
+	num_codebooks_ = kNumCodebooks;
+	codebook_pad_ = kCodebookPadTokenId;
+	codebook_eos_ = kCodebookEosTokenId;
+	codec_codebook_size_ = kCodecCodebookSize;
+	backbone_eos_ = audio_vocab_;   // the token that stops the loop
 	check("the embedding table is not num_codebooks * audio_vocab",
 	      dp_embed_rows_ == num_codebooks_ * audio_vocab_);
 	check("lm_head's width is not audio_vocab + 1", lm_head_n_ == audio_vocab_ + 1);
 	check("the codec and the backbone disagree on the codebook size",
 	      codec_codebook_size_ <= audio_vocab_);
 
-	// Backbone: Qwen3 defaults, overridden by config.json's backbone_config.
-	{
-		const JsonValue* bc = cfg.find("backbone_config");
-		bb_eps_ = bc ? cfg_f(*bc, "rms_norm_eps", 1e-6f) : 1e-6f;
-		bb_theta_ = bc ? cfg_f(*bc, "rope_theta", 1e6f) : 1e6f;
-		if (bc) {
-			check("backbone_config disagrees with the checkpoint's hidden size",
-			      cfg_i(*bc, "hidden_size", bb_hidden_) == bb_hidden_);
-			check("backbone_config disagrees with the checkpoint's head count",
-			      cfg_i(*bc, "num_attention_heads", bb_heads_) == bb_heads_);
-			check("backbone_config disagrees with the checkpoint's layer count",
-			      cfg_i(*bc, "num_hidden_layers", bb_layers_) == bb_layers_);
-		}
-	}
-	// Depth decoder: its head_dim cannot be read off a shape (8 heads of 128 and
-	// 16 of 64 look the same), so it comes from the config.
-	{
-		const JsonValue* dc = cfg.find("depth_decoder_config");
-		dp_head_dim_ = dc ? cfg_i(*dc, "head_dim", 128) : 128;
-		dp_heads_ = dq.shape[0] / dp_head_dim_;
-		dp_kv_ = dk.shape[0] / dp_head_dim_;
-		check("depth_decoder_config disagrees with the checkpoint's q width",
-		      dc == nullptr || cfg_i(*dc, "num_attention_heads", dp_heads_) == dp_heads_);
-		dp_vocab_ = dc ? cfg_i(*dc, "vocab_size", audio_vocab_) : audio_vocab_;
-		dp_eps_ = dc ? cfg_f(*dc, "rms_norm_eps", 1e-5f) : 1e-5f;
-		check("the depth decoder's vocab does not match audio_vocab_size", dp_vocab_ == audio_vocab_);
-		const float theta = dc ? cfg_f(*dc, "rope_theta", 5e5f) : 5e5f;
-		const JsonValue* rs = dc ? dc->find("rope_scaling") : nullptr;
-		if (rs && rs->is_object() && rs->find("rope_type") &&
-		    rs->find("rope_type")->as_string() == "llama3") {
-			dp_inv_freq_ = llama3_inv_freq(theta, dp_head_dim_, cfg_f(*rs, "factor", 32.0f),
-			                               cfg_f(*rs, "low_freq_factor", 0.125f),
-			                               cfg_f(*rs, "high_freq_factor", 0.5f),
-			                               cfg_f(*rs, "original_max_position_embeddings", 1024.0f));
-		} else {
-			dp_inv_freq_ = default_inv_freq(theta, dp_head_dim_);
-		}
-	}
+	// Backbone: the Qwen3-flavoured scalars are constants.
+	bb_eps_ = kBackboneRmsNormEps;
+	bb_theta_ = kBackboneRopeTheta;
+	// Depth decoder. Its head_dim cannot be read off a shape (8 heads of 128 and
+	// 16 of 64 look the same), so it is a constant - as is its llama3 RoPE scaling,
+	// which is what makes the emitted codes correct at all.
+	dp_head_dim_ = kDepthHeadDim;
+	dp_heads_ = dq.shape[0] / dp_head_dim_;
+	dp_kv_ = dk.shape[0] / dp_head_dim_;
+	dp_vocab_ = audio_vocab_;
+	dp_eps_ = kDepthRmsNormEps;
+	check("the depth decoder's vocab does not match audio_vocab_size", dp_vocab_ == audio_vocab_);
+	dp_inv_freq_ = llama3_inv_freq(kDepthRopeTheta, dp_head_dim_, kDepthRopeFactor,
+	                               kDepthRopeLowFreqFactor, kDepthRopeHighFreqFactor,
+	                               kDepthRopeOriginalMaxPos);
 	// Text encoder: two RoPE tables (sliding theta 1e4, full theta 1e6 scaled by
 	// the linear factor) and the per-layer attention type.
 	{
-		const JsonValue* tc = cfg.find("text_encoder_config");
-		te_eps_ = tc ? cfg_f(*tc, "rms_norm_eps", 1e-6f) : 1e-6f;
-		te_eoi_ = tc ? cfg_i(*tc, "eoi_token_index", 256000) : 256000;
-		te_sliding_ = tc ? cfg_i(*tc, "sliding_window", 512) : 512;
+		te_eps_ = kTextEncoderRmsNormEps;
+		te_eoi_ = kTextEncoderEoiTokenIndex;
+		te_sliding_ = kTextEncoderSlidingWindow;
 		te_scale_ = std::sqrt((float)te_hidden_);
-		const float full_factor = [&] {
-			if (!tc) return 1.0f;
-			const JsonValue* rp = tc->find("rope_parameters");
-			const JsonValue* f = rp ? rp->find("full_attention") : nullptr;
-			return f ? cfg_f(*f, "factor", 1.0f) : 1.0f;
-		}();
+		// The attention denominator is the encoder config's `query_pre_attn_scalar`
+		// (256 on the shipped checkpoint), *not* the hidden size and not necessarily
+		// the head_dim: T5Gemma2's self-attention is the one place in this family that
+		// scales by `query_pre_attn_scalar^-0.5` (the backbone's Qwen3 and the depth
+		// decoder's llama both scale by `head_dim^-0.5`). On the shipped config the two
+		// happen to coincide, which is exactly how this went wrong once: scaling by
+		// `1/sqrt(hidden_size)` (= 1/sqrt(1152) instead of 1/16) flattens every
+		// attention distribution in the encoder, so the prompt's embeddings arrive at
+		// the backbone off-distribution and the model cannot tell the timbre
+		// instruction apart from the words to speak - it reads the instruction aloud.
+		// `head_dim` is only the fallback for a config that omits the field.
+		te_qpas_ = kTextEncoderQueryPreAttnScalar;
 		te_inv_sliding_ = default_inv_freq(10000.0f, te_head_dim_);
 		te_inv_full_ = default_inv_freq(1000000.0f, te_head_dim_);
-		for (float& v : te_inv_full_) v /= full_factor;
+		for (float& v : te_inv_full_) v /= kTextEncoderFullRopeFactor;
+		// Every sixth layer is full attention, the rest slide (the encoder's own
+		// layer_types says exactly this on the shipped checkpoint).
 		te_layer_types_.assign((size_t)te_layers_, 0);
-		const JsonValue* lt = tc ? tc->find("layer_types") : nullptr;
-		if (lt && lt->is_array()) {
-			for (i64 i = 0; i < te_layers_ && i < (i64)lt->items().size(); i++)
-				te_layer_types_[(size_t)i] = lt->items()[(size_t)i].as_string() == "full_attention" ? 1 : 0;
-		} else {
-			for (i64 i = 0; i < te_layers_; i++) te_layer_types_[(size_t)i] = ((i + 1) % 6 == 0) ? 1 : 0;
-		}
+		for (i64 i = 0; i < te_layers_; i++) te_layer_types_[(size_t)i] = ((i + 1) % 6 == 0) ? 1 : 0;
 	}
 	max_seq_len_ = 2048;   // runtime.py's MAX_SEQ_LEN
 
@@ -517,7 +529,11 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 			m.st = &st_;
 			m.t = &st_.require(b + n);
 			m.n = m.t->shape[0];
-			m.k = m.t->shape[1];
+			// The *logical* K: a packed family's header shape is rewritten to it,
+			// while the I8-backed convrot int4 keeps its packed width there (see the
+			// reader) - `logical_cols` is the one answer for both, and it is the
+			// number of values `dequant_rows` hands the slab loop.
+			m.k = st_.logical_cols(*m.t);
 			if (m.n != rows || m.k != cols)
 				throw MediaError("breeze: '" + b + n + "' has an unexpected shape");
 			return m;
@@ -540,7 +556,7 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 		m.st = &st_;
 		m.t = &st_.require("text_encoder_proj.weight");
 		m.n = m.t->shape[0];
-		m.k = m.t->shape[1];
+		m.k = st_.logical_cols(*m.t);   // the logical K (see the note in `mat` above)
 		check("text_encoder_proj is not [backbone hidden, text encoder hidden]",
 		      m.n == bb_hidden_ && m.k == te_hidden_);
 		te_proj_ = m;
@@ -698,6 +714,10 @@ void BreezeTts::open(const std::string& model_path, const std::string& codec_pat
 		g_->ring->rewind();
 	}
 
+	// One scratch row for both samplers, sized for the *wider* head. Every call
+	// site passes the number of logits its own head wrote (`lm_head_n_` /
+	// `dp_vocab_`) rather than this vector's size - see `sample_logits` for what
+	// reading the wider one's tail into a depth step used to do.
 	sample_buf_.assign((size_t)std::max(lm_head_n_, dp_vocab_), 0.0f);
 	loaded_ = true;
 }
@@ -718,6 +738,9 @@ void BreezeTts::build_prompt(const BreezeParams& p) {
 	// `design_negative_segments` = "[S0]{text}".
 	const std::string cond = "[S0]<ins_bos>" + p.instruction + "<ins_eos>" + p.text;
 	const std::string neg = "[S0]" + p.text;
+	if (getenv("PHI_TTS_DEBUG"))
+		fprintf(stderr, "[tts-prompt] instruction=[%s] text=[%s]\n[tts-prompt] cond=[%s]\n[tts-prompt] neg=[%s]\n",
+		        p.instruction.c_str(), p.text.c_str(), cond.c_str(), neg.c_str());
 	auto encode_segment = [&](const std::string& s) {
 		// `tokenizer(text, add_special_tokens=True)` -> `decode` -> `tokenizer(...,
 		// False)`: the reference renders and re-encodes each segment, which is what
@@ -756,7 +779,10 @@ std::vector<float> BreezeTts::text_encoder(const std::vector<i32>& ids) const {
 	    gate((size_t)(S * te_inter_)), up((size_t)(S * te_inter_)),
 	    hh((size_t)(S * te_inter_)), down((size_t)(S * H));
 
-	const float scale = 1.0f / std::sqrt((float)te_hidden_);   // query_pre_attn_scalar^-0.5 == head_dim^-0.5
+	// `query_pre_attn_scalar^-0.5` - the encoder's own scaling (see `open`). Not
+	// `head_dim^-0.5` and not `hidden_size^-0.5`: either of those leaves the prompt's
+	// embeddings off-distribution and the model answers the wrong span of the prompt.
+	const float scale = 1.0f / std::sqrt(te_qpas_);
 	for (i64 li = 0; li < te_layers_; li++) {
 		const TeLayer& L = te_[(size_t)li];
 		const bool full = te_layer_types_[(size_t)li] != 0;
@@ -1144,8 +1170,13 @@ void BreezeTts::depth_frame(const std::vector<float>& backbone_hidden, i64 nb, i
 		} else {
 			for (i64 i = 0; i < dp_vocab_; i++) v[(size_t)i] = a[(size_t)i];
 		}
-		return sample_logits(v, p.depth_temperature, p.depth_top_k, p.depth_top_p, 1.0f, nullptr,
-		                     codec_codebook_size_, dp_vocab_, rng);
+		// The width is the *depth decoder's* head (`dp_vocab_` = 2051: codebook
+		// entries only, the pad/EOS ids live on the backbone's head). Passing the
+		// scratch buffer's own size here instead would let the sampler read index
+		// 2051 - a leftover from the backbone's `lm_head` - and return it as a
+		// codebook token. See `sample_logits`.
+		return sample_logits(v.data(), dp_vocab_, p.depth_temperature, p.depth_top_k,
+		                     p.depth_top_p, 1.0f, nullptr, codec_codebook_size_, dp_vocab_, rng);
 	};
 
 	// ── prefill: position 0 is the backbone's hidden state, position 1 the
@@ -1289,17 +1320,34 @@ i64 BreezeTts::estimate_frames(const std::string& text) const {
 std::shared_ptr<BreezeTts::Prompt> BreezeTts::prepare(const BreezeParams& p) {
 	if (!loaded_) throw MediaError("breeze: speak before open");
 	if (p.text.empty()) throw MediaError("breeze: the text is empty");
+	if (p.instruction.empty())
+		throw MediaError("breeze: the instruction (the timbre description) is empty");
 	build_prompt(p);
 	const i64 nb = (p.cfg_scale != 1.0f) ? 2 : 1;
 	i64 prefill = 0;
 	for (i64 b = 0; b < nb; b++) prefill = std::max(prefill, (i64)branches_[(size_t)b].ids.size());
 	if (prefill <= 0) throw MediaError("breeze: the prompt tokenised to nothing");
-	// The frame budget. When the caller does not give one, take the reference
-	// node's own default (1500 frames = 120 s, `_generation_controls`) and let
-	// `max_frames_for` clip it to the context: the model stops at EOS by itself,
-	// so a budget derived from the *text* would only ever cut a sentence off
-	// mid-word (`estimate_frames` is a display estimate, not a bound).
-	const i64 want = p.max_new_tokens > 0 ? p.max_new_tokens : 1500;
+	// ── the frame budget ──
+	//
+	// The caller can name a cap in the sampler's own unit (frames); when it does
+	// not, the *text* decides, through the checkpoint's own calibration
+	// (`estimate_frames`, runtime.py's `estimate_speech_frames`). That is what
+	// keeps a long text from being cut at some fixed duration: the budget grows
+	// with the sentence, and the only hard ceiling is the context
+	// (`max_frames_for`, i.e. MAX_SEQ_LEN - 1 - prefill).
+	//
+	// The estimate is a calibration, not a bound - measured against this
+	// checkpoint an utterance lands anywhere between ~0.4x and ~2.1x of it (a
+	// drawn-out reading of a few characters runs long, a clipped one short) - so
+	// the budget is the estimate with slack on top rather than the estimate alone;
+	// `estimate + max(64, estimate)` covers the observed spread with room to
+	// spare. The slack costs nothing in the ordinary case: the loop ends at the
+	// model's own EOS token, long before the budget. Its other half is a runaway
+	// guard, which is why the budget is text-proportional instead of the whole
+	// context: a generation that never emits EOS stops after ~2x the expected
+	// speech instead of after 163 s of frames.
+	const i64 est = estimate_frames(p.text);
+	const i64 want = p.max_new_tokens > 0 ? p.max_new_tokens : est + std::max<i64>(64, est);
 	const i64 max_frames = max_frames_for(prefill, want);
 	if (max_frames <= 0)
 		throw MediaError("breeze: the prompt is " + std::to_string(prefill) + " of the " +
@@ -1329,7 +1377,14 @@ std::vector<i32> BreezeTts::generate_codes(const std::shared_ptr<Prompt>& prompt
 	if (!loaded_) throw MediaError("breeze: speak before open");
 	if (!prompt) throw MediaError("breeze: no prepared prompt");
 	const i64 nb = prompt->branches;
-	const i64 max_frames = prompt->max_frames;
+	// The budget the prompt was prepared with (the text-derived or the caller's
+	// cap, already clipped to the context), and the sampler node's own cap on top
+	// of it - `MediaBreezeSampler`'s documented parameter, which can only make the
+	// utterance shorter than the prompt allows, never longer (the prompt's figure
+	// is what fits the context).
+	const i64 max_frames = (p.max_new_tokens > 0 && p.max_new_tokens < prompt->max_frames)
+	                           ? p.max_new_tokens
+	                           : prompt->max_frames;
 
 	Rng rng;
 	rng.s = p.seed ? p.seed : make_media_seed();
@@ -1379,8 +1434,11 @@ std::vector<i32> BreezeTts::generate_codes(const std::shared_ptr<Prompt>& prompt
 		for (i64 i = 0; i < lm_head_n_; i++)
 			v[(size_t)i] =
 			    nb >= 2 ? c[(size_t)i] + p.cfg_scale * (a[(size_t)i] - c[(size_t)i]) : a[(size_t)i];
-		token = sample_logits(v, p.temperature, p.top_k, p.top_p, 1.0f, nullptr,
-		                      codec_codebook_size_, audio_vocab_, rng);
+		// The backbone's own head width: `lm_head` is 2052 rows (2048 codebook
+		// entries + the pad id 2050 + the EOS id 2051), and EOS at 2051 has to stay
+		// samplable - it is what ends the loop.
+		token = sample_logits(v.data(), lm_head_n_, p.temperature, p.top_k, p.top_p, 1.0f,
+		                      nullptr, codec_codebook_size_, audio_vocab_, rng);
 	}
 
 	// ── the frame loop (runtime.py's generate_codes) ──
@@ -1440,8 +1498,9 @@ std::vector<i32> BreezeTts::generate_codes(const std::shared_ptr<Prompt>& prompt
 		for (i64 i = 0; i < lm_head_n_; i++)
 			v[(size_t)i] =
 			    nb >= 2 ? c[(size_t)i] + p.cfg_scale * (a[(size_t)i] - c[(size_t)i]) : a[(size_t)i];
-		token = sample_logits(v, p.temperature, p.top_k, p.top_p, p.repetition_penalty, &history,
-		                      codec_codebook_size_, audio_vocab_, rng);
+		token = sample_logits(v.data(), lm_head_n_, p.temperature, p.top_k, p.top_p,
+		                      p.repetition_penalty, &history, codec_codebook_size_, audio_vocab_,
+		                      rng);
 	}
 	if (frames <= 0) throw MediaError("breeze: no audio frames were produced");
 	if (frames_out) *frames_out = frames;

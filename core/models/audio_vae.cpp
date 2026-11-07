@@ -50,11 +50,12 @@ std::map<const void*, Entry>& registry() {
 	return r;
 }
 
-// The frozen headers have no destructor hook, so the per-object state cannot be
-// a member; a registry keyed by `this` is the only option. Every use re-checks
-// that the entry was built from *this* object's safetensors mapping, which makes
-// a stale entry (address reuse after destruction) fail loudly instead of reading
-// a closed mapping.
+// The headers declare no members for this, so the per-object state lives in a
+// registry keyed by `this`; both classes' destructors erase their entry, which is
+// what keeps the registry the size of the *live* objects rather than the sum of
+// every one ever opened. Every use also re-checks that the entry was built from
+// *this* object's safetensors mapping, so a stale entry could not be read as a
+// current one even if a destructor were missed.
 Entry& entry_for(const void* key, const SafeTensors* st, const char* what) {
 	std::lock_guard<std::mutex> lk(reg_mu());
 	auto it = registry().find(key);
@@ -69,9 +70,26 @@ void store_entry(const void* key, Entry&& e) {
 	registry()[key] = std::move(e);
 }
 
+void drop_entry(const void* key) {
+	std::lock_guard<std::mutex> lk(reg_mu());
+	registry().erase(key);
+}
+
 }  // namespace
 
 // ── AudioVae ─────────────────────────────────────────────────────────────
+
+// The entry holds the decoded fp32 weights (`AudioVaeNet` / `VocoderNet`) and is
+// keyed by `this`, so it dies with the object - see the destructors' note in the
+// header. `close()`-like un-loading does not exist for this path: the nets are
+// host memory and the object is the only handle to them.
+AudioVae::~AudioVae() { drop_entry(this); }
+AudioVocoder::~AudioVocoder() { drop_entry(this); }
+
+size_t audio_vae_state_entries() {
+	std::lock_guard<std::mutex> lk(reg_mu());
+	return registry().size();
+}
 
 void AudioVae::open(const std::string& path, GpuCtx* gpu) {
 	g_ = gpu;   // accepted for interface symmetry; this path never dereferences it

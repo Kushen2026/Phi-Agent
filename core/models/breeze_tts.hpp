@@ -67,17 +67,51 @@
 namespace phi::media {
 
 // Everything one TTS run is configured with.
+//
+// ── the two strings ────────────────────────────────────────────────────────
+// `instruction` describes the *voice*, `text` is what is *spoken* - and the two
+// are not interchangeable. runtime.py builds exactly one prompt out of them,
+// `design_segments(text, instruction)` ->
+//
+//     "[S0]<ins_bos>" + instruction + "<ins_eos>" + text
+//
+// so the timbre description is what sits inside the checkpoint's instruction
+// tokens (config.json: `"<ins_bos>": "<instruction>"`) and the words to speak are
+// what follows them. `build_prompt` below is the only place that lays them out,
+// and it must stay in that order: swapping the two is not a parameter
+// convention, it is a different request (the model reads the description aloud).
+//
+// A build that *does* read the description aloud is therefore almost never this
+// order being wrong - it is the prompt arriving at the backbone unusable, and the
+// one thing that does that here is the text encoder's attention scale: it must be
+// the encoder config's `query_pre_attn_scalar^-0.5`, not `head_dim^-0.5` and not
+// `hidden_size^-0.5` (see `BreezeTts::open`). Scaling it wrongly flattens every
+// attention distribution in the encoder, which is heard as the model having no
+// idea which span of the prompt is the voice and which is the sentence.
+//
+// ── the sampling parameters ────────────────────────────────────────────────
+// The defaults are the released Voice-Design node's own `_generation_controls`
+// (nodes.py) - the values its example workflow ships - so a caller that passes
+// nothing gets the reference's behaviour: cfg 4 for voice design, backbone
+// 0.9/50/1.0 with a 1.1 repetition penalty, depth decoder 0.9/50/1.0. Sampling
+// either loop looser than this (top-k off, depth temperature 1.0) makes the
+// frames drift: the utterance ends early and the tail decodes as noise.
 struct BreezeParams {
-	std::string text;          // the words to speak
-	std::string instruction;   // the voice/timbre description (e.g. "一个温柔的女声，语速偏慢")
-	float cfg_scale = 4.0f;    // voice-design default
-	i64 max_new_tokens = 0;    // 0 = derive from the text length (see runtime.py)
-	float temperature = 0.7f;
-	i64 top_k = 0;
+	std::string text;             // the words to speak (the part that is read aloud)
+	std::string instruction;      // the voice/timbre description (never spoken)
+	float cfg_scale = 4.0f;       // voice-design default (the reference node's 4)
+	// The cap on generated *acoustic code frames*, which is the sampler's unit
+	// (12.5 frames = 1 s, see `MimiCodec::frames_per_second`). 0 = let the *text*
+	// decide: `prepare` sizes the budget from `estimate_frames(text)`, so a long
+	// sentence is not cut at some fixed duration. Either way the model stops at
+	// its own EOS token, usually well before the budget.
+	i64 max_new_tokens = 0;
+	float temperature = 0.9f;      // backbone
+	i64 top_k = 50;
 	float top_p = 1.0f;
-	float repetition_penalty = 1.0f;
-	float depth_temperature = 1.0f;
-	i64 depth_top_k = 0;
+	float repetition_penalty = 1.1f;
+	float depth_temperature = 0.9f;   // depth decoder (the 15 remaining codebooks)
+	i64 depth_top_k = 50;
 	float depth_top_p = 1.0f;
 	u64 seed = 0;
 };
@@ -189,8 +223,17 @@ private:
 	void check(const char* what, bool ok) const;
 	// [S, backbone hidden] fp32: the projected text encoder output of one branch.
 	std::vector<float> text_encoder(const std::vector<i32>& ids) const;
-	// runtime.py's design_segments / _prepare_one for both branches.
+	// runtime.py's design_segments / _prepare_one for both branches. This is the
+	// ONE place the request's two strings meet, and the reference's order is fixed:
+	// `design_segments(text, instruction)` renders
+	// "[S0]<ins_bos>{instruction}<ins_eos>{text}" - the timbre description inside
+	// the instruction tokens, the words to speak after them.
 	void build_prompt(const BreezeParams& p);
+	// runtime.py's `estimate_speech_frames`: how many acoustic frames the text
+	// usually takes (en ~4.1 / zh ~3.5 per token, ~5 per inline event), calibrated
+	// on the official checkpoint. `prepare` sizes an unspecified frame budget from
+	// it, so "how long should this be" follows the *text* rather than a fixed
+	// duration.
 	i64 estimate_frames(const std::string& text) const;
 
 	// The backbone's 28 layers over `rows` rows of one branch. `row0` is the KV
@@ -230,7 +273,13 @@ private:
 	float dp_eps_ = 1e-5f;
 	i64 te_hidden_ = 0, te_layers_ = 0, te_heads_ = 0, te_kv_ = 0, te_head_dim_ = 0, te_inter_ = 0;
 	i64 te_vocab_ = 0, te_sliding_ = 512, te_eoi_ = 256000;
-	float te_eps_ = 1e-6f, te_scale_ = 1.0f;
+	// The attention scale is the *checkpoint's* `query_pre_attn_scalar^-0.5`, not
+	// `head_dim^-0.5`: the two happen to agree on the shipped config (256), but
+	// they are different fields and a checkpoint may set them apart. Getting this
+	// wrong leaves the prompt's embeddings off-distribution, which is heard as the
+	// model reading the wrong span of the prompt (e.g. the timbre instruction
+	// instead of the text to speak).
+	float te_eps_ = 1e-6f, te_scale_ = 1.0f, te_qpas_ = 256.0f;
 	std::vector<i64> te_layer_types_;   // 0 = sliding, 1 = full attention
 	std::vector<float> te_inv_sliding_, te_inv_full_;
 	const float* te_eoi_embed_ = nullptr;
@@ -261,6 +310,10 @@ private:
 	Branch branches_[2];
 	i64 kv_rows_ = 0, depth_rows_ = 17;
 	std::vector<float> prefill_embeds_[2];
+	// One scratch row for both sampling sites, sized for the wider of the two
+	// heads (`lm_head`, 2052 rows) and never for the narrower one. The *width* is
+	// not this vector's size but the argument the caller passes to
+	// `sample_logits`; see the note there for why the distinction is load-bearing.
 	std::vector<float> sample_buf_;
 	std::vector<i32> codes_;
 };

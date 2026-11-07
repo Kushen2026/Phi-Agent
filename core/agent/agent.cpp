@@ -11,6 +11,7 @@
 
 #include "util/i18n.hpp"
 #include "agent/subagent.hpp"
+#include "agent/token_estimate.hpp"
 
 namespace phi {
 
@@ -267,6 +268,23 @@ void Agent::emit_tool(AgentEvent::Type type, const std::string& call_id, const s
 
 // ── state accessors (unchanged public contract) ────────────────────────────
 
+int64_t Agent::estimate_context_tokens() const {
+	// One snapshot of everything the next call would send: messages first (the
+	// transform below mirrors run_step's, so the estimate describes the same
+	// request body), then the system prompt and tool schemas it would carry.
+	std::vector<AgentMessage> context;
+	std::string system_prompt;
+	std::string tools_json;
+	{
+		std::lock_guard<std::mutex> lock(state_mutex_);
+		context = messages_;
+		system_prompt = config_.system_prompt;
+		tools_json = build_tools_json();
+	}
+	if (config_.transform_context) context = config_.transform_context(context);
+	return tokens::estimate_request(system_prompt, tools_json, context);
+}
+
 std::vector<AgentMessage> Agent::messages() const {
 	std::lock_guard<std::mutex> lock(state_mutex_);
 	return messages_;
@@ -294,6 +312,11 @@ void Agent::set_messages(std::vector<AgentMessage> msgs) {
 void Agent::set_model(std::optional<ModelDef> model) {
 	std::lock_guard<std::mutex> lock(state_mutex_);
 	config_.model = std::move(model);
+}
+
+void Agent::set_system_prompt(std::string prompt) {
+	std::lock_guard<std::mutex> lock(state_mutex_);
+	config_.system_prompt = std::move(prompt);
 }
 
 void Agent::set_thinking_level(const std::string& level) {
@@ -799,16 +822,25 @@ Agent::StepOutcome Agent::run_step() {
 
 std::string Agent::build_tools_json() const {
 	JsonValue arr = JsonValue::array();
-	const bool is_zh = (config_.language != "en");
+	// the same capability view execute_tool() hands the tools: a schema built for
+	// a model that cannot see pictures must not advertise the parameters that
+	// only exist for one (read's frames list on a text-only model)
+	ToolContext schema_ctx;
+	schema_ctx.language = config_.language;
+	schema_ctx.can_read_images = config_.model ? config_.model->supports_image() : true;
+	schema_ctx.can_read_videos = config_.model ? config_.model->supports_video() : false;
 	for (const auto& tool : config_.tools) {
 		JsonValue t = JsonValue::object();
 		t["name"] = tool.name;
 		// two versions of every built-in prompt: pick by the session language,
-		// falling back to Chinese when no English translation is registered
-		t["description"] = is_zh ? tool.description : (tool.description_en.empty() ? tool.description : tool.description_en);
+		// falling back to Chinese when no English translation is registered. A
+		// tool that advertises capabilities (read) resolves through the same
+		// context the schema below is built for.
+		t["description"] = tool.text(config_.language, schema_ctx);
 		// the parameter descriptions are localized the same way, so the schema is
 		// materialized for the current language on each request
-		t["input_schema"] = tool.parameters_fn ? tool.parameters_fn(config_.language) : JsonValue::object();
+		t["input_schema"] = tool.parameters_fn ? tool.parameters_fn(config_.language, schema_ctx)
+			: JsonValue::object();
 		arr.push_back(t);
 	}
 	return arr.dump();
@@ -843,6 +875,8 @@ ToolResult Agent::execute_tool(const ContentPart& call, bool emit_updates) {
 	ctx.session_id = config_.session_id;
 	ctx.system_prompt = config_.system_prompt;
 	ctx.language = config_.language;
+	ctx.can_read_images = config_.model ? config_.model->supports_image() : true;
+	ctx.can_read_videos = config_.model ? config_.model->supports_video() : false;
 	ctx.current_tool = def->name;
 	ctx.output_limits = config_.tool_policies.output_limits;
 	ctx.permissions = config_.tool_policies.permissions;

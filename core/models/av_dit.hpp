@@ -158,6 +158,21 @@ i64 h3_ref_row_count(const H3Ref* refs, i64 n_refs);
 // per-pixel reference charge. Never throws.
 u64 h3_ref_pixel_area(const H3Ref* refs, i64 n_refs);
 
+// Drops the decoded modulation tensors (`build_mod`) that the H3 chain keeps per
+// checkpoint while it runs. They are host-side state belonging to the checkpoint a
+// run opened, keyed on that mapping's address, and they are re-decoded on demand, so
+// the media tools empty this when a generation ends - the same boundary at which they
+// drop the loaded checkpoints themselves (see `drop_requant_cache`). Only call it with
+// no run in flight.
+void drop_modulation_cache();
+
+// How many per-object entries the H3 chain's two side tables hold (the `Impl`s
+// keyed by `AvDiT*`, and the decoded modulation tensors keyed by checkpoint and
+// prefix). Both are meant to be empty between generations; the media tools report
+// them after every call under PHI_MEDIA_STATE.
+size_t h3_impl_entries();
+size_t modulation_cache_entries();
+
 // `torch.randn(shape, generator=torch.Generator().manual_seed(seed), dtype=float32)`
 // written into `dst` (n floats): the noise field the reference's
 // `_cond_video_rows` augments a reference's patch rows with. It is a bit-level
@@ -175,6 +190,13 @@ u64 estimate_h3_vae_activation_bytes(i64 H, i64 W, i64 T_frames);
 
 class AvDiT {
 public:
+	// Destruction drops the implementation this class keeps in a side table keyed
+	// by `this` (see av_dit.cpp's `registry()`): the opened checkpoint's mapping and
+	// its pinned host cache, the dense weight tables, the resident-window arena and
+	// the accountant's charge for it. Without the hook an entry survived its object
+	// for the life of the process, and - the sharper half - the next `AvDiT` the
+	// allocator placed at the same address inherited another model's weights.
+	~AvDiT();
 	// `dit_path` is the DiT checkpoint; the token refiner,
 	// patch projections and final head live in the same file.
 	void open(const std::string& dit_path, GpuCtx* gpu);

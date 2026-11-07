@@ -2,6 +2,7 @@
 #include "models/lora.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -83,7 +84,7 @@ std::string lora_normalize_target(const std::string& key, bool* is_a, bool* is_b
 	return "";
 }
 
-void LoraSet::add(const std::string& path) {
+void LoraSet::add(const std::string& path, float strength) {
 	if ((int)files_.size() >= kMaxLoras)
 		throw MediaError("LoRA: at most " + std::to_string(kMaxLoras) + " files may be chained");
 
@@ -93,6 +94,7 @@ void LoraSet::add(const std::string& path) {
 	File file;
 	file.path = path;
 	file.name = path_basename(path);
+	file.strength = strength;
 
 	// Default alpha from the file metadata when present (kohya writes
 	// `ss_network_alpha`; some ComfyUI exports write `lora_alpha`). A per-module
@@ -158,7 +160,12 @@ void LoraSet::add(const std::string& path) {
 		f.n = tb.shape[0];
 		if (tb.shape[1] != f.rank || f.rank <= 0 || f.n <= 0 || f.k <= 0) continue;
 		const float alpha = p.has_alpha ? p.alpha : (file_alpha > 0 ? file_alpha : (float)f.rank);
-		f.scale = alpha / (float)f.rank;
+		// The user's strength multiplies the *delta*, exactly where ComfyUI's
+		// `calculate_weight` puts it: `weight += (strength * alpha) * diff`. Folding
+		// it into `scale` here means every downstream path — the whole-matrix fold,
+		// the row-slice fold and the runtime correction's GEMM epilogue — sees one
+		// number and cannot disagree about it.
+		f.scale = strength * alpha / (float)f.rank;
 		f.A = tensor_to_f32(st, ta);
 		f.B = tensor_to_f32(st, tb);
 		if ((i64)f.A.size() != f.rank * f.k || (i64)f.B.size() != f.n * f.rank) continue;
@@ -257,7 +264,15 @@ std::string LoraSet::describe() const {
 		if (i) s += ", ";
 		i64 max_rank = 0;
 		for (const Factor& f : files_[i].factors) max_rank = std::max(max_rank, f.rank);
-		s += files_[i].name + " (" + std::to_string(files_[i].factors.size()) + " factors, r<=" +
+		s += files_[i].name;
+		// Only a non-default strength is spelled out: the report's job is to say
+		// what this run did differently, and "1.0" on every line is noise.
+		if (files_[i].strength != kLoraStrengthDefault) {
+			char buf[32];
+			snprintf(buf, sizeof(buf), " @%.2f", (double)files_[i].strength);
+			s += buf;
+		}
+		s += " (" + std::to_string(files_[i].factors.size()) + " factors, r<=" +
 		     std::to_string(max_rank) + ")";
 	}
 	return s;

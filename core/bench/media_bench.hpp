@@ -58,7 +58,12 @@ struct BenchOptions {
 	// as the settings' tools.media.video_loras reach the tool. Without this the bench
 	// could not reproduce a user's run: a LoRA rewrites every adapted weight, so a
 	// chain measured without it is not the chain the tool builds.
+	//
+	// `video_lora_strengths` is the index-matched parallel list (--video-lora-strength,
+	// repeatable); a slot that names no strength gets 1.0, which is what a settings
+	// file without the widget has.
 	std::vector<std::string> video_loras;
+	std::vector<float> video_lora_strengths;
 	// 0 = the chain's own default (kVideoSteps). A small number is how a shape
 	// that costs minutes is measured for its *segments* rather than its result:
 	// the sampling loop is the only part that scales with the step count, so one

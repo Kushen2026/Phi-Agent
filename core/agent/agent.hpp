@@ -50,6 +50,11 @@ struct ContentPart {
 	std::string arguments_text;    // ToolCall: raw json accumulation during streaming
 	std::string image_data;        // Image (base64)
 	std::string image_mime;
+	// 这张图/这段视频是从哪个文件来的（read 工具、以及附件路径）。有它，会话文件
+	// 就只写这一行路径而不写整段 base64——一个几 MB 的 mp4 会把 jsonl 撑到几十 MB，
+	// 而文件本身一直躺在磁盘上。重放时按路径重新读回同样的字节。
+	// 空 = 内容没有磁盘来源（例如用户直接粘贴的图片），此时仍按原来的方式内联。
+	std::string source_path;
 
 	static ContentPart text_part(std::string t) {
 		ContentPart p;
@@ -223,6 +228,12 @@ struct ToolContext {
 	std::string subagent_thinking;
 	// session language: "zh" or "en" — every built-in prompt string follows it
 	std::string language = "zh";
+	// 设置 → API 配置 → 多模态 of the model this session runs on: whether a
+	// picture or a video may be handed to the model at all. The read tool asks
+	// this before it touches an image file or decodes a video; a model without
+	// the capability gets a plain refusal instead of content it cannot use.
+	bool can_read_images = true;
+	bool can_read_videos = false;
 	// background subagent launch (agent tool): starts a child agent off-thread
 	// and returns immediately with its id; throws std::string when it cannot start
 	std::function<std::string(const SubagentRequest&)> launch_subagent;
@@ -245,9 +256,32 @@ struct ToolDef {
 	std::string description_en; // English description
 	std::string prompt_snippet;  // one-line for the system prompt tools list (Chinese)
 	std::string prompt_snippet_en;  // English one-line snippet
+	// Optional capability-dependent text. A tool whose own description names
+	// what the model can receive (read, which advertises pictures and video)
+	// registers these instead of the fixed strings, so a text-only model is
+	// never told about content it cannot be handed. Each builder wins over the
+	// fixed string above when it is set.
+	std::function<std::string(const std::string& language, const ToolContext& ctx)> description_fn;
+	std::function<std::string(const std::string& language, const ToolContext& ctx)> snippet_fn;
+
+	// the strings the model sees, resolved for the session language and the
+	// model's capabilities
+	std::string text(const std::string& language, const ToolContext& ctx) const {
+		if (description_fn) return description_fn(language, ctx);
+		if (language == "en" && !description_en.empty()) return description_en;
+		return description;
+	}
+	std::string snippet(const std::string& language, const ToolContext& ctx) const {
+		if (snippet_fn) return snippet_fn(language, ctx);
+		if (language == "en" && !prompt_snippet_en.empty()) return prompt_snippet_en;
+		return prompt_snippet;
+	}
 	// input-schema builder: parameter descriptions follow the session language
-	// too, so the schema is materialized on demand (Agent::build_tools_json)
-	std::function<JsonValue(const std::string& language)> parameters_fn;
+	// too, so the schema is materialized on demand (Agent::build_tools_json).
+	// The ToolContext carries the model multimodal capability, so a tool whose
+	// parameters only exist for some models (read frames) can leave them out for
+	// a model that would never use them.
+	std::function<JsonValue(const std::string& language, const ToolContext& ctx)> parameters_fn;
 	std::function<ToolResult(const JsonValue& args, ToolContext& ctx)> run;
 };
 
@@ -366,7 +400,17 @@ public:
 	std::optional<AgentMessage> streaming_message() const;
 	void set_messages(std::vector<AgentMessage> msgs);  // session restore
 
+	// How big the NEXT request to the model would be, in tokens: the system
+	// prompt, the tool schemas, and the context the model actually sees (after
+	// the compaction transform). This is the fallback the context meter uses
+	// before — and between — provider-reported usage; see token_estimate.hpp
+	// for why the density model looks the way it does.
+	int64_t estimate_context_tokens() const;
+
 	void set_model(std::optional<ModelDef> model);
+	// the tools list inside the prompt depends on what the model can receive,
+	// so a capability change rewrites it too
+	void set_system_prompt(std::string prompt);
 	void set_thinking_level(const std::string& level);
 	std::optional<ModelDef> model() const;
 	std::string thinking_level() const;

@@ -18,6 +18,28 @@ struct ModelCost {
 	double cache_write = 0;
 };
 
+// ── multimodal capability (API 配置 → 多模态) ─────────────────────────────
+//
+// What the configured model can actually look at. The setting is per profile
+// (webui-configs.json "vision") and turns into ModelDef::input, which is the
+// list the providers and the agent loop read. Three tiers, matching what an
+// endpoint can do:
+//
+//   none        text only — a picture or a video cannot be read at all
+//   image       text + pictures (the behaviour every profile had before this
+//               setting existed, hence the default)
+//   image_video pictures + mp4 video, sent whole
+enum class VisionMode { None = 0, Image = 1, ImageVideo = 2 };
+
+// "none" | "image" | "image_video". An unknown or empty key reads as Image: a
+// profile written before this setting existed was served as an image-capable
+// one, and keeping that is what makes old configs behave unchanged.
+VisionMode vision_mode_from_key(const std::string& key);
+std::string vision_mode_key(VisionMode mode);
+// the model.input list a mode implies: {"text"} / {"text","image"} /
+// {"text","image","video"} — in exactly this order
+std::vector<std::string> vision_mode_inputs(VisionMode mode);
+
 struct ModelDef {
 	std::string provider;
 	std::string id;
@@ -26,7 +48,7 @@ struct ModelDef {
 	std::string base_url;    // api root (no trailing slash)
 	bool reasoning = false;
 	std::map<std::string, std::optional<std::string>> thinking_level_map;  // level -> mapped or unsupported
-	std::vector<std::string> input;  // ["text","image"]
+	std::vector<std::string> input;  // ["text","image"] (+ "video")
 	ModelCost cost;
 	int64_t context_window = 0;
 	int64_t max_tokens = 0;
@@ -36,7 +58,9 @@ struct ModelDef {
 	std::string map_thinking(const std::string& level) const;
 	std::vector<std::string> supported_thinking_levels() const;
 	bool supports_image() const;
+	bool supports_video() const;
 };
+
 
 struct ProviderDef {
 	std::string id;

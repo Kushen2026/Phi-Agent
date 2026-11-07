@@ -7,6 +7,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -60,6 +61,35 @@ private:
 	void* p_ = nullptr;
 	u64 n_ = 0;
 	bool locked_ = false;
+};
+
+// A borrowed view of a range the pinned (system memory) cache holds.
+//
+// The *tier* a read is served from is decided inside `SafeTensors`, so every
+// loader gets the best tier that holds its bytes without knowing the tiers
+// exist (see host/residency.hpp). `read_file` has always consulted the pinned
+// set; the decoders - `dequant_rows` and everything built on it, which is every
+// quantised family and every float conversion - used to copy out of the file
+// *mapping* instead, so a model whose weights were pinned still paid the page
+// faults and the mapping's random-access read-ahead for them.
+//
+// `PinnedBytes` is what closes that: the buffer is reference-counted, so the view
+// stays valid even if the cache entry is dropped while a caller is reading it (a
+// `drop_cache()` at a phase boundary cannot pull bytes out from under a decode),
+// and `locked()` says whether the driver can read it directly instead of the
+// caller copying it.
+class PinnedBytes {
+public:
+	PinnedBytes() = default;
+	const void* data() const { return p_ ? p_->data() : nullptr; }
+	u64 size() const { return p_ ? p_->size() : 0; }
+	bool locked() const { return p_ && p_->locked(); }
+	explicit operator bool() const { return p_ != nullptr; }
+
+private:
+	friend class SafeTensors;
+	explicit PinnedBytes(std::shared_ptr<const HostPin> p) : p_(std::move(p)) {}
+	std::shared_ptr<const HostPin> p_;
 };
 
 struct StTensor {
@@ -130,9 +160,29 @@ public:
 	// StTensor::stored_cols). Called once, from the header parse.
 	void rewrite_packed_shapes();
 
-	// Refuses a six-bit payload that does not carry a code distribution (see the
-	// definition): the shipped w6a8 files are like that.
-	void validate_packed6_payload(const StTensor& t) const;
+	// ── the "does this payload look like a quantisation?" diagnostic ─────────
+	//
+	// A six-bit payload whose bits are independent (an encrypted, scrambled or
+	// wrongly written file) decodes to uniform codes, and decoding it feeds the
+	// sampler a random model that only shows up as a bad generation minutes later.
+	//
+	// **This is a diagnostic, not a gate.** ComfyUI has no such check: it decodes
+	// whatever the header declares, and the engine has to behave the same way or a
+	// checkpoint ComfyUI runs would be refused here. The measurement is therefore
+	// printed and nothing else - under `PHI_PACKED6_CHECK`, so it costs an
+	// ordinary run nothing - and the *values* it looks at are reported rather than
+	// compared against thresholds, because no threshold is right for every
+	// producer: the numbers below were measured on one packer's output, and a file
+	// from an unusual (but valid) scale policy would trip any fixed cut-off.
+	//
+	// The comment is the record of a real investigation: a file claiming to be a
+	// six-bit quantisation of the H3 DiT carried 6.00 of a possible 6.00 bits of
+	// code entropy, 7.88 of 8.0 bits of byte entropy, byte autocorrelation <0.005
+	// at every lag and |r|<0.002 against the same weights in another precision,
+	// while a genuine pack of those weights measures 5.83 bits of code entropy and
+	// has 62% of its code groups reaching an extreme code. Those two numbers are
+	// reported below; interpreting them is the operator's call.
+	void report_packed6_payload(const StTensor& t) const;
 
 	// Dequantise `t` into `target` (F32/F16/BF16) or, for a raw tensor, convert it.
 	// Returns the host buffer; `nbytes` in the returned vector is
@@ -178,6 +228,10 @@ public:
 		const StTensor* rel_scale = nullptr;     // weight_s_rel
 		const StTensor* codebook = nullptr;      // weight_codebook
 		const StTensor* global_scale = nullptr;  // weight_scale_2 (nvfp4)
+		// The asymmetric grouped recipe's additive plane, [groups, rows] fp32. Only
+		// that one recipe writes it (the symmetric and codebook recipes fold the same
+		// information into the levels), so it is null for every other family.
+		const StTensor* correction = nullptr;    // weight_correction
 		bool packed = false;                     // bits < 8: the last dim is not K
 		bool known_family = false;               // one of the families the engine decodes
 	};
@@ -236,7 +290,16 @@ public:
 	// cache, and an LRU scores zero on that pattern because every entry is evicted
 	// by the time the loop comes back to it. Pinning a fixed subset and streaming
 	// the rest is the policy that actually hits.
-	void pin_range(u64 offset, u64 len);
+	//
+	// `slot_headroom` is how much of the page-lock budget is kept *unlocked* for the
+	// look-ahead slot (see `prefetch_ranges`): the slot holds one unit of the same
+	// checkpoint, so the caller passes the largest unit it streams. It has to be a
+	// parameter rather than a constant because that unit's size is the file's, not
+	// the architecture's - a DiT block is 370 MB as int8 and 740 MB as bf16, and a
+	// fixed 768 MB of headroom is exactly right for one and a hair short of the
+	// other, which is how a bf16 run ends up DMA-ing the pinned set and copying the
+	// slot through the ring.
+	void pin_range(u64 offset, u64 len, u64 slot_headroom = 768ull << 20);
 	// How many bytes the pinned set holds.
 	u64 pinned_bytes() const;
 	// Host time spent copying out of the pinned set, so "the cache hit" can be
@@ -296,7 +359,21 @@ public:
 	// *the next 368 MB*. The ranges are stored with the byte offset they land at,
 	// so a `read_file` that does not fall inside the current set falls through to
 	// the disk exactly as before.
-	void prefetch_ranges(const std::vector<std::pair<u64, u64>>& ranges);   // (file offset, bytes)
+	void prefetch_ranges(const std::vector<std::pair<u64, u64>>& ranges) const;   // (file offset, bytes)
+
+	// ── the pinned-range view, for readers that copy out of the mapping ────
+	//
+	// A handle on [offset, offset+len) when one pinned range covers it, else an
+	// empty handle (the caller then uses the mapping / `read_file`, which resolve
+	// their own tiers). Holding the handle keeps the bytes alive, so a decode may
+	// hold it across the whole tensor and a concurrent `drop_cache()` only costs
+	// the tier, never the data.
+	PinnedBytes pinned_span(u64 offset, u64 len) const;
+	// How many bytes have been served *by pointer* out of the pinned set (the copy
+	// form's counter is `cache_served_bytes`). The two together say whether the
+	// RAM tier is being read at all, which no served-bytes total can tell apart.
+	u64 pin_served_bytes() const { return pin_served_bytes_; }
+	void reset_pin_stats() { pin_served_bytes_ = 0; }
 
 	// ── the direct-DMA query ──────────────────────────────────────────────
 	//
@@ -332,16 +409,24 @@ private:
 		u64 dest = 0;
 		u64 len = 0;
 	};
-	void prefetch_worker(std::vector<PfRange> ranges, u64 total);
+	void prefetch_worker(std::vector<PfRange> ranges, u64 total) const;
 	// The raw disk read, with neither the pinned set nor the slot consulted.
 	void read_file_direct(u64 offset, size_t len, void* dst) const;
 
 	void parse_header();
+	// The pointer a tensor's decode starts from: into the pinned (RAM tier) copy
+	// when one holds the whole tensor, else into the mapping. The handle must
+	// outlive the read (it is a stack local in every caller).
+	struct TensorSource {
+		PinnedBytes pin;
+		const u8* base = nullptr;
+	};
+	TensorSource tensor_source(const StTensor& t) const;
 	// Serves [offset, offset+len) out of the pinned set when it is fully covered.
 	bool cache_serve(u64 offset, size_t len, void* dst) const;
 	// Serves [offset, offset+len) out of the look-ahead slot when it is covered.
 	bool prefetch_serve(u64 offset, size_t len, void* dst) const;
-	void prefetch_reset_locked();
+	void prefetch_reset_locked() const;
 
 	std::string path_;
 	u64 file_size_ = 0;
@@ -365,11 +450,16 @@ private:
 	// `cache_mutex_` guards the map and the counters; nothing else is held while it
 	// is taken, and no lock is ever taken *while* holding it, so the I/O mutex and
 	// this one can never deadlock against each other.
+	//
+	// The entries are `shared_ptr`s because readers can now hold a pointer into one
+	// (`pinned_span`): dropping the entry - which the tier plan does at every phase
+	// boundary - must not free bytes a decode is in the middle of reading.
 	mutable std::mutex cache_mutex_;
-	mutable std::map<u64, HostPin> cache_;
+	mutable std::map<u64, std::shared_ptr<HostPin>> cache_;
 	mutable u64 pinned_bytes_ = 0;
 	mutable double cache_ms_ = 0;
 	mutable u64 cache_served_bytes_ = 0;
+	mutable u64 pin_served_bytes_ = 0;
 
 	// The look-ahead slot (see `prefetch_ranges`). `pf_mutex_` guards the range
 	// table and `pf_state_`; the worker writes `pf_buf_` and only flips
@@ -426,5 +516,14 @@ enum class WeightPrecision {
 WeightPrecision weight_precision_of(const SafeTensors& st, const StTensor& t);
 const char* weight_precision_name(WeightPrecision p);
 bool weight_is_dense_float(const SafeTensors& st, const StTensor& t);
+
+// The int8 tensorwise + convrot form the engine's GEMMs read: the shape every
+// weight is requantised into when it cannot be uploaded as it is stored.
+QuantSpec int8_convrot_spec();
+// The spec a *decoded* weight is requantised with. Rotation is turned off exactly
+// when the file already stores the rotated basis (so the requantiser rescales only),
+// and left on for a source that is not rotated - see the definition for why getting
+// this backwards is silent.
+QuantSpec requant_spec_for(const SafeTensors& st, const std::string& base);
 
 }  // namespace phi::media

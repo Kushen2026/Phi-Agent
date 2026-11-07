@@ -62,12 +62,25 @@ namespace phi::media {
 // How a row's relative-scale table is stored. Anything else is refused by the
 // caller, which falls back to the CPU path (there is none today: every float
 // spelling the reader can decode is here).
-enum class RelDType : int { F32 = 0, F16 = 1, BF16 = 2, F8_E4M3 = 3, F8_E5M2 = 4 };
+enum class RelDType : int {
+	F32 = 0,
+	F16 = 1,
+	BF16 = 2,
+	F8_E4M3 = 3,
+	F8_E5M2 = 4,
+	// An fp8 E4M3 table in a byte container - the spelling every packer that wrote
+	// before safetensors had an fp8 dtype used, and the one ComfyUI's loader still
+	// accepts ("scale.view(torch.float8_e4m3fn)"). It reads as fp8, not as 0..255.
+	U8_E4M3 = 5,
+};
 
 // The code layout of the packed weight.
 enum class CodeLayout : int {
-	Nibble4 = 0,   // asym_w4a8_int8: two unsigned 4-bit codes per byte, low nibble first
-	Packed6 = 1,   // w6a8_int8: four unsigned 6-bit codes per three bytes
+	// asym_w4a8_int8: two unsigned 4-bit codes per byte, **low** nibble = column 2j.
+	Nibble4 = 0,
+	// w6a8_int8: k/2 bytes of low nibbles followed by k/4 bytes of top-2-bit codes,
+	// i.e. k*3/4 bytes per row in two planes (see `dequant_packed6_row`).
+	Packed6 = 1,
 };
 
 struct W4a8ExpandArgs {

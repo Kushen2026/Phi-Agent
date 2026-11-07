@@ -118,6 +118,11 @@ private:
 	GpuCtx* g_ = nullptr;
 	TextEncoder8BConfig cfg_;
 	SafeTensors st_;
+	// The Vram / Ram / Disk tier plan for this tower (host/residency.hpp): attached
+	// and given its layers in `open()`, planned at the end of `plan_residency`
+	// (where the window count is final), dropped at the phase boundary with the
+	// window. Declared after `st_` so it is destroyed first.
+	WeightResidency wr_;
 	std::string path_;
 	const LoraSet* loras_ = nullptr;
 

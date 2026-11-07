@@ -32,6 +32,40 @@ static std::string mapOpenAIStop(std::string_view r) {
 	return "error";
 }
 
+// ── media blocks ─────────────────────────────────────────────────────────────
+// A ContentPart carries either a picture (image/…) or a whole video (video/…)
+// — both are "binary content the model looks at", and the media type is what
+// tells them apart. The read tool names the container (video/mp4, video/webm),
+// so the block type follows the mime rather than a separate part kind.
+static bool is_video_mime(const std::string& mime) { return starts_with(mime, "video/"); }
+
+// Anthropic wants {"type":"image","source":{...}} or {"type":"video","source":{...}}:
+// the two blocks are identical apart from the type name.
+static JsonValue anthropic_media_block(const ContentPart& p) {
+	JsonValue b = JsonValue::object();
+	std::string mime = p.image_mime.empty() ? "image/png" : p.image_mime;
+	b["type"] = is_video_mime(mime) ? "video" : "image";
+	JsonValue src = JsonValue::object();
+	src["type"] = "base64";
+	src["media_type"] = mime;
+	src["data"] = p.image_data;
+	b["source"] = src;
+	return b;
+}
+
+// OpenAI chat-completions has one content block for every URL payload, images
+// included: {"type":"image_url","image_url":{"url":"data:<mime>;base64,<data>"}}.
+// Providers that accept video reuse the same block with a video/* data URL.
+static JsonValue openai_media_block(const ContentPart& p) {
+	std::string mime = p.image_mime.empty() ? "image/png" : p.image_mime;
+	JsonValue b = JsonValue::object();
+	b["type"] = "image_url";
+	JsonValue u = JsonValue::object();
+	u["url"] = "data:" + mime + ";base64," + p.image_data;
+	b["image_url"] = u;
+	return b;
+}
+
 // ── thinking budget defaults (TS: DEFAULT_THINKING_BUDGETS in simple-options.ts)
 static const struct { const char* level; int64_t tokens; } kThinkingBuckets[] = {
 	{"minimal", 1024},
@@ -48,8 +82,23 @@ static int64_t thinkingBudgetForLevel(const std::string& level) {
 // ── URL helpers ─────────────────────────────────────────────────────────────
 
 static void urlAppendPath(std::string& base, std::string_view path) {
+	// a trailing "/" on the configured baseUrl is decoration, not a prefix: fold
+	// it away first so "http://host/v1/" compares like "http://host/v1" below
+	while (!base.empty() && base.back() == '/') base.pop_back();
 	// avoid double "/v1" when the configured baseUrl already ends with /v1
 	if (ends_with(base, "/v1") && starts_with(path, "/v1/")) path.remove_prefix(4);
+	// A path that already starts with '/' must not get a second separator:
+	// baseUrl "http://host/v1" + "/chat/completions" used to become
+	// "http://host/v1//chat/completions", which OpenAI-compatible gateways
+	// answer with 404 Not found — and a local gateway answers that *after* the
+	// key check, so a perfectly good key reads as a mystery "not found".
+	// (The anthropic branch hid the bug: "/v1/messages" starts with "/v1/" and
+	// was stripped above, so only the openai path ever produced a "//".)
+	if (!path.empty() && path.front() == '/') {
+		while (!base.empty() && base.back() == '/') base.pop_back();
+		base += std::string(path);
+		return;
+	}
 	if (base.empty() || base.back() == '/') base += std::string(path);
 	else base += "/" + std::string(path);
 }
@@ -124,15 +173,7 @@ static JsonValue buildAnthropicBody(
 							tb["text"] = p.text;
 							parts.push_back(tb);
 						} else if (p.type == ContentPart::Type::Image && !p.image_data.empty()) {
-							JsonValue ib = JsonValue::object();
-							ib["type"] = "image";
-							JsonValue src = JsonValue::object();
-							src["type"] = "base64";
-							src["media_type"] =
-								p.image_mime.empty() ? "image/png" : p.image_mime;
-							src["data"] = p.image_data;
-							ib["source"] = src;
-							parts.push_back(ib);
+							parts.push_back(anthropic_media_block(p));
 						}
 					}
 					if (parts.size() == 1u && ((const JsonValue&)parts)[(size_t)0].is_string())
@@ -206,7 +247,8 @@ static JsonValue buildAnthropicBody(
 				tr["content"] = txt.empty() ? "(no output)" : txt;
 			} else {
 				// multimodal tool result: image I/O lets a tool (read) hand the model a
-				// picture. Anthropic accepts an array of blocks inside tool_result.
+				// picture or a whole video. Anthropic accepts an array of blocks inside
+				// tool_result, each one a media block of its own media type.
 				JsonValue blocks = JsonValue::array();
 				if (!txt.empty()) {
 					JsonValue tb = JsonValue::object();
@@ -214,16 +256,7 @@ static JsonValue buildAnthropicBody(
 					tb["text"] = txt;
 					blocks.push_back(tb);
 				}
-				for (const ContentPart* p : imgs) {
-					JsonValue ib = JsonValue::object();
-					ib["type"] = "image";
-					JsonValue src = JsonValue::object();
-					src["type"] = "base64";
-					src["media_type"] = p->image_mime.empty() ? "image/png" : p->image_mime;
-					src["data"] = p->image_data;
-					ib["source"] = src;
-					blocks.push_back(ib);
-				}
+				for (const ContentPart* p : imgs) blocks.push_back(anthropic_media_block(*p));
 				tr["content"] = blocks;
 			}
 			// (an empty tool_call_id would be an invalid block; the agent always
@@ -336,13 +369,7 @@ static JsonValue buildOpenAIBody(
 						tb["text"] = p.text;
 						parts.push_back(tb);
 					} else if (p.type == ContentPart::Type::Image && !p.image_data.empty()) {
-						JsonValue ib = JsonValue::object();
-						ib["type"] = "image_url";
-						JsonValue iu = JsonValue::object();
-						std::string mime = p.image_mime.empty() ? "image/png" : p.image_mime;
-						iu["url"] = "data:" + mime + ";base64," + p.image_data;
-						ib["image_url"] = iu;
-						parts.push_back(ib);
+						parts.push_back(openai_media_block(p));
 					}
 				}
 				if (!parts.is_null()) m["content"] = parts;
@@ -414,19 +441,17 @@ static JsonValue buildOpenAIBody(
 				JsonValue tb = JsonValue::object();
 				tb["type"] = "text";
 				const std::string tool = msg.tool_name.empty() ? std::string("tool") : msg.tool_name;
+				// a tool may hand back a video instead of a picture (read on a model with
+				// the capability); the label has to say which, or the model takes a video
+				// data URL for a broken image
+				bool has_video = false;
+				for (const ContentPart* p : imgs) has_video = has_video || is_video_mime(p->image_mime);
 				tb["text"] = tr(options.language,
-					"以下是工具 " + tool + " 返回的图片：",
-					"Image(s) returned by tool " + tool + ":");
+					has_video ? "以下是工具 " + tool + " 返回的图片/视频：" : "以下是工具 " + tool + " 返回的图片：",
+					has_video ? "Image/video content returned by tool " + tool + ":"
+					           : "Image(s) returned by tool " + tool + ":");
 				tool_images.push_back(std::move(tb));
-				for (const ContentPart* p : imgs) {
-					JsonValue ib = JsonValue::object();
-					ib["type"] = "image_url";
-					JsonValue iu = JsonValue::object();
-					std::string mime = p->image_mime.empty() ? "image/png" : p->image_mime;
-					iu["url"] = "data:" + mime + ";base64," + p->image_data;
-					ib["image_url"] = iu;
-					tool_images.push_back(std::move(ib));
-				}
+				for (const ContentPart* p : imgs) tool_images.push_back(openai_media_block(*p));
 			}
 		} else if (msg.role == "compactionSummary" && !msg.summary.empty()) {
 			JsonValue m = JsonValue::object();

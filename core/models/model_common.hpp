@@ -14,6 +14,7 @@
 #include "kernels/gpu_ops.hpp"
 #include "runtime/sched.hpp"
 #include "host/st.hpp"
+#include "host/residency.hpp"   // WeightResidency: the Vram / Ram / Disk tier plan
 
 namespace phi::media {
 
@@ -71,6 +72,16 @@ struct GpuCtx {
 	// named here to keep this header light; see the definition for why the
 	// difference matters (~3-10x on a cached range).
 	u64 upload_file_into(const GpuAlloc& a, const SafeTensors& st, const StTensor& t);
+	// A whole tensor from whichever tier holds it: a page-locked copy is a direct
+	// DMA, an unlocked pinned copy a memcpy out of system memory, and everything
+	// else falls to `fallback` (the caller's own source - the mapping for the
+	// chains that read it, null for the file path those that stream prefer).
+	//
+	// This is the one place the *read* side of the tier policy lives, so a loader
+	// cannot accidentally pin a block and then read it off the checkpoint anyway -
+	// which is what happened while each chain resolved the cache for itself.
+	u64 upload_tensor_tiered(const GpuAlloc& a, const SafeTensors& st, const StTensor& t,
+	                         const void* fallback = nullptr);
 	// Upload fp32 values.
 	GpuAlloc upload_f32(const float* src, u64 count, bool to_weights_arena = true);
 	// bf16 source -> the device keeps bf16 (the GEMM reads it directly)
@@ -116,13 +127,10 @@ std::vector<float> tensor_to_f32(const SafeTensors& st, const StTensor& t);
 // before it is quantised - for an int8 checkpoint that means dequantise, rotate
 // back to the original basis, add the delta, and re-quantise.
 //
-// The spec to requantise a *decoded* weight with, which decides whether the
-// requantiser rotates. Exposed because getting it wrong is silent: rot() is an
-// involution, so rotating a weight that the file already stored rotated (every
-// `"convrot": true` checkpoint, i.e. all the shipped ones) hands the GEMM a
-// different matrix of the same size - the model then answers with noise and
-// nothing anywhere reports an error. `media_packed_quant_test` pins it down.
-QuantSpec requant_spec_for(const SafeTensors& st, const std::string& base);
+// `int8_convrot_spec` (the int8 tensorwise + convrot form the GEMMs read) and
+// `requant_spec_for` (the spec a decoded weight is requantised with, which decides
+// whether the requantiser rotates) are declared in host/st.hpp: both are answers
+// about the *file*, so they live with the layout knowledge.
 
 // ── the dense float loader (the path that replaces the float->int8 requantise) ──
 //
@@ -278,5 +286,24 @@ void apply_lora_tail(GpuCtx& g, const LoraTail& t, const GpuAlloc& x, i64 m, con
 u64 host_cache_budget_bytes();
 // The RAM the pin loops must leave alone (see the note in model_common.cpp).
 u64 host_cache_reserve_bytes();
+
+// Drops every block the requantised-weight cache is holding.
+//
+// The cache is keyed on (the `SafeTensors` it was read from, the tensor name), so
+// its entries describe one *loaded checkpoint*: they exist to keep a sampling loop
+// from re-deriving the same weights on every step. The media tools drop the loaded
+// checkpoints when a generation ends, and an entry must not outlive the run that
+// made it - it holds the decoded int8 weights and their scales in system memory (up
+// to `host_cache_budget_bytes()`), and if a later run happens to map a checkpoint at
+// the same address, the entry would be served to it: one model's block format handed
+// to another.
+//
+// Only call this with no run in flight: `get()` hands the caller a raw pointer into
+// an entry, which that caller uploads outside the cache's lock.
+void drop_requant_cache();
+// What it is holding right now, for the same report: `entries` and the bytes they
+// occupy (the int8 codes plus their fp32 scales).
+size_t requant_cache_entries();
+u64 requant_cache_bytes();
 
 }  // namespace phi::media

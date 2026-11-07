@@ -3,13 +3,18 @@
 //
 // ── the exact arithmetic, and where each part comes from ───────────────────
 //
-// Decode (SafeTensors::dequant_rows -> quant.cpp):
-//   asym_w4a8_int8:  v = codebook[i] * s_rel[g] * s_channel     (dequant_codebook_int4_row)
-//   w6a8_int8:       v = (float)i   * s_rel[g] * s_channel      (dequant_packed6_row)
-// The operand order and the two multiplies are reproduced exactly; both are
-// single-rounded fp32 multiplies (no FMA contraction is possible in a product of
-// two factors, and the compiler cannot fuse them into an add), so the fp32 value
-// the absmax and the rounding see is the same one the host sees.
+// Decode (SafeTensors::dequant_rows -> quant.cpp), for both grouped families:
+//   level = codebook[code], or `code - 8` (4-bit) / `code - 32` (6-bit) without one
+//   v     = round_half_even(clamp(level * s_rel[g], -127, 127)) * s_channel
+//                                                                 (dequant_*_row)
+// The operand order, the int8-grid rounding and the two multiplies are reproduced
+// exactly; all of them are single-rounded fp32 operations (no FMA contraction is
+// possible in a product of two factors, and the compiler cannot fuse them into an
+// add), so the fp32 value the absmax and the rounding see is the same one the host
+// sees. That grid step is what ComfyUI's own dequantizers do
+// (`_dequant_int4_grouped_to_int8`), and it is what `s_rel` was fitted against -
+// omitting it leaves the value up to half a step of the packer's own grid away
+// from the weight the checkpoint holds.
 //
 // Quantise (quantize_impl_into):
 //   amax  = max_c |v|                    over the whole row
@@ -59,22 +64,28 @@ __device__ __forceinline__ float rel_one(const uchar* p, uint rdt) {
     if (rdt == 1u) return __half2float(*(const __half*)p);
     if (rdt == 2u) return __uint_as_float(((unsigned)*(const unsigned short*)p) << 16u);
     const unsigned b = (unsigned)*(const uchar*)p;
-    if (rdt == 3u) {
+    if (rdt == 3u || rdt == 5u) {
         // E4M3: bias 7, 3 mantissa bits; 0x7F/0xFF are NaN and every other
-        // all-ones exponent is inf. Subnormals are mantissa * 2^-9.
+        // all-ones exponent is inf. Subnormals are mantissa * 2^-9. rdt 5 is the
+        // same table in a byte container (the legacy on-disk fp8 spelling).
         const unsigned sign = (b >> 7u) & 1u, e = (b >> 3u) & 15u, m = b & 7u;
+        // E4M3FN has no infinity: only the all-ones-mantissa patterns are NaN, and
+        // the rest of the all-ones exponent holds ordinary finite values up to 448.
+        // (This mirrors `f8_lut` in media_common.cpp, which the host decoder uses,
+        // and both match torch's `float8_e4m3fn` bit for bit.)
         float v;
-        if (e == 15u) v = (m == 7u) ? __uint_as_float(0x7fc00000u) : __uint_as_float(0x7f800000u);
+        if (e == 15u) v = (m == 7u) ? __uint_as_float(0x7fc00000u)
+                                    : (float)(8u + m) * ldexpf(1.0f, 5);
         else if (e == 0u) v = (float)m * ldexpf(1.0f, -9);
         else v = (float)(8u + m) * ldexpf(1.0f, (int)e - 10);
         return sign ? -v : v;
     }
-    // E5M2: bias 15, 2 mantissa bits. The host's table maps *every* all-ones
-    // exponent to inf here (`f8_lut` only builds the NaN case for E4M3), so this
-    // does the same rather than "fixing" it - the two have to agree.
+    // E5M2: bias 15, 2 mantissa bits, IEEE-shaped - a zero mantissa at the all-ones
+    // exponent is inf and anything else there is NaN. Same table as the host's
+    // `f8_lut`, and both match torch's `float8_e5m2`.
     const unsigned sign = (b >> 7u) & 1u, e = (b >> 2u) & 31u, m = b & 3u;
     float v;
-    if (e == 31u) v = __uint_as_float(0x7f800000u);
+    if (e == 31u) v = (m == 0u) ? __uint_as_float(0x7f800000u) : __uint_as_float(0x7fc00000u);
     else if (e == 0u) v = (float)m * ldexpf(1.0f, -16);
     else v = (float)(4u + m) * ldexpf(1.0f, (int)e - 17);
     return sign ? -v : v;
@@ -92,12 +103,48 @@ __device__ __forceinline__ signed char q8(float v, float inv) {
     return (signed char)r;
 }
 
-// The four 6-bit codes of one three-byte group (quant.cpp::unpack_6bit_triple).
-__device__ __forceinline__ void six(const uchar* t, unsigned out[4]) {
-    out[0] = (unsigned)(t[0] & 0x3F);
-    out[1] = (unsigned)(((t[0] >> 6) | (t[1] << 2)) & 0x3F);
-    out[2] = (unsigned)(((t[1] >> 4) | (t[2] << 4)) & 0x3F);
-    out[3] = (unsigned)(t[2] >> 2);
+// The *packer's* rounding onto the INT8 grid: round half to even, clamped to
+// [-127, 127]. This is the step the grouped families' `s_rel` was fitted against
+// (quant.cpp::int8_grid, the same rule in the same order) and it is what makes the
+// value this kernel decodes identical to the one `SafeTensors::dequant_rows`
+// produces. `rint` is IEEE round-to-nearest-even - the mode the reference's
+// `round()` and the CUDA kernel's `rint` both use - so a .5 tie lands on the even
+// integer here exactly as it does there.
+//
+// (The *engine's* own quantiser, `q8` below, is a different rule on purpose: it
+// rounds half away from zero and is pinned against the shipped int8 checkpoints'
+// requantisation. This one decodes what a packer wrote.)
+__device__ __forceinline__ float g8(float v) {
+    float r = rintf(v);
+    r = r < -127.0f ? -127.0f : (r > 127.0f ? 127.0f : r);
+    return r;
+}
+
+// One 4-bit group's two levels: the codebook's level when the family has one, and
+// the uniform symmetric code (`code - 8`) when it does not. The low nibble is
+// column 2j - the order every int4 family in this engine uses.
+__device__ __forceinline__ void nib_levels(const uchar* cg, uint j, const float* cb, uint has_cb,
+                                           float out[2]) {
+    const unsigned b = cg[j];
+    const unsigned lo = b & 15u, hi = b >> 4u;
+    out[0] = has_cb ? cb[lo] : (float)((int)lo - 8);
+    out[1] = has_cb ? cb[hi] : (float)((int)hi - 8);
+}
+
+// One 6-bit group's four levels, out of the row's **two planes**: the low nibbles
+// come from `lo_p` (the row's first k/2 bytes) and the top two bits from `hi_p`
+// (the k/4-byte plane that follows, four codes per byte at bit positions 0, 2, 4
+// and 6). The level is `code - 32` (six-bit storage is uniform and symmetric).
+// This is the packer's own contract, and `quant.cpp::dequant_packed6_row` decodes
+// the same bytes - not the three-byte little-endian triple an earlier reader
+// assumed.
+__device__ __forceinline__ void six_levels(const uchar* lo_p, const uchar* hi_p, uint j,
+                                           float out[4]) {
+    const uchar b0 = lo_p[2u * j], b1 = lo_p[2u * j + 1u], hb = hi_p[j];
+    out[0] = (float)((int)(unsigned)((b0 & 15u) | (((hb >> 0u) & 3u) << 4u)) - 32);
+    out[1] = (float)((int)(unsigned)((b0 >> 4u) | (((hb >> 2u) & 3u) << 4u)) - 32);
+    out[2] = (float)((int)(unsigned)((b1 & 15u) | (((hb >> 4u) & 3u) << 4u)) - 32);
+    out[3] = (float)((int)(unsigned)((b1 >> 4u) | (((hb >> 6u) & 3u) << 4u)) - 32);
 }
 
 // numthreads(256, 1, 1) - grid = one block per output row
@@ -138,21 +185,28 @@ extern "C" __global__ void w4a8_to_i8(Args a) {
     float loc = 0.0f;
     for (uint gi = t; gi < ngroups; gi += 256u) {
         const float g = rel_one(srel + (size_t)gi * rsz, rdt);
-        const uchar* cg = codes + (size_t)gi * (layout == 0u ? (group >> 1u) : (group * 3u / 4u));
+        // A group's codes are one contiguous run of the low-nibble plane and, at six
+        // bits, one of the top-2-bit plane; both planes are `k`-relative.
+        const uint gpn = layout == 0u ? (group >> 1u) : (group >> 2u);
+        // The low-nibble plane is `group/2` bytes per group in *both* layouts (`gpn`
+        // is `group/4` at six bits, where one hi-plane byte covers four columns).
+        const uchar* cg = codes + (size_t)gi * (group >> 1u);
+        const uchar* hg = codes + (k >> 1u) + (size_t)gi * (group >> 2u);
         float m = 0.0f;
         if (layout == 0u) {
-            for (uint j = 0; j < group >> 1u; j++) {
-                const unsigned b = cg[j];
-                const float v0 = (cb[b & 15u] * g) * s_ch;
-                const float v1 = (cb[b >> 4u] * g) * s_ch;
+            for (uint j = 0; j < gpn; j++) {
+                float lv[2];
+                nib_levels(cg, j, cb, has_cb, lv);
+                const float v0 = g8(lv[0] * g) * s_ch;
+                const float v1 = g8(lv[1] * g) * s_ch;
                 m = fmaxf(m, fmaxf(fabsf(v0), fabsf(v1)));
             }
         } else {
-            for (uint j = 0; j < group / 4u; j++) {
-                unsigned c[4];
-                six(cg + (size_t)j * 3u, c);
+            for (uint j = 0; j < gpn; j++) {
+                float lv[4];
+                six_levels(cg, hg, j, lv);
                 for (uint i = 0; i < 4u; i++) {
-                    const float v = ((float)c[i] * g) * s_ch;
+                    const float v = g8(lv[i] * g) * s_ch;
                     m = fmaxf(m, fabsf(v));
                 }
             }
@@ -180,20 +234,24 @@ extern "C" __global__ void w4a8_to_i8(Args a) {
     for (uint gi = t; gi < ngroups; gi += 256u) {
         const float g = rel_one(srel + (size_t)gi * rsz, rdt);
         uchar* qg = (uchar*)qrow + (size_t)gi * group;
+        const uint gpn = layout == 0u ? (group >> 1u) : (group >> 2u);
+        // The low-nibble plane is `group/2` bytes per group in *both* layouts (`gpn`
+        // is `group/4` at six bits, where one hi-plane byte covers four columns).
+        const uchar* cg = codes + (size_t)gi * (group >> 1u);
+        const uchar* hg = codes + (k >> 1u) + (size_t)gi * (group >> 2u);
         if (layout == 0u) {
-            const uchar* cg = codes + (size_t)gi * (group >> 1u);
-            for (uint j = 0; j < group >> 1u; j++) {
-                const unsigned b = cg[j];
-                qg[2u * j] = (uchar)q8((cb[b & 15u] * g) * s_ch, inv);
-                qg[2u * j + 1u] = (uchar)q8((cb[b >> 4u] * g) * s_ch, inv);
+            for (uint j = 0; j < gpn; j++) {
+                float lv[2];
+                nib_levels(cg, j, cb, has_cb, lv);
+                qg[2u * j] = (uchar)q8(g8(lv[0] * g) * s_ch, inv);
+                qg[2u * j + 1u] = (uchar)q8(g8(lv[1] * g) * s_ch, inv);
             }
         } else {
-            const uchar* cg = codes + (size_t)gi * (group * 3u / 4u);
-            for (uint j = 0; j < group / 4u; j++) {
-                unsigned c[4];
-                six(cg + (size_t)j * 3u, c);
+            for (uint j = 0; j < gpn; j++) {
+                float lv[4];
+                six_levels(cg, hg, j, lv);
                 for (uint i = 0; i < 4u; i++)
-                    qg[j * 4u + i] = (uchar)q8(((float)c[i] * g) * s_ch, inv);
+                    qg[j * 4u + i] = (uchar)q8(g8(lv[i] * g) * s_ch, inv);
             }
         }
     }
@@ -207,13 +265,15 @@ void dispatch_w4a8_expand(ComputeContext& ctx, const W4a8ExpandArgs& a) {
 	if (a.group <= 0 || a.k % a.group != 0)
 		throw MediaError("w4a8_expand: K=" + std::to_string(a.k) + " is not a multiple of group=" +
 		                 std::to_string(a.group));
-	const i64 cpg = a.group / (a.layout == CodeLayout::Nibble4 ? 2 : 4);
 	if (a.group % (a.layout == CodeLayout::Nibble4 ? 2 : 4) != 0)
 		throw MediaError("w4a8_expand: group=" + std::to_string(a.group) +
 		                 " is not a whole number of code groups for this layout");
-	if (a.codes_row_bytes < cpg * (a.k / a.group))
+	// A packed row is k/2 bytes at four bits and k/2 + k/4 = 3k/4 at six (two
+	// planes), which is what the header's stored width has to cover.
+	const i64 need = a.layout == CodeLayout::Nibble4 ? a.k / 2 : a.k / 2 + a.k / 4;
+	if (a.codes_row_bytes < need)
 		throw MediaError("w4a8_expand: a " + std::to_string(a.k) + "-column row needs " +
-		                 std::to_string(cpg * (a.k / a.group)) + " packed bytes, got " +
+		                 std::to_string(need) + " packed bytes, got " +
 		                 std::to_string(a.codes_row_bytes));
 	if (!a.pool || !a.q || !a.s) throw MediaError("w4a8_expand: missing binding");
 	if (a.has_codebook && a.layout != CodeLayout::Nibble4)

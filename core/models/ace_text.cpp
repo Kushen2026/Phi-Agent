@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 
 #include "kernels/gpu_ops.hpp"
 #include "kernels/kernels.hpp"            // attn_query_tile()
@@ -126,6 +127,36 @@ GemmOperand gemm_operand_for(DType t) {
 	throw MediaError("ace: a weight is neither bf16, f16 nor f32");
 }
 
+// The tensors one stack layer reads, in `ace_qwen3_upload_layer`'s own order: the
+// seven projections (`<name>.weight`) and then the four vectors. One table for
+// three callers - the loader, the host weight cache that pins a layer's file
+// ranges, and the look-ahead that reads the next layer while this one computes -
+// so "one layer" means the same thing to all of them.
+const char* const kQwen3LayerMats[] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                                       "self_attn.o_proj", "mlp.gate_proj",   "mlp.up_proj",
+                                       "mlp.down_proj"};
+const char* const kQwen3LayerVecs[] = {"input_layernorm.weight", "post_attention_layernorm.weight",
+                                       "self_attn.q_norm.weight", "self_attn.k_norm.weight"};
+
+// The file ranges of one stack layer, in the loader's order (see the tables
+// above). Used by `AceLm` to pin its streamed layers and to read the next one
+// ahead.
+std::vector<std::pair<u64, u64>> ace_qwen3_layer_ranges(const SafeTensors& st,
+                                                        const std::string& prefix, i64 index) {
+	const std::string p = prefix + "layers." + std::to_string(index) + ".";
+	std::vector<std::pair<u64, u64>> rs;
+	rs.reserve(11);
+	for (const char* n : kQwen3LayerMats) {
+		const StTensor& t = st.require(p + n + ".weight");
+		rs.push_back({t.offset, t.nbytes});
+	}
+	for (const char* n : kQwen3LayerVecs) {
+		const StTensor& t = st.require(p + n);
+		rs.push_back({t.offset, t.nbytes});
+	}
+	return rs;
+}
+
 // One sequence's view of a pass through the stack: where its hidden state lives,
 // which KV-cache row it writes and how many keys it may read.
 struct AcePass {
@@ -153,7 +184,7 @@ void ace_stack_multi(GpuCtx& g, const SafeTensors& st, const std::string& prefix
                      const AceQwen3Config& cfg, i64 n_layers, bool final_norm,
                      const std::string& norm_name, i64 group, AcePass* passes, i64 n_pass,
                      GpuArena* res_arena = nullptr, const std::vector<AceQwen3Layer>* res = nullptr,
-                     i64 res_n = 0) {
+                     i64 res_n = 0, bool prefetch_next = false, i64 first_prefetch = 0) {
 	const i64 H = cfg.hidden;
 	const i64 HQ = cfg.n_heads * cfg.head_dim;
 	const i64 HK = cfg.n_kv_heads * cfg.head_dim;
@@ -176,8 +207,32 @@ void ace_stack_multi(GpuCtx& g, const SafeTensors& st, const std::string& prefix
 			g.ctx->submit_if_recording();
 			g.ctx->begin();
 		} else {
+			// ── one layer ahead on the disk (see SafeTensors::prefetch_ranges) ──
+			//
+			// The decode re-reads every streamed layer once *per token*, so the read for
+			// this layer is issued at the end of the previous iteration and runs on a
+			// worker thread while the previous layer's pass uses the GPU. The overlap is
+			// worth less here than in the DiT's block loop - a one-row pass is
+			// microseconds of arithmetic against a 100-230 MB read, so the card is idle
+			// either way - and the lever that really moves the LM is the *pin* in
+			// `AceLm::ensure_host_cache`, not this hint. It is kept because it costs a
+			// buffer and a joiner thread and turns the loader's reads into DMA from
+			// that buffer (`pinned_dma_at`), so the layers the cache did not take still
+			// come off the device in one pass rather than into the ring first.
+			//
+			// Off by default: a one-shot tower (the DiT bundle's four) reads each layer
+			// exactly once, so looking ahead would only spend memory on a hint that can
+			// never be used. `first_prefetch` lets the caller exclude the layers that
+			// need no hint at all - the resident window and the ones the host weight
+			// cache already holds (see `AceLm::ensure_host_cache`).
+			if (prefetch_next) st.prefetch_wait();
 			g.new_layer();
 			ace_qwen3_upload_layer(g, st, prefix, li, &streamed);
+			// This layer's bytes are on the device, so the slot is free for the next
+			// read - kicked off before the passes below submit their first command list.
+			if (prefetch_next && li + 1 < n_layers && li + 1 >= first_prefetch &&
+			    !(res && res_arena && li + 1 < res_n))
+				st.prefetch_ranges(ace_qwen3_layer_ranges(st, prefix, li + 1));
 		}
 		if (li == 0) {
 			// The upload is where a wrong checkpoint would surface, and it is
@@ -658,7 +713,7 @@ void AceKvCache::init(GpuCtx& g, i64 n_layers, i64 cap, i64 dim) {
 void ace_qwen3_probe(const SafeTensors& st, const std::string& prefix, AceQwen3Config* cfg) {
 	const StTensor& qp = st.require(prefix + "layers.0.self_attn.q_proj.weight");
 	if (qp.shape.size() != 2) throw MediaError("ace: q_proj is not a matrix");
-	cfg->hidden = qp.shape[1];
+	cfg->hidden = st.logical_cols(qp);
 	cfg->head_dim = st.require(prefix + "layers.0.self_attn.q_norm.weight").shape[0];
 	if (cfg->head_dim != 128)
 		throw MediaError("ace: head_dim " + std::to_string(cfg->head_dim) + " != 128");
@@ -722,17 +777,60 @@ void ace_gather_rows(const SafeTensors& st, const std::string& name, i64 hidden,
 	if (t.shape.size() != 2 || t.shape[1] != hidden)
 		throw MediaError("ace: '" + name + "' is not [vocab, " + std::to_string(hidden) + "]");
 	const i64 vocab = t.shape[0];
-	if (t.dtype != DType::BF16 && t.dtype != DType::F16 && t.dtype != DType::F32)
-		throw MediaError("ace: '" + name + "' has an unsupported dtype for a gather");
-	const u64 row_bytes = (u64)hidden * dtype_size(t.dtype);
-	const u8* base = (const u8*)st.data_of(t);
 	for (i64 s = 0; s < S; s++) {
 		const i32 id = ids[(size_t)s];
 		if (id < 0 || (i64)id >= vocab)
 			throw MediaError("ace: token id " + std::to_string(id) + " out of range");
-		convert_to_f32(t.dtype, base + (u64)id * row_bytes, dst + (size_t)s * (size_t)hidden,
-		               (size_t)hidden);
 	}
+	// A raw f16 / bf16 / f32 table is read straight out of the mapping - the gather
+	// this has always been. Any other precision the file may hold (fp8, nvfp4, int8
+	// tensorwise, w4a8, w6a8, or the packed int4) goes a row at a time through the
+	// reader, which owns every family's codebook, group scales and per-row scale, so
+	// a quantised text/LM checkpoint gathers the same vectors it would at bf16.
+	if (st.is_raw(t)) {
+		const u64 row_bytes = (u64)hidden * (u64)dtype_size(t.dtype);
+		const u8* base = (const u8*)st.data_of(t);
+		for (i64 s = 0; s < S; s++)
+			convert_to_f32(t.dtype, base + (u64)ids[(size_t)s] * row_bytes,
+			               dst + (size_t)s * (size_t)hidden, (size_t)hidden);
+		return;
+	}
+	// A convrot quantisation stores the *rotated* rows; a gather has no activation
+	// to rotate, so the rotation is undone here (H is an involution), exactly as the
+	// 8B tower's embedding gather does it.
+	for (i64 s = 0; s < S; s++)
+		st.dequant_rows(t, ids[(size_t)s], 1, dst + (size_t)s * (size_t)hidden);
+	const QuantSpec spec = st.quant_spec_of(t.name);
+	if (spec.convrot) {
+		std::vector<float> un((size_t)S * (size_t)hidden);
+		convrot_inverse(dst, un.data(), S, hidden, spec.convrot_groupsize);
+		memcpy(dst, un.data(), un.size() * sizeof(float));
+	}
+}
+
+// ── the tied lm-head at any precision ──────────────────────────────────────
+//
+// The head *is* a slice of `model.embed_tokens.weight`, and the fp16 GEMM reads
+// it as a bf16 / f16 / f32 operand. A raw table is copied straight out of the
+// mapping (the path this head has always used); any quantised or fp8 table is
+// decoded one row at a time - by the reader - into bf16, so a quantised
+// checkpoint samples its codes with the same vectors it would at bf16.
+void ace_head_rows(GpuCtx& g, const SafeTensors& st, const StTensor& t, i64 row0, i64 rows,
+                   i64 hidden, const GpuAlloc& dst, GemmOperand* op) {
+	if (st.is_raw(t)) {
+		const u64 row_bytes = (u64)hidden * (u64)dtype_size(t.dtype);
+		if (op) *op = gemm_operand_for(t.dtype);
+		g.upload_into(dst, (const u8*)st.data_of(t) + (u64)row0 * row_bytes,
+		              (u64)rows * row_bytes);
+		return;
+	}
+	if (op) *op = GemmOperand{/*b_is_bf16=*/true, /*b_is_f32=*/false};
+	std::vector<float> buf((size_t)rows * (size_t)hidden);
+	for (i64 r = 0; r < rows; r++)
+		st.dequant_rows(t, row0 + r, 1, buf.data() + (size_t)r * (size_t)hidden);
+	std::vector<u8> out((size_t)rows * (size_t)hidden * 2);
+	convert_from_f32(buf.data(), DType::BF16, out.data(), (size_t)rows * (size_t)hidden);
+	g.upload_into(dst, out.data(), out.size());
 }
 
 // ── AceQwen3 ──────────────────────────────────────────────────────────────
@@ -804,6 +902,17 @@ void AceLm::open(const std::string& path, GpuCtx* gpu) {
 	ace_qwen3_probe(st_, "model.", &cfg_);
 	if (cfg_.vocab <= 0) throw MediaError("ace: '" + path + "' has no embedding table");
 
+	// The tied head reads a row slice of the embedding table with the fp16 GEMM, so
+	// the dtype it lands in is decided once, here: the file's own f16 / bf16 / f32
+	// for a raw table (uploaded verbatim), bf16 for every quantised or fp8 table
+	// (`ace_head_rows` decodes to bf16). Everything downstream - the slice's byte
+	// size, the plan's price for it, the GEMM's operand flags - reads these two.
+	{
+		const StTensor& tie = st_.require("model.embed_tokens.weight");
+		head_dtype_ = st_.is_raw(tie) ? tie.dtype : DType::BF16;
+		head_row_bytes_ = (u64)cfg_.hidden * (u64)dtype_size(head_dtype_);
+	}
+
 	// The window `plan_residency()` fills. Its chunk granularity is derived from
 	// the budget the same way the weight arena's is, so what the plan measures and
 	// what the accountant books are the same number (`ImageDiT::open` is the same
@@ -825,13 +934,79 @@ void AceLm::open(const std::string& path, GpuCtx* gpu) {
 		u64 b = 0;
 		for (const char* n : kMats) {
 			const StTensor& t = st_.require(p + n + ".weight");
-			b += (u64)t.numel * dtype_size(t.dtype);
+			const i64 rows = t.shape[0];
+			const i64 K = st_.logical_cols(t);
+			// What `ace_upload_linear` actually allocates: a float source keeps the
+			// file's own width, everything else lands on the engine's int8 tensorwise
+			// pair (one code per element plus one fp32 scale per output row).
+			if (weight_is_dense_float(st_, t)) {
+				const u64 esz =
+				    weight_precision_of(st_, t) == WeightPrecision::F32 ? 4u : 2u;
+				b += (u64)rows * (u64)K * esz;
+			} else {
+				b += (u64)rows * (u64)K + (u64)rows * 4;
+			}
 		}
 		// The four RMSNorm vectors (input/post = hidden, q/k_norm = head_dim) are
 		// widened to fp32 on upload (`ace_upload_vector`).
 		b += (u64)(2 * cfg_.hidden + 2 * cfg_.head_dim) * 4;
 		res_layer_bytes_ = b;
 	}
+
+	// The file ranges of every layer, in `ace_qwen3_upload_layer`'s order: what the
+	// host weight cache pins and what `generate` reads one layer ahead for. Built
+	// once, here, because the reader is open and the layer count is known.
+	layer_ranges_.assign((size_t)cfg_.n_layers, {});
+	for (i64 i = 0; i < cfg_.n_layers; i++)
+		layer_ranges_[(size_t)i] = ace_qwen3_layer_ranges(st_, "model.", i);
+
+	// The tier plan's units, in the order the decode walks them: `plan(res_n)`
+	// reads "units [0, n) are on the card", and the layers past the window are the
+	// ones re-read on every decoded token.
+	wr_.attach(&st_, "acelm", HostWeightPool::Rank::Secondary);
+	for (const auto& rs : layer_ranges_) wr_.add_unit(rs);
+}
+
+// ── the RAM tier ───────────────────────────────────────────────────────────
+//
+// One `generate` call is hundreds of decode passes and every pass runs all the
+// layers; the ones outside the VRAM window are re-read from the checkpoint each
+// time, which on a card that cannot hold the LM is the whole run (measured here
+// with the 4B LM on a 6 GB card: 36 s for fifteen decoded tokens, against 71 s
+// for the *fifty* diffusion steps that follow). The bytes do not change, so the
+// layers the card did not take are pinned in system memory once - the same
+// decision `AceDiT::ensure_host_cache` and `AvDiT`'s plan take, drawn from the
+// same process-wide ledger (host/residency.hpp).
+//
+// One wrinkle that is specific to the music chain: the LM and the DiT are two
+// working sets in one process, and a 16 GB machine cannot pin both (4.14 GB of
+// streamed LM layers + 4.5 GB of streamed DiT blocks, beside the process's own
+// pages and the OS). That used to make the pin first-come-first-served, and on
+// this box an LM that took the RAM measured *worse* than leaving it to the
+// sampler: for a 3 s request, 150.7 s end to end against 107.8 s (the sampler
+// lost 40 s of its own against the 27 s the LM saved). The answer at the time was
+// to pin only when the LM's own cyclic walk was the larger of the two - the decode
+// length crossing the sampler's step count, 50 in the shipped workflow.
+//
+// That heuristic is gone, and the reason is the ledger: the LM registers as a
+// *Secondary*, so when the DiT's plan runs (immediately after this call) the pool
+// hands these bytes back to it - the 40 s the sampler lost was the pin denying it
+// RAM, which cannot happen any more. What is left is the LM's own arithmetic: one
+// read of the streamed layers (paid once, up front) against re-reading them on
+// every decoded token, and that is a win for any decode longer than a single pass.
+// `max_new` stays in the signature because the caller has it and a future gate may
+// want it again.
+void AceLm::ensure_host_cache(i64 max_new) {
+	(void)max_new;
+	if (host_cache_ready_) return;
+	host_cache_ready_ = true;
+	if (layer_ranges_.size() != (size_t)cfg_.n_layers) return;
+	const WeightResidency::Plan& p = wr_.plan(res_n_);
+	pinned_lo_ = res_n_;
+	pinned_layers_ = p.ram_units;
+	if (getenv("PHI_ACE_LM_PLAN") || p.ram_units > 0)
+		fprintf(stderr, "[acelm] weights: %s\n",
+		        weight_plan_line(wr_, "acelm", checkpoint_precision_label(st_).c_str()).c_str());
 }
 
 i64 AceLm::vocab() const { return cfg_.vocab; }
@@ -1119,6 +1294,15 @@ void AceLm::release_resident() {
 	head_w_ = GpuAlloc{};
 	head_lo_ = head_hi_ = -1;
 	head_in_window_ = false;
+	// The RAM tier is part of the same phase. The DiT's own plan runs immediately
+	// after this (`generate`'s exit path is the last thing the text phase does), and
+	// the pool would take these bytes back anyway - dropping them here is what makes
+	// the hand-over explicit, and clearing the flag is what lets a later request
+	// ask for them again.
+	wr_.drop();
+	host_cache_ready_ = false;
+	pinned_lo_ = 0;
+	pinned_layers_ = 0;
 }
 
 void AceLm::logits(const std::vector<float>& h, i32 lo, i32 hi, std::vector<float>& out) {
@@ -1130,9 +1314,9 @@ void AceLm::logits(const std::vector<float>& h, i32 lo, i32 hi, std::vector<floa
 	// sampler scores is a row slice of `model.embed_tokens.weight` - read at the
 	// precision the checkpoint stores it in.
 	const StTensor& t = st_.require("model.embed_tokens.weight");
-	const GemmOperand op = gemm_operand_for(t.dtype);
-	const u64 row_bytes = (u64)H * dtype_size(t.dtype);
-	if (t.shape[1] != H) throw MediaError("ace lm: the tied head is not [vocab, hidden]");
+	const u64 row_bytes = head_row_bytes_;
+	if (st_.logical_cols(t) != H)
+		throw MediaError("ace lm: the tied head is not [vocab, hidden]");
 	if (head_lo_ != lo || head_hi_ != hi) {
 		// The slice goes into the **resident window's** arena, not the `keep` arena,
 		// whenever a window was planned and priced for it (see `plan_residency`). It
@@ -1150,8 +1334,7 @@ void AceLm::logits(const std::vector<float>& h, i32 lo, i32 hi, std::vector<floa
 		                           : g_->kalloc((u64)n * row_bytes);
 		const bool own = !g_->ctx->recording();
 		if (own) g_->ctx->begin();
-		g_->upload_into(head_w_, (const u8*)st_.data_of(t) + (u64)lo * row_bytes,
-		                (u64)n * row_bytes);
+		ace_head_rows(*g_, st_, t, lo, n, H, head_w_, nullptr);
 		if (own) {
 			g_->ctx->submit();
 			g_->ring->rewind();
@@ -1172,6 +1355,7 @@ void AceLm::logits(const std::vector<float>& h, i32 lo, i32 hi, std::vector<floa
 	ga.n = n;
 	ga.k = H;
 	ga.a_is_f32 = true;
+	const GemmOperand op = gemm_operand_for(head_dtype_);
 	ga.b_is_bf16 = op.b_is_bf16;
 	ga.b_is_f32 = op.b_is_f32;
 	dispatch_gemm_f16(*g_->ctx, ga);
@@ -1234,19 +1418,24 @@ std::vector<i32> AceLm::generate(const std::vector<i32>& pos_ids, const std::vec
 	plan_pre_rows_[0] = npos;
 	if (use_cfg) plan_pre_rows_[1] = nneg;
 	{
-		const StTensor& tie = st_.require("model.embed_tokens.weight");
-		const u64 head_row = (u64)H * dtype_size(tie.dtype);
-		plan_head_bytes_ =
-		    (head_lo_ == audio_start && head_hi_ == audio_end) ? 0 : (u64)n_codes * head_row;
+		plan_head_bytes_ = (head_lo_ == audio_start && head_hi_ == audio_end)
+		                       ? 0
+		                       : (u64)n_codes * head_row_bytes_;
 	}
 	plan_residency();
+	// The window is fixed, so this is the first point where the layers that will
+	// *not* be resident are known - and they are the ones the decode re-reads once
+	// per token. Decided here, before the prefill, so the very first token already
+	// reads out of system memory when the cache takes the layers at all.
+	ensure_host_cache(max_new);
 
 	AceKvCache kv[2];
 	kv[0].init(*g_, cfg_.n_layers, cap, HK);
 	if (use_cfg) kv[1].init(*g_, cfg_.n_layers, cap, HK);
 
-	// The eos row of the tied head, scored with the same GEMM.
-	const GemmOperand head_op = gemm_operand_for(st_.require("model.embed_tokens.weight").dtype);
+	// The eos row of the tied head, scored with the same GEMM (the same dense dtype
+	// `logits` uploaded - see `head_dtype_`).
+	const GemmOperand head_op = gemm_operand_for(head_dtype_);
 	auto eos_score = [&](const std::vector<float>& last) {
 		GpuAlloc x = g_->aalloc((u64)H * 4);
 		GpuAlloc y = g_->aalloc(4);
@@ -1270,13 +1459,12 @@ std::vector<i32> AceLm::generate(const std::vector<i32>& pos_ids, const std::vec
 	};
 	if (eos_row_ != eos_id) {
 		const StTensor& t = st_.require("model.embed_tokens.weight");
-		const u64 row_bytes = (u64)H * dtype_size(t.dtype);
 		if (eos_id < 0 || (i64)eos_id >= t.shape[0])
 			throw MediaError("ace lm: eos id out of range");
-		eos_w_ = g_->kalloc(row_bytes);
+		eos_w_ = g_->kalloc(head_row_bytes_);
 		const bool own = !g_->ctx->recording();
 		if (own) g_->ctx->begin();
-		g_->upload_into(eos_w_, (const u8*)st_.data_of(t) + (u64)eos_id * row_bytes, row_bytes);
+		ace_head_rows(*g_, st_, t, eos_id, 1, H, eos_w_, nullptr);
 		if (own) {
 			g_->ctx->submit();
 			g_->ring->rewind();
@@ -1325,7 +1513,8 @@ std::vector<i32> AceLm::generate(const std::vector<i32>& pos_ids, const std::vec
 			g_->ring->rewind();
 		}
 		ace_stack_multi(*g_, st_, "model.", cfg_, cfg_.n_layers, true, "model.norm.weight", 0,
-		                pass.data(), nbr, &res_arena_, &res_layers_, res_n_);
+		                pass.data(), nbr, &res_arena_, &res_layers_, res_n_, /*prefetch_next=*/true,
+		                /*first_prefetch=*/std::max(res_n_, pinned_lo_ + pinned_layers_));
 		for (i64 p = 0; p < nbr; p++)
 			hp[(size_t)p] = g_->download_f32(hid[(size_t)p], (u64)rows[(size_t)p] * (u64)H);
 	};

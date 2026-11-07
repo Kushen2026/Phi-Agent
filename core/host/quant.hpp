@@ -135,33 +135,73 @@ void quantize_convrot_w4a4(const float* w, i64 rows, i64 cols, void* packed, flo
 // `SafeTensors::dequant_rows` and the streaming requantiser — already know which
 // header/scale tensors belong to the row, so these take raw pointers and never
 // look at a file.
+//
+// Every layout below was checked against the packer that writes it
+// (comfy_kitchen's `tensor/*.py` + `backends/eager/*.py`, which are the reference
+// ComfyUI loads these checkpoints with), and `tests/precision_coverage_test.cpp`
+// decodes a fixture built by those same functions and compares value for value.
 
-// A scale that may be stored in any of the floats the checkpoints use.
+// A scale that may be stored in any of the floats the checkpoints use. A `U8`
+// tensor is an fp8 E4M3 table in a byte container — ComfyUI's own spelling
+// (`scale.view(torch.float8_e4m3fn)` in `_load_from_state_dict`) for a checkpoint
+// written before safetensors had an fp8 dtype — so it is read as fp8, not as the
+// 0..255 integers its dtype names. Reading it as integers is an order of
+// magnitude wrong, not a rounding difference.
 float scale_at(const void* p, DType dtype, i64 i);
 
-// "asym_w4a8_int8": `codes` is k/2 bytes per row, low nibble = column 2j. Each
-// nibble indexes `codebook` (16 fp32 entries, index 0..15 as stored, unsigned);
-// the value is codebook[idx] * s_channel * s_rel[g] with g = column / group.
+// ── the grouped 4-bit / 6-bit families (`asym_w4a8_int8`, `w6a8_int8`) ─────
 //
-// `codebook` is the raw 16-entry fp32 table from `weight_codebook`.
+// Both store unsigned codes, a per-group relative scale `s_rel` and a per-output-
+// row channel scale `s_channel`, and both decode onto the **INT8 grid** the packer
+// optimized `s_rel` against:
+//
+//     level(code)                      // a codebook level, or `code - 2^(bits-1)`
+//     q    = round(clamp(level * s_rel[g], -127, 127))      // the int8 operand
+//     value = q * s_channel[row] + correction[g][row]
+//
+// The clamp/round is not an optimisation on the way in: `s_rel` is chosen (by an
+// ALS fit) so the product lands on an int8 grid, and `s_channel` is that grid's
+// absmax/127. Skipping it leaves the value within half a step of the same number
+// but is *not* the weight ComfyUI reads back.
+//
+// `correction` (present only for the asymmetric recipe) is a [groups, rows] fp32
+// plane added after the channel scale; `corr_row` here is one weight row's worth
+// of it, already gathered to `groups` entries by the caller.
+
+// "asym_w4a8_int8": `codes` is k/2 bytes per row, and - exactly as for the
+// `convrot_w4a4` family - the **low** nibble is column 2j. The codes are unsigned:
+// a nibble indexes `codebook` (16 fp32 levels, index 0..15 as stored), or, when the
+// file carries no codebook, the level is `code - 8` (the uniform symmetric form).
 void dequant_codebook_int4_row(const u8* codes, i64 k, const float* codebook,
                                float s_channel, const void* s_rel_row, DType s_rel_dtype,
-                               i64 group, float* dst);
+                               i64 group, const float* corr_row, float* dst);
 
-// One three-byte group of a six-bit pack -> its four codes (code 0 in bits 0..5
-// of the first byte). The layout is shared by the decoder and the payload check.
-void unpack_6bit_triple(const u8* triple, u8 out[4]);
-
-// "w6a8_int8": six-bit codes, four per three bytes, little-endian inside the
-// triple (code 0 in bits 0..5, code 1 in bits 6..11, ...), so a row of k codes is
-// k*3/4 bytes. value = code * s_channel * s_rel[column / group].
+// "w6a8_int8": a row of k codes is k/2 + k/4 = 3k/4 bytes, in **two planes**:
+//
+//   * the first k/2 bytes hold the low nibbles, two codes per byte, low nibble =
+//     column 2j (`_pack_codes`'s `unsigned[:, 0::2] | unsigned[:, 1::2] << 4`);
+//   * the last k/4 bytes hold the top two bits of four codes each - byte b carries
+//     the bits of columns 4b..4b+3 at bit positions 0, 2, 4 and 6.
+//
+// So `code = low_nibble | (top_two_bits << 4)` is unsigned in [0, 63] and the level
+// is `code - 32` (the uniform symmetric form; 6-bit storage has no codebook).
 void dequant_packed6_row(const u8* codes, i64 k, float s_channel, const void* s_rel_row,
-                         DType s_rel_dtype, i64 group, float* dst);
+                         DType s_rel_dtype, i64 group, const float* corr_row, float* dst);
 
-// "nvfp4": E2M1 4-bit floats, two per byte (low nibble = column 2j), a per-16
-// block scale in fp8 and one global fp32 scale.
-void dequant_nvfp4_row(const u8* codes, i64 k, const void* block_scale, DType scale_dtype,
-                       float global_scale, i64 block, float* dst);
+// ── nvfp4 ─────────────────────────────────────────────────────────────────
+//
+// E2M1 4-bit floats, two per byte, with the **even** column in the *high* nibble
+// (`pack_uint4(hi_first=True)` - the opposite of the int4 families above), one
+// fp8 E4M3 scale per 16-element block and one global fp32 scale.
+//
+// The block table is not a plain [rows, k/16] matrix: it is stored in the cuBLAS
+// "blocked" (tiled) layout `to_blocked` produces, of shape
+// (roundup(rows,128), roundup((k/16)/4)*4), so a block's scale is found by
+// un-swizzling (row, block) through that permutation. `blocked_*` describe the
+// scale tensor as it is stored; `row` is the weight row.
+void dequant_nvfp4_row(const u8* codes, i64 row, i64 k, const u8* blocked, i64 blocked_rows,
+                       i64 blocked_cols, DType scale_dtype, float global_scale, i64 block,
+                       float* dst);
 
 // fp8 weights: one value per element, optional per-row or per-tensor scale.
 void dequant_fp8_row(const u8* codes, i64 k, DType dtype, float scale, float* dst);

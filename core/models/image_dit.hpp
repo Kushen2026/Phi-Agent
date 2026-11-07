@@ -83,6 +83,11 @@ struct QILayer {
 
 class ImageDiT {
 public:
+	// Destruction gives back the one allocation this class holds outside an arena:
+	// the prefix K/V cache, whose charge is booked with the accountant rather than
+	// through a `GpuArena` (see `alloc_prefix_cache`). The resident window needs no
+	// hook - `res_arena_` is a member and releases its own charge.
+	~ImageDiT();
 	void open(const std::string& path, GpuCtx* gpu);
 	// LoRA chain applied at load time (may be null). Set before open().
 	void set_loras(const LoraSet* loras) { loras_ = loras; }
@@ -260,6 +265,11 @@ private:
 	GpuCtx* g_ = nullptr;
 	ImageDitConfig cfg_;
 	SafeTensors st_;
+	// The Vram / Ram / Disk tier plan for this checkpoint (host/residency.hpp):
+	// attached and given its blocks in `probe()`, planned at the end of
+	// `plan_residency` (where the window count is final), dropped at the phase
+	// boundary with the window. Declared after `st_` so it is destroyed first.
+	WeightResidency wr_;
 	std::string path_;
 	bool open_ = false;
 	const LoraSet* loras_ = nullptr;

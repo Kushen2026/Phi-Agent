@@ -54,10 +54,50 @@
 #include <string>
 #include <vector>
 
+#include "util/base.hpp"    // path_join / path_normalize / path_exists
 #include "util/media_common.hpp"
 #include "util/json.hpp"
+#include "models/lora.hpp"
 
 namespace phi::media {
+
+// ── 共享分词器（内置，随程序走） ────────────────────────────────────────────
+//
+// Qwen-Image 2.1 / MiniMax H3 / ACE-Step 1.5 三条链的文本编码器都用同一个
+// Qwen2.5 词表：ComfyUI 给它们发的是同一份 qwen25_tokenizer，三个文件
+// （vocab.json / merges.txt / tokenizer_config.json）在三个模型目录里字节完全相同。
+// 把它们各存一份既浪费，又让「换一份词表」变成要在三个地方分别改。
+//
+// 所以这三份内置在 <agent_dir>/tokenizers/qwen2.5/ 下，随程序分发，不属于任何
+// 一个模型目录：删掉某个模型不会带走它，选一个新模型也不需要再挑一遍词表。
+// 每个角色（image_/video_/music_tokenizer_vocab 等）仍可单独覆盖——共享只是
+// 默认值，不是强制。
+//
+// Breeze-TTS-2 的 tokenizer.json 也是一份可内置的词表（33 MB 的完整 HF
+// tokenizer，自包含：model.vocab + model.merges + added_tokens）。它和 Qwen2
+// 那三个文件格式不同、互不通用，但「词表随程序走、不随模型目录走」是同一条
+// 规则，所以它也住在 <agent_dir>/tokenizers/ 下，只是各自一个子目录。
+//
+// 每个分词器角色都可能有自己的内置子目录，见 shared_tokenizer_subdir(role)。
+#define kSharedTokenizerRoot "tokenizers"
+#define kSharedQwen2Dir "tokenizers/qwen2.5"
+#define kSharedBreezeDir "tokenizers/breeze_tts_2"
+
+// <agent_dir>/<subdir> —— 调用方传 agent_dir（Phi/data）
+inline std::string shared_tokenizer_dir(const std::string& agent_dir,
+                                        const std::string& subdir = kSharedQwen2Dir) {
+	return agent_dir.empty() || subdir.empty() ? std::string() : path_join(agent_dir, subdir);
+}
+
+// 这个角色的内置子目录；"" = 该角色没有内置副本（仍从 models/ 解析）
+std::string shared_tokenizer_subdir(const std::string& role);
+
+// 一个已解析的路径是否落在某条内置分词器目录里（用于界面提示与文档）
+inline bool is_shared_tokenizer_path(const std::string& agent_dir, const std::string& p) {
+	if (agent_dir.empty() || p.empty()) return false;
+	const std::string root = path_normalize(path_join(agent_dir, kSharedTokenizerRoot));
+	return path_normalize(p).rfind(root, 0) == 0;
+}
 
 // One file the engine loads, by role.
 struct MediaModelSpec {
@@ -80,14 +120,9 @@ struct MediaModelSpec {
 	std::string tts_model;
 	std::string tts_codec;
 	std::string tts_tokenizer;
-	// The TTS config.json (beside the weights) and the codec's own config.json.
-	// Empty means "read the sibling config.json", i.e. the pre-role behaviour.
-	// They are deliberately *not* the same file: the model's config carries the
-	// backbone / text-encoder scalars at the top level, the codec's carries its own
-	// under `decoder_config`, and the two used to be conflated because the codec
-	// checkpoint sits in the model's directory.
-	std::string tts_config;
-	std::string tts_codec_config;
+	// (Breeze-TTS-2's model and codec config.json files used to be roles here. Their
+	// scalars are now compiled into the loaders, so there is no file and no
+	// selection - see core/models/breeze_tts.cpp / mimi_codec.cpp.)
 	// ── per-chain tokenizer files ──────────────────────────────────────────
 	// Three independent selections per chain, because the tokenizer needs three
 	// files and they do *not* have to sit together: `vocab.json` is the token ->
@@ -105,13 +140,20 @@ struct MediaModelSpec {
 	std::string music_tokenizer_config;
 	// LoRA chains, in application order (0..1 each). Kept apart so an image LoRA
 	// never leaks into the video DiT (or vice versa).
-	std::vector<std::string> image_loras;
-	std::vector<std::string> video_loras;
+	//
+	// Each entry is a resolved path *and* the user's strength for that slot (see
+	// `LoraRef`): the settings file stores two lists per chain - the files and
+	// their strengths - and they are read together here, so a strength can never
+	// drift onto a different file than the one it was set for. A missing strength
+	// is `kLoraStrengthDefault` (1.0), which is what every install predating the
+	// widget gets and what ComfyUI's LoraLoader defaults to.
+	std::vector<LoraRef> image_loras;
+	std::vector<LoraRef> video_loras;
 
 	bool empty() const {
 		return image_dit.empty() && video_dit.empty() && music_dit.empty() && tts_model.empty() &&
 		       image_tokenizer_vocab.empty() && video_tokenizer_vocab.empty() &&
-		       music_tokenizer_vocab.empty() && tts_config.empty() && tts_codec_config.empty();
+		       music_tokenizer_vocab.empty();
 	}
 };
 
@@ -124,7 +166,7 @@ struct MediaModelEntry {
 		                        // "music_dit" | "music_te" | "music_lm" | "music_vae" |
 		                        // "tts_model" | "tts_codec" | "tts_tokenizer" |
 		                        // "image_tokenizer_config" | "video_tokenizer_config" |
-		                        // "music_tokenizer_config" | "tts_config" | "tts_codec_config"
+		                        // "music_tokenizer_config"
 	std::string format;     // "safetensors" | "json"
 	std::string subdir;     // models/<subdir>/<file>
 	std::string file;       // target filename
@@ -153,18 +195,25 @@ std::vector<std::string> list_media_files(const std::string& models_dir);
 // (matched anywhere under `models_dir`). Returns "" when nothing matches.
 std::string resolve_media_file(const std::string& models_dir, const std::string& name);
 
-// Resolves a role to a concrete path inside `models_dir`:
+// Resolves a role to a concrete path:
 //   * the settings' selection when it names a file that is present;
-//   * otherwise the shipped default filename, looked up anywhere under
-//     `models_dir` (so a hand-placed file still works, whatever its subfolder);
+//   * otherwise the shipped default filename — the built-in shared tokenizer
+//     directory first (for the three chains' Qwen2.5 vocabulary), then anywhere
+//     under `models_dir` (so a hand-placed file still works, whatever its
+//     subfolder);
 // Returns a best-guess path when nothing exists, so the caller's error names a
 // file the user can act on.
+// `agent_dir` may be empty: the search then starts at `models_dir`, which is
+// the shape the media benchmark uses (it ships no data directory).
 std::string resolve_media_role(const JsonValue& media_settings, const std::string& role,
-                               const std::string& models_dir);
+                               const std::string& models_dir,
+                               const std::string& agent_dir = std::string());
 
-// Builds the full spec from settings.json's `tools.media` object and the models
-// directory (which the caller located with find_models_dir).
-MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::string& models_dir);
+// Builds the full spec from settings.json's `tools.media` object, the models
+// directory (which the caller located with find_models_dir), and the data
+// directory that holds the built-in tokenizers (may be empty).
+MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::string& models_dir,
+                                  const std::string& agent_dir = std::string());
 
 // The default (shipped) id for a role, "" for an unknown role.
 std::string default_media_model_id(const std::string& role);

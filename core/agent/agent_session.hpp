@@ -81,6 +81,10 @@ public:
 	void set_thinking(const std::string& level);
 	void set_system_prompt_language(const std::string& language);
 	bool isChinese() const { return settings_->system_prompt_language() != "en"; }
+	// 当前模型能不能收到图片 / 视频（设置 → API 配置 → 多模态，落在 ModelDef::input）。
+	// prompt() 用它判断附件该送媒体块还是只报文件名。
+	bool multimodal_images();
+	bool multimodal_videos();
 	void set_session_name(const std::string& name);
 	void reload_resources();
 
@@ -108,7 +112,12 @@ private:
 		const std::string& name, const JsonValue* model_ref, const std::string& thinking_level);
 	std::vector<ToolDef> build_tools();
 	ToolPolicies tool_policies() const;
-	std::string build_system_prompt_text();
+	// the running model's input modalities ("text" / "image" / "video")
+	bool model_supports(const char* modality);
+	// can_images/can_videos: the model's input modalities. The tools list in the
+	// prompt (read's snippet) says what the model can be handed, so a text-only
+	// model is never told it can look at a picture.
+	std::string build_system_prompt_text(bool can_images, bool can_videos);
 	void rebuild_system_prompt();
 	JsonValue build_snapshot();
 

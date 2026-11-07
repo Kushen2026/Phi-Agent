@@ -446,15 +446,58 @@ GpuKernel* vit_ln_kernel(ComputeContext& ctx) {
 	return ctx.pipeline("vit_ln", kVitLnCuda, "vit_ln", ShaderModel::SM5_1, 256, 1, 1);
 }
 
-// bf16 tensor -> device as bf16, straight out of the checkpoint (the fp16 GEMM
-// reads bf16 B operands directly, so there is nothing to convert).
+// A dense weight the fp16 GEMM reads as a bf16 B operand. A bf16 tensor goes
+// straight out of the checkpoint (nothing to convert); any other precision the
+// file may hold - f16, f32, fp8, or a quantised family - is decoded to bf16 here,
+// so the vision tower accepts whatever precision its checkpoint was saved in.
 GpuAlloc up_bf16(SafeTensors& st, GpuCtx& g, GpuArena& arena, const std::string& name) {
 	const StTensor& t = st.require(name);
-	if (t.dtype != DType::BF16)
-		throw MediaError("qwen3vl(visual): " + name + " is not bf16");
-	GpuAlloc a = arena.alloc(t.nbytes);
-	upload_file_range(*g.ctx, *g.ring, a.res, a.off, st, t);
+	if (t.dtype == DType::BF16) {
+		GpuAlloc a = arena.alloc(t.nbytes);
+		upload_file_range(*g.ctx, *g.ring, a.res, a.off, st, t);
+		return a;
+	}
+	std::vector<u8> bytes = st.materialize(t, DType::BF16);
+	GpuAlloc a = arena.alloc(bytes.size());
+	g.upload_into(a, bytes.data(), bytes.size());
 	return a;
+}
+
+// One row of the token embedding table, in fp32, whatever precision the
+// checkpoint stores it in.
+//
+// A raw f16 / bf16 / f32 table is read straight out of the mapping - the fast
+// path this gather has always used. fp8 and every quantised family (int8
+// tensorwise, w4a8, w6a8, nvfp4, the packed convrot int4) go a row at a time
+// through the reader, which owns each family's codebook, group scales and per-row
+// scale, so a quantised text tower gathers the same vectors it would at bf16. A
+// convrot quantisation stores the *rotated* rows and a gather has no activation to
+// rotate, so the rotation is undone afterwards (H is an involution) - the same
+// step `text_encoder_8b.cpp`'s gather takes for the same checkpoint family.
+void gather_embedding_rows(const SafeTensors& st, const StTensor& t, i64 H, const i32* ids,
+                           i64 S, i64 vocab, float* dst) {
+	if (st.is_raw(t)) {
+		const u64 row_bytes = (u64)H * (u64)dtype_size(t.dtype);
+		const u8* base = (const u8*)st.data_of(t);
+		for (i64 s = 0; s < S; s++) {
+			const i32 id = ids[(size_t)s];
+			if (id < 0 || (i64)id >= vocab) throw MediaError("qwen3vl: token id out of range");
+			convert_to_f32(t.dtype, base + (u64)id * row_bytes, dst + (size_t)s * (size_t)H,
+			               (size_t)H);
+		}
+		return;
+	}
+	for (i64 s = 0; s < S; s++) {
+		const i32 id = ids[(size_t)s];
+		if (id < 0 || (i64)id >= vocab) throw MediaError("qwen3vl: token id out of range");
+		st.dequant_rows(t, id, 1, dst + (size_t)s * (size_t)H);
+	}
+	const QuantSpec spec = st.quant_spec_of(t.name);
+	if (spec.convrot) {
+		std::vector<float> un((size_t)S * (size_t)H);
+		convrot_inverse(dst, un.data(), S, H, spec.convrot_groupsize);
+		memcpy(dst, un.data(), un.size() * sizeof(float));
+	}
 }
 
 // The ViT's LayerNorm (bias included) - see `vit_ln` above for why it is not
@@ -567,13 +610,22 @@ void TextEncoder32B::open(const std::string& path, GpuCtx* gpu) {
 	const StTensor& emb = st_.require("model.embed_tokens.weight");
 	if (emb.shape.size() != 2) throw MediaError("qwen3vl: unexpected embedding shape");
 	cfg_.vocab = emb.shape[0];
-	cfg_.hidden = emb.shape[1];
+	cfg_.hidden = st_.logical_cols(emb);   // the logical K of the embedding table
 	wdtype_ = emb.dtype;
 
 	i64 layers = 0;
 	while (st_.find("model.layers." + std::to_string(layers) + ".input_layernorm.weight")) layers++;
 	cfg_.n_layers = layers;
 	if (cfg_.out_layer >= cfg_.n_layers) cfg_.out_layer = cfg_.n_layers - 1;
+	if (cfg_.out_layer < 0) cfg_.out_layer = cfg_.n_layers - 1;
+
+	// The tier plan's units (host/residency.hpp): one per backbone layer the encode
+	// walks, in order - `plan(n)` reads "units [0, n) are on the card". A *Secondary*
+	// grant: this tower runs once per prompt, so its pins are the first thing the
+	// pool hands back when the DiT's own plan runs.
+	wr_.attach(&st_, "te32", HostWeightPool::Rank::Secondary);
+	for (i64 i = 0; i <= cfg_.out_layer; i++)
+		wr_.add_unit(weight_unit_of(st_, "model.layers." + std::to_string(i) + "."));
 
 	// Shapes, checked against the header constants the struct carries: a
 	// mismatch here would otherwise surface as a wrong-looking video.
@@ -585,13 +637,12 @@ void TextEncoder32B::open(const std::string& path, GpuCtx* gpu) {
 	if (k.shape[0] != cfg_.n_kv_heads * cfg_.head_dim)
 		throw MediaError("qwen3vl: k_proj is not 8 x 128");
 	if (g.shape[0] != cfg_.intermediate) throw MediaError("qwen3vl: gate_proj is not 25600 wide");
-	// A packed int4 pair halves the stored K; a plain int8 tensorwise weight
-	// stores one code per element, so its K is the full hidden width. The order
-	// matters: both are I8 with a `weight_scale` beside them, and only the layout
-	// (`is_plain_int8`) tells them apart - testing the dtype alone made an int8
-	// checkpoint fail the halving check with a confusing message.
-	const bool int4_ckpt = !st_.is_plain_int8(g) && g.dtype == DType::I8 &&
-	                       st_.find("model.layers.0.mlp.gate_proj.weight_scale") != nullptr;
+	// The packed `convrot_w4a4` pair stores the *packed* row width in `shape` (its
+	// consumer reads `shape[1]` as the packed K), while every other family - a plain
+	// int8, w4a8, w6a8, nvfp4, or a float - carries the logical K. The layout, not
+	// the dtype, is what tells them apart: asking "I8?" first made a plain int8
+	// checkpoint fail the halving check, and would make a w4a8 one fail it too.
+	const bool int4_ckpt = weight_precision_of(st_, g) == WeightPrecision::W4A4;
 	if (int4_ckpt) {
 		if (g.shape[1] * 2 != cfg_.hidden)
 			throw MediaError("qwen3vl: the int4 K axis does not halve");
@@ -614,24 +665,7 @@ std::vector<float> TextEncoder32B::encode(const std::vector<i32>& ids) {
 	std::vector<float> xf((size_t)S * H);
 	{
 		const StTensor& t = st_.require("model.embed_tokens.weight");
-		const size_t esz = (t.dtype == DType::BF16 || t.dtype == DType::F16) ? 2 : 4;
-		std::vector<u8> row((size_t)H * esz);
-		for (i64 s = 0; s < S; s++) {
-			const i32 id = ids[(size_t)s];
-			if (id < 0 || id >= cfg_.vocab) throw MediaError("qwen3vl: token id out of range");
-			memcpy(row.data(), (const u8*)st_.data_of(t) + (u64)id * H * esz, row.size());
-			for (i64 d = 0; d < H; d++) {
-				if (wdtype_ == DType::BF16) {
-					const u16 h = *(const u16*)&row[(size_t)d * 2];
-					xf[(size_t)(s * H + d)] = bf16_to_f32(h);
-				} else if (wdtype_ == DType::F16) {
-					const u16 h = *(const u16*)&row[(size_t)d * 2];
-					xf[(size_t)(s * H + d)] = f16_to_f32(h);
-				} else {
-					memcpy(&xf[(size_t)(s * H + d)], &row[(size_t)d * 4], 4);
-				}
-			}
-		}
+		gather_embedding_rows(st_, t, H, ids.data(), S, cfg_.vocab, xf.data());
 	}
 
 	return encode_embeds(xf.data(), S);
@@ -692,11 +726,18 @@ void TextEncoder32B::release_resident() {
 	res_n_ = 0;
 	res_bytes_ = 0;
 	res_planned_ = false;
+	// The RAM tier goes with the window: the DiT's plan runs right after this call
+	// and wants the machine's RAM for blocks it re-reads on every sampling step,
+	// while this tower has already produced its prompt's rows.
+	wr_.drop();
 }
 
 void TextEncoder32B::plan_residency(i64 S) {
 	(void)S;   // the frame is already charged: this runs after the activations exist
 	release_resident();
+	// The RAM tier is planned on the way out, from whatever `res_n_` ends up
+	// being (every early return below is a legitimate answer).
+	TierPlanOnExit tier(wr_, res_n_);
 	res_planned_ = true;
 	const i64 n_total = cfg_.out_layer + 1;
 	if (!g_ || !g_->ctx || n_total <= 0) return;
@@ -1579,24 +1620,7 @@ std::vector<float> TextEncoder32B::encode_vl_embeds(const PromptTokens& p) {
 	std::vector<float> xf((size_t)L * (size_t)H);
 	{
 		const StTensor& t = st_.require("model.embed_tokens.weight");
-		const size_t esz = (t.dtype == DType::BF16 || t.dtype == DType::F16) ? 2 : 4;
-		std::vector<u8> row((size_t)H * esz);
-		for (i64 s = 0; s < L; s++) {
-			const i32 id = p.ids[(size_t)s];
-			if (id < 0 || id >= cfg_.vocab) throw MediaError("qwen3vl: token id out of range");
-			memcpy(row.data(), (const u8*)st_.data_of(t) + (u64)id * (u64)H * esz, row.size());
-			for (i64 d = 0; d < H; d++) {
-				if (wdtype_ == DType::BF16) {
-					const u16 h = *(const u16*)&row[(size_t)d * 2];
-					xf[(size_t)(s * H + d)] = bf16_to_f32(h);
-				} else if (wdtype_ == DType::F16) {
-					const u16 h = *(const u16*)&row[(size_t)d * 2];
-					xf[(size_t)(s * H + d)] = f16_to_f32(h);
-				} else {
-					memcpy(&xf[(size_t)(s * H + d)], &row[(size_t)d * 4], 4);
-				}
-			}
-		}
+		gather_embedding_rows(st_, t, H, p.ids.data(), L, cfg_.vocab, xf.data());
 	}
 
 	// ── splice the vision rows in ─────────────────────────────────────────

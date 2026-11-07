@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -51,30 +52,28 @@ const DefaultRole kDefaults[] = {
 	{"tts_model", "breeze_tts2_bf16", "breeze_tts_2", "breeze_tts_2_bf16.safetensors"},
 	{"tts_codec", "breeze_tts2_codec", "breeze_tts_2",
 	 "breeze_tts_2_audio_tokenizer.safetensors"},
-	{"tts_tokenizer", "breeze_tts2_tokenizer", "breeze_tts_2", "tokenizer.json"},
-	// ── tokenizer files: three per chain, no chain shares another's ────────
-	// The three files the Qwen2 tokenizer reads, each its own role: the token ->
-	// id table, the BPE merge ranks, and the special-token ids. (The three chains
-	// read the same Qwen2.5 vocabulary today, but the *selection* is per-model.)
-	{"image_tokenizer_vocab", "qwen_image_tokenizer_vocab", "qwen_image_2.1", "vocab.json"},
-	{"image_tokenizer_merges", "qwen_image_tokenizer_merges", "qwen_image_2.1", "merges.txt"},
-	{"image_tokenizer_config", "qwen_image_tokenizer_config", "qwen_image_2.1",
-	 "tokenizer_config.json"},
-	{"video_tokenizer_vocab", "minimax_h3_tokenizer_vocab", "minimax_h3", "vocab.json"},
-	{"video_tokenizer_merges", "minimax_h3_tokenizer_merges", "minimax_h3", "merges.txt"},
-	{"video_tokenizer_config", "minimax_h3_tokenizer_config", "minimax_h3",
-	 "tokenizer_config.json"},
-	{"music_tokenizer_vocab", "ace15_tokenizer_vocab", "ace_step_1.5", "vocab.json"},
-	{"music_tokenizer_merges", "ace15_tokenizer_merges", "ace_step_1.5", "merges.txt"},
-	{"music_tokenizer_config", "ace15_tokenizer_config", "ace_step_1.5",
-	 "tokenizer_config.json"},
-	// Breeze-TTS-2's own config.json and the codec's own config.json. They are two
-	// different files with two different formats (the model's scalars at the top
-	// level, the codec's under `decoder_config`), which is why the codec is no
-	// longer pointed at the model's.
-	{"tts_config", "breeze_tts2_config", "breeze_tts_2", "config.json"},
-	{"tts_codec_config", "breeze_tts2_codec_config", "breeze_tts_2",
-	 "audio_tokenizer_config.json"},
+	{"tts_tokenizer", "breeze_tts2_tokenizer", "", "tokenizer.json"},
+	// ── tokenizer files: ONE built-in vocabulary, shared by every chain ──────
+	// The Qwen2 tokenizer reads three files (token -> id table, BPE merge ranks,
+	// special-token ids), and the three chains read the SAME Qwen2.5 vocabulary:
+	// ComfyUI ships one qwen25_tokenizer for all of them, and the copies under
+	// models/ were byte-identical. So the shipped default is the built-in copy in
+	// <data>/tokenizers/qwen2.5 (see shared_tokenizer_dir in the header).
+	// An empty subdir marks a role as living OUTSIDE models/- resolve_media_role
+	// tries the shared directory before its models/ search.
+	// A chain may still override any of the three with a file from models/.
+	{"image_tokenizer_vocab", "qwen_image_tokenizer_vocab", "", "vocab.json"},
+	{"image_tokenizer_merges", "qwen_image_tokenizer_merges", "", "merges.txt"},
+	{"image_tokenizer_config", "qwen_image_tokenizer_config", "", "tokenizer_config.json"},
+	{"video_tokenizer_vocab", "minimax_h3_tokenizer_vocab", "", "vocab.json"},
+	{"video_tokenizer_merges", "minimax_h3_tokenizer_merges", "", "merges.txt"},
+	{"video_tokenizer_config", "minimax_h3_tokenizer_config", "", "tokenizer_config.json"},
+	{"music_tokenizer_vocab", "ace15_tokenizer_vocab", "", "vocab.json"},
+	{"music_tokenizer_merges", "ace15_tokenizer_merges", "", "merges.txt"},
+	{"music_tokenizer_config", "ace15_tokenizer_config", "", "tokenizer_config.json"},
+	// Breeze-TTS-2's two config.json files are NOT roles: their scalars are compiled
+	// into the loaders (core/models/breeze_tts.cpp, core/models/mimi_codec.cpp), so
+	// they are no longer files beside the weights and there is nothing to select.
 };
 
 const DefaultRole* default_role(const std::string& role) {
@@ -129,6 +128,14 @@ std::vector<MediaModelEntry> media_model_catalog() {
 	    "safetensors", "ace_step_1.5", "qwen_0.6b_ace15.safetensors", "", 0);
 	add("ace15_qwen3_4b", "ACE-Step 1.5 audio-code LM Qwen3-4B (bf16)", "music_lm",
 	    "safetensors", "ace_step_1.5", "qwen_4b_ace15.safetensors", "", 0);
+	// The smaller audio-code LM of the same release. It is the same Qwen3 shape
+	// (hidden 2048 / 28 layers against the 4B's 2560 / 36) and the same code range,
+	// so `AceLm` runs it unchanged - it is just 3.7 GB instead of 8.4 GB, which on a
+	// 6 GB card is the difference between a resident window and streaming the whole
+	// LM on every decoded token. Either file is a valid `music_lm` selection; the
+	// 4B stays the shipped default (it is the one the released workflow wires).
+	add("ace15_qwen3_1.7b", "ACE-Step 1.5 audio-code LM Qwen3-1.7B (bf16)", "music_lm",
+	    "safetensors", "ace_step_1.5", "qwen_1.7b_ace15.safetensors", "", 0);
 	add("ace15_vae_bf16", "ACE-Step 1.5 audio VAE (bf16)", "music_vae", "safetensors",
 	    "ace_step_1.5", "ace_1.5_vae.safetensors", "", 0);
 	// ── tts (Breeze-TTS-2): one checkpoint + the codec + the tokenizer ──
@@ -136,8 +143,11 @@ std::vector<MediaModelEntry> media_model_catalog() {
 	    "breeze_tts_2_bf16.safetensors", "", 0);
 	add("breeze_tts2_codec", "Breeze-TTS-2 codec (Qwen3-TTS 12 Hz)", "tts_codec",
 	    "safetensors", "breeze_tts_2", "breeze_tts_2_audio_tokenizer.safetensors", "", 0);
+	// The Breeze vocabulary is built in too (<data>/tokenizers/breeze_tts_2): it is a
+	// vocabulary, not a checkpoint, and replacing it should not mean editing a model
+	// directory. The empty subdir keeps the catalogue row from pointing at models/.
 	add("breeze_tts2_tokenizer", "Breeze-TTS-2 tokenizer.json", "tts_tokenizer", "json",
-	    "breeze_tts_2", "tokenizer.json", "", 0);
+	    "", "tokenizer.json", "", 0);
 	// ── the JSON configs (selectable, never downloaded) ─────────────────────
 	// One per model: each chain's tokenizer config lives beside that chain's
 	// weights, and the Breeze model / codec configs are two different files.
@@ -159,10 +169,6 @@ std::vector<MediaModelEntry> media_model_catalog() {
 	    "music_tokenizer_merges", "json", "ace_step_1.5", "merges.txt", "", 0);
 	add("ace15_tokenizer_config", "ACE-Step 1.5 tokenizer tokenizer_config.json",
 	    "music_tokenizer_config", "json", "ace_step_1.5", "tokenizer_config.json", "", 0);
-	add("breeze_tts2_config", "Breeze-TTS-2 config.json", "tts_config", "json", "breeze_tts_2",
-	    "config.json", "", 0);
-	add("breeze_tts2_codec_config", "Breeze-TTS-2 codec config.json", "tts_codec_config",
-	    "json", "breeze_tts_2", "audio_tokenizer_config.json", "", 0);
 	return c;
 }
 
@@ -187,6 +193,27 @@ std::string default_media_model_id(const std::string& role) {
 
 bool media_model_present(const MediaModelEntry& entry, const std::string& models_dir) {
 	return path_exists(path_join(path_join(models_dir, entry.subdir), entry.file));
+}
+
+std::string shared_tokenizer_subdir(const std::string& role) {
+	// 这些角色的默认文件现在随程序走，不在任何模型目录里。两套词表格式不同
+	// （Qwen2 是 vocab/merges/config 三件套，Breeze 是一个自包含的 tokenizer.json），
+	// 所以各自一个子目录；同族的九个 Qwen 角色共用一个，三条链才真的只有一份。
+	static const struct { const char* role; const char* subdir; } kMap[] = {
+		{"image_tokenizer_vocab", kSharedQwen2Dir},
+		{"image_tokenizer_merges", kSharedQwen2Dir},
+		{"image_tokenizer_config", kSharedQwen2Dir},
+		{"video_tokenizer_vocab", kSharedQwen2Dir},
+		{"video_tokenizer_merges", kSharedQwen2Dir},
+		{"video_tokenizer_config", kSharedQwen2Dir},
+		{"music_tokenizer_vocab", kSharedQwen2Dir},
+		{"music_tokenizer_merges", kSharedQwen2Dir},
+		{"music_tokenizer_config", kSharedQwen2Dir},
+		{"tts_tokenizer", kSharedBreezeDir},
+	};
+	for (const auto& e : kMap)
+		if (role == e.role) return e.subdir;
+	return "";
 }
 
 namespace {
@@ -230,8 +257,25 @@ std::string resolve_media_file(const std::string& models_dir, const std::string&
 	return "";
 }
 
+// The three chains' Qwen2.5 files are built in under <data>/tokenizers/qwen2.5,
+// not under models/: they are vocabularies, not checkpoints, they are identical
+// for every chain, and replacing them should not mean editing three model
+// directories. This is the filename-only half of that rule - a role whose
+// shipped default has no models/ subdirectory resolves here first.
+namespace {
+// The built-in copy of `file` for `role`, or "" when nothing is installed.
+std::string shared_tokenizer_path(const std::string& agent_dir, const std::string& role,
+                                   const std::string& file) {
+	if (agent_dir.empty() || file.empty()) return "";
+	const std::string subdir = shared_tokenizer_subdir(role);
+	if (subdir.empty()) return "";
+	const std::string p = path_join(shared_tokenizer_dir(agent_dir, subdir), file);
+	return path_exists(p) ? p : std::string();
+}
+}  // namespace
+
 std::string resolve_media_role(const JsonValue& media_settings, const std::string& role,
-                               const std::string& models_dir) {
+                               const std::string& models_dir, const std::string& agent_dir) {
 	const DefaultRole* d = default_role(role);
 	if (!d) return "";
 	const JsonValue* sel = media_settings.find(role);
@@ -250,11 +294,21 @@ std::string resolve_media_role(const JsonValue& media_settings, const std::strin
 		// actionable instead of an empty string.
 		return path_join(models_dir, id);
 	}
-	// 2. an empty selection falls back to the shipped default. The role's own
-	//    subdirectory is tried first and by full path: several roles share a
-	//    filename now (`tokenizer_config.json` exists in every chain's directory),
-	//    so a bare-basename search would hand the image chain the music chain's
-	//    vocabulary - alphabetically first - and be wrong without ever saying so.
+	// 2. an empty selection falls back to the shipped default.
+	//    (a) a default with no models/ subdirectory is a built-in vocabulary: it
+	//        lives in <data>/tokenizers/qwen2.5 and never in a model directory.
+	if (d->file && d->file[0] && (!d->subdir || !d->subdir[0])) {
+		if (std::string shared = shared_tokenizer_path(agent_dir, role, d->file); !shared.empty())
+			return shared;
+		// Not installed: report the path it should be at, so the error is actionable.
+		const std::string subdir = shared_tokenizer_subdir(role);
+		if (!agent_dir.empty() && !subdir.empty())
+			return path_join(shared_tokenizer_dir(agent_dir, subdir), d->file);
+	}
+	//    (b) otherwise the role's own subdirectory, tried by full path: several
+	//        roles share a filename (`config.json` exists in every chain's
+	//        directory), so a bare-basename search would hand the image chain the
+	//        music chain's file - alphabetically first - and be wrong silently.
 	if (d->file && d->file[0]) {
 		if (d->subdir && d->subdir[0]) {
 			std::string exact = path_join(path_join(models_dir, d->subdir), d->file);
@@ -273,7 +327,8 @@ std::string resolve_media_role(const JsonValue& media_settings, const std::strin
 	return "";
 }
 
-MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::string& models_dir) {
+MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::string& models_dir,
+                                  const std::string& agent_dir) {
 	MediaModelSpec s;
 	s.image_dit = resolve_media_role(media_settings, "image_dit", models_dir);
 	s.image_te = resolve_media_role(media_settings, "image_te", models_dir);
@@ -288,7 +343,8 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 	s.music_vae = resolve_media_role(media_settings, "music_vae", models_dir);
 	s.tts_model = resolve_media_role(media_settings, "tts_model", models_dir);
 	s.tts_codec = resolve_media_role(media_settings, "tts_codec", models_dir);
-	s.tts_tokenizer = resolve_media_role(media_settings, "tts_tokenizer", models_dir);
+	s.tts_tokenizer =
+	    resolve_media_role(media_settings, "tts_tokenizer", models_dir, agent_dir);
 	// The tokenizer files: three roles per chain, resolved independently.
 	//
 	// Migration, in order of precedence:
@@ -321,12 +377,18 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 			const std::string p = resolve_media_file(models_dir, sel->as_string(""));
 			if (!p.empty()) return p;
 		}
-		// The legacy / environment directory, then the chain's own default.
+		// The built-in vocabulary is the shipped default, and it wins over a legacy
+		// directory: an install that predates the shared directory must not keep
+		// reading its own three copies just because settings.json remembers them.
+		if (std::string shared = shared_tokenizer_path(agent_dir, role, file); !shared.empty())
+			return shared;
+		// A legacy / environment directory (older settings, or the benchmark),
+		// then the chain's own default.
 		if (!legacy_dir.empty()) {
 			const std::string p = path_join(legacy_dir, file);
 			if (path_exists(p)) return p;
 		}
-		return resolve_media_role(media_settings, role, models_dir);
+		return resolve_media_role(media_settings, role, models_dir, agent_dir);
 	};
 	s.image_tokenizer_vocab = tok_role("image_tokenizer_vocab", "vocab.json");
 	s.image_tokenizer_merges = tok_role("image_tokenizer_merges", "merges.txt");
@@ -337,8 +399,7 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 	s.music_tokenizer_vocab = tok_role("music_tokenizer_vocab", "vocab.json");
 	s.music_tokenizer_merges = tok_role("music_tokenizer_merges", "merges.txt");
 	s.music_tokenizer_config = tok_role("music_tokenizer_config", "tokenizer_config.json");
-	s.tts_config = resolve_media_role(media_settings, "tts_config", models_dir);
-	s.tts_codec_config = resolve_media_role(media_settings, "tts_codec_config", models_dir);
+
 
 	// `PHI_IMAGE_DIT` / `PHI_VIDEO_DIT` (and the same for the other roles)
 	// replace the resolved path outright. The settings file is the app's, and the
@@ -355,8 +416,7 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 		                               "music_dit",    "music_te",     "music_lm",
 		                               "music_vae",    "music_tokenizer_vocab",
 		                               "music_tokenizer_merges", "music_tokenizer_config",
-		                               "tts_model",    "tts_codec",    "tts_tokenizer",
-		                               "tts_config",   "tts_codec_config"};
+		                               "tts_model",    "tts_codec",    "tts_tokenizer"};
 		std::string* slots[] = {&s.image_dit,    &s.image_te,   &s.image_vae,
 		                        &s.image_tokenizer_vocab,   &s.image_tokenizer_merges,
 		                        &s.image_tokenizer_config,  &s.video_dit,  &s.video_te,
@@ -365,8 +425,7 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 		                        &s.music_dit,    &s.music_te,   &s.music_lm,
 		                        &s.music_vae,    &s.music_tokenizer_vocab,
 		                        &s.music_tokenizer_merges,  &s.music_tokenizer_config,
-		                        &s.tts_model,    &s.tts_codec,  &s.tts_tokenizer,
-		                        &s.tts_config,   &s.tts_codec_config};
+		                        &s.tts_model,    &s.tts_codec,  &s.tts_tokenizer};
 		const size_t n_roles = sizeof(kRoles) / sizeof(kRoles[0]);
 		for (size_t i = 0; i < n_roles; i++) {
 			std::string key = "PHI_";
@@ -386,8 +445,39 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 	// input (see `core/workflows/`), and they are *resolved here*: the node's
 	// parameter is a file name, and a bare name has to become the path under
 	// models/ before it reaches the engine - the same lookup every other role uses.
-	auto read_loras = [&](const char* key, std::vector<std::string>* out) {
-		for (const JsonValue& v : media_settings[key].items()) {
+	//
+	// The strength is the second, parallel list (`image_lora_strengths` /
+	// `video_lora_strengths`), index-matched to the files: entry i of the
+	// strengths scales the file named by entry i. Where the *files* list carries a
+	// comma-joined legacy entry, that one strength covers every file the entry
+	// expands to. A missing, non-numeric or out-of-range strength falls back to
+	// `kLoraStrengthDefault`, so an install predating the widget behaves exactly
+	// as it did (and a hand-edited settings.json cannot scale a weight by a
+	// nonsense factor - the loader applies whatever it is given, so the clamp
+	// belongs here, at the edge where user input enters).
+	auto read_loras = [&](const char* key, const char* strength_key,
+	                      std::vector<LoraRef>* out) {
+		const JsonValue& files = media_settings[key];
+		const JsonValue& strengths = media_settings[strength_key];
+		size_t slot = 0;
+		for (const JsonValue& v : files.items()) {
+			// The strength for this slot, read before the file so both stay in step
+			// even when the entry turns out to expand to several files.
+			//
+			// A number is clamped to the widget's range rather than discarded: a
+			// hand-edited settings.json asking for 200 means "as strong as possible",
+			// and silently running at 1.0 would be a different request. A *missing*
+			// or non-numeric entry is the default, which is the case every install
+			// predating the widget hits.
+			float strength = kLoraStrengthDefault;
+			if (const JsonValue& sv = strengths[slot]; sv.is_number()) {
+				double d = sv.as_number(kLoraStrengthDefault);
+				if (!std::isfinite(d)) d = kLoraStrengthDefault;
+				d = std::clamp(d, (double)kLoraStrengthMin, (double)kLoraStrengthMax);
+				strength = (float)d;
+			}
+			slot++;
+
 			std::string name = v.as_string("");
 			if (name.empty()) continue;
 			// A settings entry may be a list ("a.safetensors, b.safetensors") or a
@@ -402,17 +492,25 @@ MediaModelSpec resolve_media_spec(const JsonValue& media_settings, const std::st
 				start = comma == std::string::npos ? name.size() + 1 : comma + 1;
 				if (one.empty()) continue;
 				std::string p = resolve_media_file(models_dir, one);
-				out->push_back(p.empty() ? one : p);
+				// A strength of exactly 0 is ComfyUI's "leave this file out of the
+				// chain" (its LoraLoader returns the inputs untouched), so the slot
+				// is dropped here rather than loaded and multiplied by zero: the
+				// file is then never read, and the report does not list it.
+				if (strength == 0.0f) continue;
+				out->push_back(LoraRef{p.empty() ? one : p, strength});
 			}
 		}
 	};
-	read_loras("image_loras", &s.image_loras);
-	read_loras("video_loras", &s.video_loras);
+	read_loras("image_loras", "image_lora_strengths", &s.image_loras);
+	read_loras("video_loras", "video_lora_strengths", &s.video_loras);
 	// Legacy: a settings file from a build that stored one shared list. Apply it
-	// to both chains, which is what that build did.
+	// to both chains, which is what that build did. That build had no strength
+	// widget either, so the list gets the default 1.0: the `loras_strengths` key
+	// does not exist in any version of the file, which is exactly the "missing =>
+	// default" path `read_loras` already takes.
 	if (s.image_loras.empty() && s.video_loras.empty() && media_settings.find("loras")) {
-		read_loras("loras", &s.image_loras);
-		read_loras("loras", &s.video_loras);
+		read_loras("loras", "loras_strengths", &s.image_loras);
+		read_loras("loras", "loras_strengths", &s.video_loras);
 	}
 	return s;
 }

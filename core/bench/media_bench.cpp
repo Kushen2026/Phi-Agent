@@ -591,15 +591,17 @@ int media_bench_main(const BenchOptions& opts) {
 		auto s = timer.scope("tokenizer.load");
 		try {
 			Qwen2Tokenizer tk;
-			// The image chain's own tokenizer role (each model carries its
-			// vocabulary now; there is no shared tokenizers/qwen25 any more).
+			// The image chain's tokenizer role. The shipped vocabulary is built in
+			// under data/tokenizers/qwen2.5 and shared by all three chains, so the
+			// data directory travels with the lookup.
 			const std::string models_dir = path_join(base, "models");
+			const std::string data_dir = path_join(base, "data");
 			const std::string vocab = resolve_media_role(JsonValue::object(),
-			                                             "image_tokenizer_vocab", models_dir);
+			                                             "image_tokenizer_vocab", models_dir, data_dir);
 			const std::string merges = resolve_media_role(JsonValue::object(),
-			                                              "image_tokenizer_merges", models_dir);
+			                                              "image_tokenizer_merges", models_dir, data_dir);
 			const std::string cfg = resolve_media_role(JsonValue::object(),
-			                                           "image_tokenizer_config", models_dir);
+			                                           "image_tokenizer_config", models_dir, data_dir);
 			if (vocab.empty() || !path_exists(vocab))
 				throw MediaError("no image vocab.json configured under " + models_dir);
 			tk.load(vocab, merges, cfg);
@@ -746,7 +748,11 @@ int media_bench_main(const BenchOptions& opts) {
 						// by construction, so this whole-matrix form and the
 						// slab-wise form the loader uses produce the same bytes.)
 						const QuantSpec host_spec = requant_spec_for(st, stem);
-						const i64 n = t->shape[0], k = t->shape[1];
+						// The *logical* K: a packed grouped-scale weight (`asym_w4a8_int8`,
+						// `w6a8_int8`) stores a fraction of its columns, and everything
+						// below - the host decode's destination, the loader's own `k` and
+						// the device tensors - is measured in the logical width.
+						const i64 n = t->shape[0], k = st.logical_cols(*t);
 						std::vector<float> hv((size_t)(n * k));
 						std::vector<int8_t> hq((size_t)(n * k));
 						std::vector<float> hs((size_t)n);
@@ -920,8 +926,8 @@ int media_bench_main(const BenchOptions& opts) {
 
 		// ── CUDA runtime status ──
 	//
-	// What the CUDA path is running on: the arch NVRTC compiled for, the compiler,
-	// and the kernel cache.
+	// What the CUDA path is running on: the arch NVRTC compiled for and the
+	// compiler (there is no kernel cache; every run compiles what it dispatches).
 	printf("\n-- CUDA --\n");
 	if (have_cuda) {
 		printf("  %s\n", cuda.capabilities().c_str());
@@ -983,7 +989,11 @@ int media_bench_main(const BenchOptions& opts) {
 		       (long long)frames);
 		try {
 			const std::string models_dir = path_join(base, "models");
-			MediaModelSpec spec_v = resolve_media_spec(JsonValue::object(), models_dir);
+			// data_dir carries the built-in shared tokenizer; resolved spec paths must
+			// not depend on those files for this VAE check, but the lookup signature is
+			// shared with the chains that do.
+			const std::string data_dir = path_join(base, "data");
+			MediaModelSpec spec_v = resolve_media_spec(JsonValue::object(), models_dir, data_dir);
 			std::string path = name.empty() ? spec_v.video_vae : resolve_media_file(models_dir, name);
 			if (path.empty()) path = spec_v.video_vae;
 
@@ -1065,7 +1075,8 @@ int media_bench_main(const BenchOptions& opts) {
 			GpuCtx ig{&cuda, &compute, &iwa, &iaa, &ikeep, &iring};
 
 			const std::string models_dir = path_join(base, "models");
-			MediaModelSpec spec_i = resolve_media_spec(JsonValue::object(), models_dir);
+			const std::string data_dir = path_join(base, "data");  // built-in tokenizers
+			MediaModelSpec spec_i = resolve_media_spec(JsonValue::object(), models_dir, data_dir);
 
 			// The chain is the graph the tool builds (core/graph): image_generate
 			// runs exactly this graph, so the numbers below are the tool's numbers, not
@@ -1271,7 +1282,8 @@ int media_bench_main(const BenchOptions& opts) {
 			GpuCtx vg{&cuda, &compute, &vwa, &vaa, &vkeep, &vring};
 
 			const std::string models_dir = path_join(base, "models");
-			MediaModelSpec spec_v = resolve_media_spec(JsonValue::object(), models_dir);
+			const std::string data_dir = path_join(base, "data");
+			MediaModelSpec spec_v = resolve_media_spec(JsonValue::object(), models_dir, data_dir);
 
 			// The graph the video_generate tool builds, on the tool's own arenas: a
 			// number produced by a private harness would not be the acceptance number.
@@ -1290,7 +1302,15 @@ int media_bench_main(const BenchOptions& opts) {
 			wp.ref_videos = opts.video_ref_clips;
 			wp.ref_video_audios = opts.video_ref_clip_audios;
 			wp.ref_image_size = opts.video_ref_image_size;
-			wp.loras = opts.video_loras;
+			// The chain: each file with its own strength, the pair kept together so a
+			// measurement names the slider value it ran at (as the settings do).
+			for (size_t i = 0; i < opts.video_loras.size(); i++) {
+				const float strength = i < opts.video_lora_strengths.size()
+				                           ? opts.video_lora_strengths[i]
+				                           : kLoraStrengthDefault;
+				if (strength == 0.0f) continue;   // ComfyUI: strength 0 = not in the chain
+				wp.loras.push_back(LoraRef{opts.video_loras[i], strength});
+			}
 			if (opts.video_steps > 0) wp.steps = opts.video_steps;
 			wp.model = spec_v.video_dit;
 			wp.clip = spec_v.video_te;
@@ -1552,6 +1572,11 @@ bool parse_media_bench_args(const std::vector<std::string>& args, BenchOptions* 
 			opts->video_steps = atoll(args[++i].c_str());
 		} else if (a == "--video-lora" && i + 1 < args.size()) {
 			opts->video_loras.push_back(args[++i]);
+		} else if (a == "--video-lora-strength" && i + 1 < args.size()) {
+			// Index-matched to the --video-lora list, like the settings' parallel
+			// strength list: give one per file, in the same order. A file with no
+			// strength of its own gets 1.0.
+			opts->video_lora_strengths.push_back((float)atof(args[++i].c_str()));
 		} else if (a == "--help" || a == "-h") {
 						printf("usage: phi.exe --media-bench [--quick] [--verbose] [--json out.json] [--model path]...\n"
 				       "       [--image] [--image-size WxH] [--image-prompt text] [--image-out out.png] [--image-seed N]\n"
@@ -1559,7 +1584,8 @@ bool parse_media_bench_args(const std::vector<std::string>& args, BenchOptions* 
 				       "       [--image-negative text] [--image-cfg F]\n"
 				       "       [--video] [--video-size WxH] [--video-frames N] [--video-prompt text] [--video-out out.mp4] [--video-seed N]\n"
 				       "       [--video-ref path]... [--video-ref-clip path]... [--video-ref-clip-audio path]...\n"
-				       "       [--video-ref-audio path]... [--video-ref-image-size match|max] [--video-lora path]...\n");
+				       "       [--video-ref-audio path]... [--video-ref-image-size match|max]\n"
+				       "       [--video-lora path]... [--video-lora-strength F]...\n");
 			return false;
 		} else {
 			if (error) *error = "unknown --media-bench option: " + a;

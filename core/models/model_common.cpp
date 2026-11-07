@@ -131,6 +131,43 @@ u64 GpuCtx::upload_file_into(const GpuAlloc& a, const SafeTensors& st, const StT
 	return bytes;
 }
 
+u64 GpuCtx::upload_tensor_tiered(const GpuAlloc& a, const SafeTensors& st, const StTensor& t,
+                                 const void* fallback) {
+	const u64 bytes = t.nbytes;
+	if (bytes == 0) return 0;
+	// The VRAM tier never reaches this function: a resident block is not uploaded
+	// again. What is left is RAM (this cache) and the checkpoint.
+	//
+	// A *page-locked* copy first: the driver can read it where it lies, so the whole
+	// staging hop - memcpy into the ring, then one copy command - disappears, which
+	// is the difference `upload_file_into`'s zero-copy branch already exploits for
+	// the streaming chains.
+	if (st.pinned_dma_at(t.offset, (size_t)bytes)) return upload_file_into(a, st, t);
+	const PinnedBytes pin = st.pinned_span(t.offset, bytes);
+	const void* src = pin ? pin.data() : fallback;
+	if (!src) return upload_file_into(a, st, t);
+	// The same bound `upload_file_into` uses: the ring never wraps a single copy, so
+	// a tensor larger than half an empty ring is staged in pieces rather than
+	// refused.
+	const u64 max_chunk = std::max<u64>((ring->size() / 2) & ~255ull, 1ull << 20);
+	const bool own = !ctx->recording();
+	if (own) ctx->begin();
+	u64 done = 0;
+	while (done < bytes) {
+		const u64 n = std::min(max_chunk, bytes - done);
+		u64 ring_off = 0;
+		void* host = ring->reserve(n, &ring_off);
+		memcpy(host, (const u8*)src + done, (size_t)n);
+		upload_range_staged(*ctx, *ring, a.res, a.off + done, ring_off, n);
+		done += n;
+	}
+	if (own) {
+		ctx->submit();
+		ring->rewind();
+	}
+	return bytes;
+}
+
 GpuAlloc GpuCtx::upload_raw(const void* src, u64 bytes, bool to_weights_arena) {
 	GpuAlloc a = to_weights_arena ? walloc(bytes) : aalloc(bytes);
 	upload_into(a, src, bytes);
@@ -210,7 +247,10 @@ GpuAlloc GpuCtx::upload_tensor(const SafeTensors& st, const StTensor& t, DType a
 	// against 3.23 s).
 	if (st.is_raw(t) && t.dtype == as) {
 		GpuAlloc a = walloc(t.nbytes);
-		upload_range(*ctx, *ring, a.res, a.off, st.data_of(t), t.nbytes);
+		// The mapping is the *fallback*, not the source: when the tier plan has this
+		// tensor in system memory the upload reads that copy instead (and, page-locked,
+		// as a direct DMA) - the two paths above and below are unchanged.
+		upload_tensor_tiered(a, st, t, st.data_of(t));
 		return a;
 	}
 	std::vector<u8> bytes = st.materialize(t, as);
@@ -229,8 +269,10 @@ namespace {
 std::vector<float> dequant_weight_f32(const SafeTensors& st, const std::string& base, i64 n,
                                       i64 k) {
 	const StTensor& t = st.require(base + ".weight");
-	if (t.dtype == DType::I4 && !st.weight_layout(t.name).known_family)
-		throw MediaError("'" + base + "' is int4; it needs the int4 loader");
+	// No family is special-cased here any more: `materialize` decodes every one the
+	// reader understands, including a bare packed int4 (`I4` with no comfy_quant
+	// sidecar), so a weight that reaches this point is decoded whatever the file
+	// holds. A shape mismatch below is the honest error for anything it cannot.
 	std::vector<u8> bytes = st.materialize(t, DType::F32);
 	std::vector<float> out((size_t)(n * k));
 	const size_t have = bytes.size() / 4;
@@ -456,6 +498,30 @@ private:
 
 }  // namespace
 
+// Empty the requantised-weight cache (see the declaration in model_common.hpp for
+// why it is dropped at all). Its entries are per (mapping, tensor name) and hold
+// decoded int8 weights plus their per-row scales, so they describe the checkpoint a
+// run opened; when that run is over there is nothing left for them to answer.
+void drop_requant_cache() {
+	RequantCache& c = requant_cache();
+	std::lock_guard<std::mutex> lk(c.mu);
+	c.entries.clear();
+	c.order.clear();
+	c.bytes = 0;
+}
+
+size_t requant_cache_entries() {
+	RequantCache& c = requant_cache();
+	std::lock_guard<std::mutex> lk(c.mu);
+	return c.entries.size();
+}
+
+u64 requant_cache_bytes() {
+	RequantCache& c = requant_cache();
+	std::lock_guard<std::mutex> lk(c.mu);
+	return c.bytes;
+}
+
 // Identifies a LoRA chain in a folded-weight cache key. A folded matrix is a
 // function of (checkpoint, module, chain), and the chain is immutable for the
 // life of a run, so its address is the identity - the same thing the node layer
@@ -467,59 +533,31 @@ std::string lora_cache_tag(const LoraSet* lora) {
 	return std::string(buf);
 }
 
-u64 host_cache_budget_bytes() {
-	if (const char* e = getenv("PHI_DIT_HOSTCACHE_MB")) {
-		const long v = strtol(e, nullptr, 10);
-		return v <= 0 ? 0 : (u64)v << 20;
-	}
-	// Two thirds of *physical* memory, capped at 9 GB - and never more than what is
-	// *free* right now minus a reserve for the process that is asking.
-	//
-	// The free-memory term is the one that keeps a 16 GB box alive. `pin_range`
-	// commits RAM the process cannot give back (a pinned range is not reclaimable),
-	// while a checkpoint's own pages are clean and evictable, so a budget derived
-	// from installed memory alone can pin the machine out of memory: measured here,
-	// a 16 GB box with 9 GB of physical-memory budget pinned 8.97 GB for the H3
-	// chain and the *next* allocation was answered with an OOM kill - the process
-	// died mid-run with no error at all. The reserve keeps room for the engine's
-	// own host buffers, the WebView2 UI and the file pages the streaming reads
-	// still need.
-	//
-	// Basing this on installed memory rather than on the momentary free count is
-	// deliberate. A block format has no raw form the streamer can upload: every
-	// non-resident matrix is decoded, rotated and requantised, and the only thing
-	// that keeps that off the critical path of *every* sampling step is this cache.
-	// But the decode itself reads the entire file, so by the time the first block has
-	// been cached the page cache has eaten the machine - and a free-memory budget
-	// then collapses to a fraction of a gigabyte exactly when the cache is needed
-	// most, so the loop re-derives the weights it derived one step ago. Physical
-	// memory does not move, so this budget does not either; the file pages a large
-	// budget displaces are clean and reclaimable, and the OS evicts them to make
-	// room for the cache that is actually re-read.
-	const u64 total = SafeTensors::host_total_bytes();
-	u64 want = total / 3 * 2;
-	const u64 cap = 9ull << 30;
-	if (want > cap) want = cap;
-	// The reserve scales with the machine the way the VRAM policy's does: a small
-	// box needs a meaningful fraction back, a large one a bounded amount.
-	u64 reserve = total / 8;
-	if (reserve < (1ull << 30)) reserve = 1ull << 30;
-	if (reserve > (4ull << 30)) reserve = 4ull << 30;
-	const u64 free_now = SafeTensors::host_free_bytes();
-	if (free_now > reserve && want > free_now - reserve) want = free_now - reserve;
-	return want & ~((u64)4095);
-}
+// The budget itself now lives with the tier policy (host/residency.hpp), because
+// it stopped being a per-model number: every checkpoint in one generation draws
+// its RAM tier from one process-wide ledger (HostWeightPool), and a model that
+// computed "two thirds of the machine" for itself would hand itself a share the
+// next model also claims. These two are kept as the documented entry points the
+// model code reads - the pool calls the same functions to decide its budget, so
+// there is still exactly one formula.
+u64 host_cache_budget_bytes() { return host_weight_budget_bytes(); }
 
-// The same reserve, exposed so a *pin loop* can stop while it still has room:
-// `host_cache_budget_bytes()` is decided once per weight set and stays put (see
-// the note above), while the pinning itself proceeds block by block and must not
-// spend the last free page on the machine.
-u64 host_cache_reserve_bytes() {
-	const u64 total = SafeTensors::host_total_bytes();
-	u64 reserve = total / 8;
-	if (reserve < (1ull << 30)) reserve = 1ull << 30;
-	if (reserve > (4ull << 30)) reserve = 4ull << 30;
-	return reserve;
+u64 host_cache_reserve_bytes() { return host_weight_reserve_bytes(); }
+
+// What the *decoded-weight* cache (`requant_cache` below) may hold: the machine's
+// budget less what the pinned tier already holds.
+//
+// The two host caches hold the same weights in different forms - a pinned range is
+// the file's own encoding, this one is the int8 pair a folded or packed weight had
+// to be re-derived into - and they used to each plan against the whole machine,
+// which on a 16 GB box is how a LoRA chain's decode filled RAM the tier had
+// already been promised. The tier goes first because it is planned before the
+// first forward and helps every step; the decode cache takes what is left and
+// falls back to its slab path when that is nothing.
+static u64 requant_cache_budget_bytes() {
+	const u64 all = host_cache_budget_bytes();
+	const u64 pinned = host_weight_pool().held();
+	return all > pinned ? all - pinned : 0;
 }
 
 // ── the native grouped-scale decode ───────────────────────────────────────
@@ -581,23 +619,33 @@ bool w4a8_plan_of(const SafeTensors& st, const StTensor& t, W4a8Plan* out) {
 		case DType::F16:
 		case DType::BF16:
 		case DType::F8_E4M3:
-		case DType::F8_E5M2: break;
+		case DType::F8_E5M2:
+		// A byte container holding fp8: the same table as E4M3 (see `RelDType`).
+		case DType::U8: break;
 		default: return false;
 	}
+	// The kernel decodes the levels and applies the two scales; it has no way to add
+	// the asymmetric recipe's per-group *offset* plane, so a checkpoint that carries
+	// one goes to the generic path (`SafeTensors::dequant_rows`, which does).
+	if (L.correction) return false;
 
 	const i64 n = t.shape[0], k = t.shape[1];
 	const i64 group = L.group > 0 ? L.group : (i64)L.spec.group_size;
 	const i64 codes_per_group = six ? 4 : 2;
 	if (group <= 0 || group % codes_per_group != 0 || k % group != 0) return false;
-	const i64 need = (group / codes_per_group) * (k / group);
+	// The packed row's own width: k/2 bytes at four bits, and k/2 + k/4 at six
+	// (low-nibble plane then top-2-bit plane).
+	const i64 need = six ? (k / 2 + k / 4) : (k / 2);
 	if (need <= 0 || t.row_bytes_stored < (u64)need) return false;
 	if (L.rel_scale->shape[0] != n || L.rel_scale->shape[1] != k / group) return false;
 
 	if (six) {
-		// The six-bit family has no codebook: the code *is* the value.
+		// Six-bit storage is uniform and symmetric: it has no codebook.
 		if (L.codebook) return false;
 	} else {
-		if (!L.codebook || L.codebook->dtype != DType::F32 || L.codebook->numel != 16)
+		// The codebook is optional: without one the family is the uniform symmetric
+		// form and the kernel decodes `code - 8`, exactly as the host does.
+		if (L.codebook && (L.codebook->dtype != DType::F32 || L.codebook->numel != 16))
 			return false;
 	}
 	// The channel scale is read as one fp32 per row. A one-entry table is
@@ -615,6 +663,7 @@ bool w4a8_plan_of(const SafeTensors& st, const StTensor& t, W4a8Plan* out) {
 		case DType::BF16: rdt = RelDType::BF16; break;
 		case DType::F8_E4M3: rdt = RelDType::F8_E4M3; break;
 		case DType::F8_E5M2: rdt = RelDType::F8_E5M2; break;
+		case DType::U8: rdt = RelDType::U8_E4M3; break;
 		default: break;
 	}
 	out->layout = six ? CodeLayout::Packed6 : CodeLayout::Nibble4;
@@ -774,7 +823,7 @@ DenseUpload upload_dense_linear(GpuCtx& g, const SafeTensors& st, const std::str
 		throw MediaError("dense linear: '" + base + ".weight' is not a 2-D matrix");
 	DenseUpload out;
 	out.n = t.shape[0];
-	out.k = t.shape[1];
+	out.k = st.logical_cols(t);   // the logical K, not a packed width
 	out.dtype = dense_target_dtype(st, t);
 	const u64 esz = (u64)dtype_size(out.dtype);
 	out.w = arena.alloc((u64)out.n * (u64)out.k * esz);
@@ -787,7 +836,7 @@ DenseUpload load_dense_linear(GpuCtx& g, const SafeTensors& st, const std::strin
 	const StTensor& t = st.require(base + ".weight");
 	if (t.shape.size() != 2)
 		throw MediaError("dense linear: '" + base + ".weight' is not a 2-D matrix");
-	const i64 n = t.shape[0], k = t.shape[1];
+	const i64 n = t.shape[0], k = st.logical_cols(t);
 	const DType dt = dense_target_dtype(st, t);
 	GpuArena& arena = into ? *into : *g.wa;
 	if (!lora || !lora->touches(base)) return upload_dense_linear(g, st, base, arena);
@@ -824,9 +873,9 @@ DenseUpload load_dense3_linear(GpuCtx& g, const SafeTensors& st, const std::stri
 	const char* bases[3] = {base_q.c_str(), base_k.c_str(), base_v.c_str()};
 	const StTensor* ts[3] = {&st.require(base_q + ".weight"), &st.require(base_k + ".weight"),
 	                         &st.require(base_v + ".weight")};
-	const i64 k = ts[0]->shape[1];
+	const i64 k = st.logical_cols(*ts[0]);
 	for (int i = 0; i < 3; i++)
-		if (ts[i]->shape.size() != 2 || ts[i]->shape[1] != k)
+		if (ts[i]->shape.size() != 2 || st.logical_cols(*ts[i]) != k)
 			throw MediaError(std::string("dense3 linear: shape mismatch at ") + bases[i]);
 	const DType dt = dense_target_dtype(st, *ts[0]);
 	for (int i = 1; i < 3; i++)
@@ -875,7 +924,10 @@ QuantLinear load_quant_linear(GpuCtx& g, const SafeTensors& st, const std::strin
 	const StTensor& t = st.require(base + ".weight");
 	if (t.shape.size() != 2)
 		throw MediaError("load_quant_linear: '" + base + ".weight' is not a 2-D matrix");
-	const i64 n = t.shape[0], k = t.shape[1];
+	// The *logical* K (`shape[1]` for every family whose header was rewritten, and
+	// twice it for the I8-backed convrot int4, which keeps its packed width). The
+	// GEMM's K and the activation width are the logical one for every path below.
+	const i64 n = t.shape[0], k = st.logical_cols(t);
 	// A float source keeps its own precision and runs the dense GEMM: this is the
 	// conversion that used to happen here (float -> int8 requantise) and must not.
 	if (weight_is_dense_float(st, t)) {
@@ -906,7 +958,9 @@ QuantLinear load_quant_linear(GpuCtx& g, const SafeTensors& st, const std::strin
 		// from cached pages, while routing it through `read_file` measured 7.08 s a
 		// step instead of 3.23 s (see `GpuCtx::upload_tensor`).
 		q.w = alloc(t.nbytes);
-		upload_range(*g.ctx, *g.ring, q.w.res, q.w.off, st.data_of(t), t.nbytes);
+		// The tier decides the source (see `upload_tensor_tiered`): pinned system
+		// memory when the plan holds this block, the mapping otherwise.
+		g.upload_tensor_tiered(q.w, st, t, st.data_of(t));
 		std::vector<float> s = tensor_to_f32(st, st.require(base + ".weight_scale"));
 		if ((i64)s.size() != n) throw MediaError("weight_scale length mismatch: " + base);
 		q.scale = alloc((u64)s.size() * 4);
@@ -985,7 +1039,8 @@ QuantLinear load_quant_linear(GpuCtx& g, const SafeTensors& st, const std::strin
 		}
 	}
 	const bool cacheable =
-	    host_cache_budget_bytes() > 0 && (u64)n * (u64)k + (u64)n * 4 <= host_cache_budget_bytes();
+	    requant_cache_budget_bytes() > 0 &&
+	    (u64)n * (u64)k + (u64)n * 4 <= requant_cache_budget_bytes();
 	if (cacheable) {
 		// The whole matrix fits the host budget - the common case, and the one every
 		// streamed block takes. Requantise it once, in parallel, keep it, then upload.
@@ -1007,7 +1062,7 @@ QuantLinear load_quant_linear(GpuCtx& g, const SafeTensors& st, const std::strin
 			g.ring->rewind();
 		}
 		requant_cache().put(&st, base, n, k, whole_q.data(), whole_q.size(), whole_s.data(),
-		                    whole_s.size() * 4, host_cache_budget_bytes());
+		                    whole_s.size() * 4, requant_cache_budget_bytes());
 		return q;
 	}
 	// Larger than the host budget: stream it a slab at a time and keep nothing, so
@@ -1045,7 +1100,7 @@ I8Upload upload_quant_linear_i8(GpuCtx& g, const SafeTensors& st, const std::str
 		throw MediaError("upload_quant_linear_i8: '" + base + ".weight' is not a 2-D matrix");
 	I8Upload out;
 	out.n = t.shape[0];
-	out.k = t.shape[1];
+	out.k = st.logical_cols(t);   // see `load_quant_linear` on why this is the logical K
 	// A grouped-scale checkpoint is decoded on the device (see w4a8_plan_of).
 	//
 	// The `lora` argument does not divert this path: a delta is never folded into a
@@ -1123,7 +1178,7 @@ I8Upload upload_quant_linear_i8(GpuCtx& g, const SafeTensors& st, const std::str
 		const u64 slab = slab_rows(out.n, out.k);
 		const u64 nk = (u64)out.n * (u64)out.k;
 		const bool cacheable =
-		    host_cache_budget_bytes() > 0 && nk + (u64)out.n * 4 <= host_cache_budget_bytes();
+		    requant_cache_budget_bytes() > 0 && nk + (u64)out.n * 4 <= requant_cache_budget_bytes();
 		std::vector<int8_t> whole_q;
 		std::vector<float> whole_s;
 		if (cacheable) {
@@ -1156,7 +1211,7 @@ I8Upload upload_quant_linear_i8(GpuCtx& g, const SafeTensors& st, const std::str
 		}
 		if (cacheable)
 			requant_cache().put(&st, key, out.n, out.k, whole_q.data(), whole_q.size(),
-			                    whole_s.data(), whole_s.size() * 4, host_cache_budget_bytes());
+			                    whole_s.data(), whole_s.size() * 4, requant_cache_budget_bytes());
 		return out;
 	}
 	out.w = arena.alloc((u64)out.n * (u64)out.k);
@@ -1180,8 +1235,8 @@ I8Upload upload_quant_linear_i8(GpuCtx& g, const SafeTensors& st, const std::str
 	// cached, so a streamed block's second step is a copy; one that does not is
 	// streamed a slab at a time and kept nowhere, because it would not fit anyway.
 	const bool cacheable =
-	    host_cache_budget_bytes() > 0 &&
-	    (u64)out.n * (u64)out.k + (u64)out.n * 4 <= host_cache_budget_bytes();
+	    requant_cache_budget_bytes() > 0 &&
+	    (u64)out.n * (u64)out.k + (u64)out.n * 4 <= requant_cache_budget_bytes();
 	if (cacheable) {
 		std::vector<int8_t> whole_q((size_t)(out.n * out.k));
 		std::vector<float> whole_s((size_t)out.n);
@@ -1201,7 +1256,7 @@ I8Upload upload_quant_linear_i8(GpuCtx& g, const SafeTensors& st, const std::str
 			g.ring->rewind();
 		}
 		requant_cache().put(&st, base, out.n, out.k, whole_q.data(), whole_q.size(),
-		                    whole_s.data(), whole_s.size() * 4, host_cache_budget_bytes());
+		                    whole_s.data(), whole_s.size() * 4, requant_cache_budget_bytes());
 		return out;
 	}
 	{
@@ -1363,9 +1418,9 @@ QuantLinear load_quant3_linear(GpuCtx& g, const SafeTensors& st, const std::stri
 	const char* bases[3] = {base_q.c_str(), base_k.c_str(), base_v.c_str()};
 	const StTensor* ts[3] = {&st.require(base_q + ".weight"), &st.require(base_k + ".weight"),
 	                         &st.require(base_v + ".weight")};
-	const i64 k = ts[0]->shape[1];
+	const i64 k = st.logical_cols(*ts[0]);
 	for (int i = 0; i < 3; i++) {
-		if (ts[i]->shape.size() != 2 || ts[i]->shape[1] != k)
+		if (ts[i]->shape.size() != 2 || st.logical_cols(*ts[i]) != k)
 			throw MediaError(std::string("load_quant3_linear: shape mismatch at ") + bases[i]);
 	}
 	bool raw_int8 = true;
@@ -1470,8 +1525,8 @@ QuantLinear load_quant3_linear(GpuCtx& g, const SafeTensors& st, const std::stri
 			return q;
 		}
 	}
-	const bool cacheable = host_cache_budget_bytes() > 0 &&
-	                       (u64)q.n * (u64)k + (u64)q.n * 4 <= host_cache_budget_bytes();
+	const bool cacheable = requant_cache_budget_bytes() > 0 &&
+	                       (u64)q.n * (u64)k + (u64)q.n * 4 <= requant_cache_budget_bytes();
 	if (cacheable) {
 		std::vector<int8_t> whole_q((size_t)(q.n * k));
 		std::vector<float> whole_s((size_t)q.n);
@@ -1495,7 +1550,7 @@ QuantLinear load_quant3_linear(GpuCtx& g, const SafeTensors& st, const std::stri
 			}
 		}
 		requant_cache().put(&st, key, q.n, k, whole_q.data(), whole_q.size(), whole_s.data(),
-		                    whole_s.size() * 4, host_cache_budget_bytes());
+		                    whole_s.size() * 4, requant_cache_budget_bytes());
 		return q;
 	}
 	{
@@ -1520,29 +1575,6 @@ QuantLinear load_quant3_linear(GpuCtx& g, const SafeTensors& st, const std::stri
 		}
 	}
 	return q;
-}
-
-// The spec to requantise a *decoded* weight with.
-//
-// The int8 GEMMs were written against the rotated basis: on disk a weight is
-// `rot(W)` and the activation is rotated at run time, so the contraction comes out
-// in the original basis. A checkpoint whose sidecar says `"convrot": true`
-// (every shipped `*_int8_convrot`, `*_w4a8`, `*_w6a8`) therefore already stores
-// exactly the bytes the kernels want, and the decode hands them back in that same
-// basis - so requantising them must only rescale, not rotate. Rotating again is
-// not a rounding difference: rot() is an involution, so the second application
-// returns the matrix to its *original* basis, i.e. it produces a different
-// matrix (energy-preserving, so it looks harmless, and then the model answers
-// with noise). Only a source that is *not* rotated - a plain float checkpoint, or
-// an int8 one without the flag - has to be rotated on the way in.
-QuantSpec requant_spec_for(const SafeTensors& st, const std::string& base) {
-	QuantSpec spec = default_int8_spec();
-	const StTensor* t = st.find(base + ".weight");
-	if (t) {
-		const SafeTensors::WeightLayout L = st.weight_layout(t->name);
-		if (L.spec.valid && L.spec.convrot) spec.convrot = false;
-	}
-	return spec;
 }
 
 // ── the runtime LoRA correction ────────────────────────────────────────────

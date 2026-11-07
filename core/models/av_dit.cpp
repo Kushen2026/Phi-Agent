@@ -167,6 +167,11 @@ struct Layout {
 
 struct Impl {
 	SafeTensors st;
+	// The Vram / Ram / Disk tier plan for this checkpoint (host/residency.hpp).
+	// Registered in `open()` from the block and refiner ranges below, planned on
+	// the first forward() once the resident window is final, and dropped with
+	// `release_weights()`. Declared after `st` so it is destroyed first.
+	WeightResidency wr;
 	DenseW dense;
 	std::vector<BlockW> res;   // resident blocks [0, res_n)
 	i64 res_n = 0;
@@ -207,7 +212,9 @@ struct Impl {
 	std::vector<std::vector<std::pair<u64, u64>>> block_ranges;
 	// The same for the token refiner's two blocks, which re-stream on every step.
 	std::vector<std::pair<u64, u64>> refiner_ranges;
-	// The host cache is filled once per weight set, on the first forward().
+	// Filled once per weight set, on the first forward(): the tier plan for the
+	// blocks the window did not take. Reset by `release_weights()` so a second
+	// generation re-plans against the card and the pool it then really has.
 	bool host_cache_ready = false;
 	// LoRA chain to fold into the block matrices at load time (may be null).
 	const LoraSet* lora = nullptr;
@@ -518,14 +525,19 @@ GpuAlloc up_f32(SafeTensors& st, const std::string& name, GpuCtx& g, GpuArena& a
 	return a;
 }
 
-// raw bytes: bf16/f16/f32 weights the fp16 GEMM reads directly. When a helper
-// tensor arrives in another precision it is materialised to `as` (the
-// dtype its consumer reads), which never changes the safetensors behaviour: a
-// raw tensor is uploaded verbatim whatever `as` says.
+// A dense weight the fp16 GEMM reads directly, in the dtype `as` its consumer
+// reads (bf16 for the refiner, f16 for the adaLN projection, f32 for the patch
+// and output heads). A tensor the file *already* stores in `as` is uploaded
+// verbatim off the checkpoint - the zero-conversion path. Anything else is
+// decoded to `as`: a raw tensor in another float width (an f16 checkpoint's
+// weight feeding a bf16 GEMM), fp8 (decoded to f16 by the caller's `as`), or one
+// of the quantised families. Uploading a raw tensor "verbatim whatever `as`
+// says" was wrong for exactly that first case - a differently-widthed float
+// checkpoint fed the GEMM operands it would misread.
 GpuAlloc up_raw(SafeTensors& st, const std::string& name, GpuCtx& g, GpuArena& arena,
                 DType as = DType::F16) {
 	const StTensor& t = st.require(name);
-	if (st.is_raw(t)) {
+	if (st.is_raw(t) && t.dtype == as) {
 		GpuAlloc a = arena.alloc((u64)t.numel * (u64)dtype_size(t.dtype));
 		upload_chunked_file(g, a, st, t);
 		return a;
@@ -562,7 +574,7 @@ QuantLinear load_linear_pair(SafeTensors& st, GpuCtx& g, GpuArena& arena,
 	if (st.is_plain_int8(t)) {
 		QuantLinear q;
 		q.n = t.shape[0];
-		q.k = t.shape[1];
+		q.k = st.logical_cols(t);
 		q.w = arena.alloc(t.nbytes);
 		upload_chunked_file(g, q.w, st, t);
 		q.scale = up_scale(st, base + ".weight_scale", g, arena);
@@ -938,6 +950,41 @@ void gemm_dense(GpuCtx& g, const GpuAlloc& a, const GpuAlloc& b, const GpuAlloc&
 	dispatch_gemm_f16(*g.ctx, ga);
 }
 
+// ── the modulation table's decoded tensors ─────────────────────────────────
+//
+// One entry per (checkpoint mapping, tensor prefix): the fp16 rank-8 operand pair
+// behind `build_mod`, decoded to fp32. It exists because the pair is re-read fifty
+// times a step (once per block, plus the final layer) out of a 20 GB file that is
+// being streamed through at the same time: reading it through the mapping is a page
+// fault per 4 KB and evicts the streaming window, and converting the same 193k
+// halves once per call buys nothing. The decoded 3.5 MB per block is ~175 MB for the
+// whole 50-block stack, against the ~7 GB of streamed weights the same run already
+// holds in host RAM.
+//
+// Keyed on the reader as well as the name: two models can each have a
+// `blocks.0.adaln_proj.linear`, and a cache that conflated them would feed one model
+// the other's modulation.
+//
+// Like every other host-side cache in this engine it lives for one *generation*:
+// `drop_modulation_cache()` empties it when a run ends, because the media tools drop
+// the checkpoint that run opened - which is also the only thing that could make an
+// entry stale, since a later model may well be mapped at the same address.
+namespace {
+
+using ModPair = std::pair<std::vector<float>, std::vector<float>>;
+
+struct ModulationCache {
+	std::mutex mu;
+	std::map<std::pair<const void*, std::string>, ModPair> entries;
+};
+
+ModulationCache& modulation_cache() {
+	static ModulationCache c;
+	return c;
+}
+
+}  // namespace
+
 // ── the modulation table, evaluated on the host ────────────────────────────
 //
 // out[(m*modalities + j)*chunks + c] is a hidden-wide vector: modality j,
@@ -946,28 +993,15 @@ void gemm_dense(GpuCtx& g, const GpuAlloc& a, const GpuAlloc& b, const GpuAlloc&
 // modality stride of chunks*hidden and the chunk stride of hidden.
 void build_mod(SafeTensors& st, const std::string& prefix, i64 modalities, const Layout& ly,
                i64 hidden, std::vector<float>& out) {
-	// ── the rank-8 operand pair, decoded once per checkpoint ────────────
-	//
-	// `build_mod` runs once per block per step - fifty times a step, plus the
-	// final layer - and the two tensors behind it are 1.7 MB of fp16 sitting at
-	// an arbitrary offset in a 20 GB file that is being streamed through at the
-	// same time. Reading them through the mapping on every call is a page fault
-	// per 4 KB (0.6-0.9 GB/s measured, and it evicts the streaming window), and
-	// converting 193k halves to fp32 each time buys nothing: it is the same
-	// 1.7 MB all run. Decoded once and kept, it is 3.5 MB per block - ~175 MB for
-	// the whole 50-block stack, against the ~7 GB of streamed weights the same
-	// run already holds in host RAM.
-	//
-	// Keyed on the reader as well as the name: two models can each have a
-	// `blocks.0.adaln_proj.linear`, and a cache that conflated them would feed one
-	// model the other's modulation.
-	static std::map<std::pair<const void*, std::string>, std::pair<std::vector<float>, std::vector<float>>> cache;
-	static std::mutex cache_mu;
+	// The rank-8 operand pair, decoded once per (checkpoint, prefix) - see the
+	// note on `modulation_cache()` above for why it is kept at all and for how
+	// long.
 	const std::vector<float>* Wp = nullptr;
 	const std::vector<float>* Bp = nullptr;
 	{
-		std::lock_guard<std::mutex> lk(cache_mu);
-		auto& e = cache[{&st, prefix}];
+		ModulationCache& mc = modulation_cache();
+		std::lock_guard<std::mutex> lk(mc.mu);
+		auto& e = mc.entries[{&st, prefix}];
 		if (e.first.empty()) {
 			e.first = tensor_to_f32(st, st.require(prefix + ".weight"));
 			e.second = tensor_to_f32(st, st.require(prefix + ".bias"));
@@ -1458,6 +1492,35 @@ void adaln_table_row(const float* table, float t, float* out8) {
 
 }  // namespace
 
+// The implementation goes with the object: the `unique_ptr` is what owns it, and
+// erasing the entry is what runs its destructor. That releases, in one place, the
+// checkpoint's `SafeTensors` (its mapping, its look-ahead worker and the pinned
+// host ranges `release_weights` may have left behind), the resident window's arena
+// (with the accountant's charge for it) and every host vector the forward passes
+// keep between calls. Declared in av_dit.hpp; the object must outlive nothing but
+// its own use - the device it was opened against may already be gone, because
+// nothing here dereferences it.
+AvDiT::~AvDiT() { registry().erase(this); }
+size_t h3_impl_entries() { return registry().size(); }
+
+// Empties the modulation cache (see `modulation_cache()` above). It belongs to the
+// checkpoint a run opened, keyed on that mapping's address, so it must not outlive
+// the run: the media tools drop the loaded checkpoints at the end of every
+// generation, and an entry kept past that would be decoded weights of a file that is
+// no longer mapped - handed to a later model that happens to be mapped at the same
+// address. Declared in av_dit.hpp; called from `release_generation_state`.
+void drop_modulation_cache() {
+	ModulationCache& c = modulation_cache();
+	std::lock_guard<std::mutex> lk(c.mu);
+	c.entries.clear();
+}
+
+size_t modulation_cache_entries() {
+	ModulationCache& c = modulation_cache();
+	std::lock_guard<std::mutex> lk(c.mu);
+	return c.entries.size();
+}
+
 // ── open ──────────────────────────────────────────────────────────────────
 
 void AvDiT::open(const std::string& dit_path, GpuCtx* gpu) {
@@ -1487,7 +1550,7 @@ void AvDiT::open(const std::string& dit_path, GpuCtx* gpu) {
 	cfg_.head_dim = 128;
 	cfg_.n_kv_heads = 56;
 	cfg_.ffn_hidden = fc1.shape[0] / 2;
-	cfg_.text_dim = cond.shape[1];
+	cfg_.text_dim = st.logical_cols(cond);
 	cfg_.n_layers = 0;
 	while (st.find("blocks." + std::to_string(cfg_.n_layers) + ".norm1.weight")) cfg_.n_layers++;
 	if (cfg_.n_layers != 50) throw MediaError("h3dit: expected 50 blocks");
@@ -1522,7 +1585,7 @@ void AvDiT::open(const std::string& dit_path, GpuCtx* gpu) {
 			if (t.shape.size() != 2)
 				throw MediaError(std::string("h3dit: blocks.0.") + name + " is not 2-D");
 			const u64 rows = (u64)t.shape[0];
-			const u64 cols = (u64)t.shape[1];
+			const u64 cols = (u64)st.logical_cols(t);
 			if (weight_is_dense_float(st, t)) {
 				const u64 esz = weight_precision_of(st, t) == WeightPrecision::F32 ? 4u : 2u;
 				im->layer_tensors.push_back(rows * cols * esz);
@@ -1593,6 +1656,25 @@ void AvDiT::open(const std::string& dit_path, GpuCtx* gpu) {
 		}
 	}
 
+	// ── the tier plan's units ──────────────────────────────────────────────
+	//
+	// The *blocks* first - `plan(res_n)` reads "units [0, n) are already on the
+	// card" - and the token refiner last, because it is never resident: it
+	// re-streams through the weight arena at the start of every step, so it is
+	// always one of the units the RAM tier considers. Registering it before the
+	// blocks would make the plan think the first resident block was the refiner.
+	//
+	// Within the streamed set the order is block index, then the refiner. Every one
+	// of those units is read exactly once per step, so what a partial grant buys is
+	// the *set* and not an ordering; the refiner goes last because it is one 1.5 GB
+	// unit that cannot be half-pinned, and a small grant is better spent on whole
+	// blocks than refused on the refiner.
+	//
+	// The ranges are the ones the loaders read, in their own order, so pinning a
+	// unit is pinning exactly the bytes that unit's upload will ask for.
+	im->wr.attach(&st, "h3dit", HostWeightPool::Rank::Primary);
+	for (i64 i = 0; i < cfg_.n_layers; i++) im->wr.add_unit(im->block_ranges[(size_t)i]);
+	im->wr.add_unit(im->refiner_ranges);
 
 	auto& K = *gpu->keep;
 	im->dense.cond_w = up_raw(st, "condition_proj.weight", *gpu, K, DType::BF16);
@@ -1630,16 +1712,19 @@ void AvDiT::release_weights() {
 	res_.planned = false;
 	if (g_ && g_->wa) g_->wa->release_chunks();
 	if (g_ && g_->aa) g_->aa->release_chunks();
-	// The host-side weight cache goes with the device side, and for the same
-	// reason: the sampling loop is over, the phase that follows (the video VAE's
-	// 100-odd tiles) re-reads its own 5 GB checkpoint, and holding ~7 GB of system
-	// RAM pinned for weights nobody will ask for again is what starved that phase.
-	// Measured: the VAE's tile loop went from 774 ms to 1.55 s per tile because
-	// `pin_range` refused the 1.25 GB of decoder blocks it wanted for want of a
-	// free half of system memory - 70 s of an 8 minute run. A second generation
-	// call re-pins: `forward` fills the cache on the first step either way, and
-	// the file pages it reads are already in the OS cache.
-	if (im->st.pinned_bytes()) im->st.drop_cache();
+	// The RAM tier goes with the device side, and for the same reason: the sampling
+	// loop is over, the phase that follows (the video VAE's 100-odd tiles) re-reads
+	// its own 5 GB checkpoint, and holding ~7 GB of system memory pinned for weights
+	// nobody will ask for again is what starved that phase. Measured: the VAE's tile
+	// loop went from 774 ms to 1.55 s per tile because `pin_range` refused the
+	// 1.25 GB of decoder blocks it wanted for want of a free half of system memory -
+	// 70 s of an 8 minute run. The grant goes back to the pool with it, so the VAE
+	// (a Secondary) can ask for the same bytes - and a second generation call
+	// re-plans on its first step, which is now possible because the flag below is
+	// cleared: a pinned set that was dropped used to be treated as "still filled"
+	// for the rest of the process.
+	im->wr.drop();
+	im->host_cache_ready = false;
 }
 
 // ── estimates (plan §4) ───────────────────────────────────────────────────
@@ -2895,7 +2980,7 @@ void AvDiT::forward_refs(const float* x_v, const float* x_a, i64 T, i64 H, i64 W
 		PR.resident = im->res_n;
 		PR.blocks = cfg_.n_layers;
 	}
-	// ── the host-side weight cache ─────────────────────────────────────────
+	// ── the RAM tier: the blocks the card did not take ─────────────────────
 	//
 	// Filled once per weight set, here, because this is the first point where the
 	// residency decision is final (`res_n` is what the window really took) and the
@@ -2903,8 +2988,8 @@ void AvDiT::forward_refs(const float* x_v, const float* x_a, i64 T, i64 H, i64 W
 	//
 	// Why it exists: 41 of the 50 blocks are streamed off the checkpoint on *every*
 	// step - 15.1 GB per step, plus 1.5 GB for the refiner - and this box's NVMe
-	// delivers ~1.2 GB/s for that pattern no matter how it is driven. Measured
-	// on this box: 1.13 GB/s for a whole-file sequential read of the 19.5 GB
+	// delivers ~1.2 GB/s for that pattern no matter how it is driven. Measured on
+	// this box: 1.13 GB/s for a whole-file sequential read of the 19.5 GB
 	// checkpoint, 1.25 GB/s for the engine's own 12-scattered-reads-per-block
 	// pattern, 1.00-1.18 GB/s when a block's tensors are merged into fewer, larger
 	// reads, 1.02-1.24 GB/s with 2/3/4/6/8 concurrent reader threads, and a
@@ -2913,61 +2998,16 @@ void AvDiT::forward_refs(const float* x_v, const float* x_a, i64 T, i64 H, i64 W
 	// thread count and overlap are all at the device's limit already; the disk time
 	// is 14.8 s of a 18.9 s step and nothing in the read path can shorten it.
 	//
-	// What can shorten it is not reading those bytes again. System memory moves them
-	// ~10x faster than the disk, so the streamed blocks that fit are pinned in RAM
-	// once and served out of it for the rest of the session.
-	//
-	// The refiner goes first: 1.5 GB re-read on every step is the best
-	// bytes-saved-per-byte-pinned in the whole chain. Blocks follow in index order,
-	// which is also the order the loop touches them, so a partial budget pins the
-	// front of the run rather than a scattering of it.
+	// What shortens it is not reading those bytes again. `WeightResidency` pins what
+	// the card did not take in system memory - in the order the loop touches the
+	// units, so a partial budget covers the front of the run - out of the
+	// process-wide ledger, so the text tower and the VAEs of the same generation
+	// cannot have spent the machine's RAM first (see host/residency.hpp).
 	if (!im->host_cache_ready) {
 		im->host_cache_ready = true;
-		const u64 budget = host_cache_budget_bytes();
-		u64 pinned = 0;
-		i64 pinned_blocks = 0;
-		// A pin is RAM the process cannot give back, so the loop stops at whichever
-		// comes first: the budget, or the free-memory reserve. The second term is
-		// what makes the cache safe on a machine that is already busy - pinning
-		// "two thirds of the box" is fine arithmetic and an OOM kill in practice
-		// when the box is 16 GB and the UI, the text tower and the file pages are
-		// using the rest.
-		const u64 reserve = host_cache_reserve_bytes();
-		auto room_left = [&]() {
-			const u64 free_now = SafeTensors::host_free_bytes();
-			return free_now > reserve;
-		};
-		if (budget > 0) {
-			try {
-				for (const auto& r : im->refiner_ranges) {
-					if (pinned + r.second > budget || !room_left()) break;
-					im->st.pin_range(r.first, r.second);
-					pinned += r.second;
-				}
-				for (i64 i = im->res_n; i < cfg_.n_layers; i++) {
-					u64 blk = 0;
-					for (const auto& r : im->block_ranges[(size_t)i]) blk += r.second;
-					if (pinned + blk > budget || !room_left()) break;
-					for (const auto& r : im->block_ranges[(size_t)i])
-						im->st.pin_range(r.first, r.second);
-					pinned += blk;
-					pinned_blocks++;
-				}
-			} catch (const std::exception& e) {
-				// An allocation failure is a reason to pin less, never a reason to
-				// fail a run: the same bytes still come off the disk.
-				fprintf(stderr, "[h3dit] host weight cache stopped early: %s\n", e.what());
-			}
-		}
-		fprintf(stderr,
-		        "[h3dit] host weight cache: %.2f GB pinned (%lld streamed blocks of %lld, "
-		        "budget %.2f GB, %.2f GB free, %.2f GB held back) - the rest streams off "
-		        "the device\n",
-		        (double)pinned / 1073741824.0, (long long)pinned_blocks,
-		        (long long)(cfg_.n_layers - im->res_n),
-		        (double)budget / 1073741824.0,
-		        (double)SafeTensors::host_free_bytes() / 1073741824.0,
-		        (double)reserve / 1073741824.0);
+		im->wr.plan(im->res_n);
+		fprintf(stderr, "[h3dit] weights: %s\n",
+		        weight_plan_line(im->wr, "h3dit", weight_precision()).c_str());
 	}
 
 	for (i64 i = 0; i < cfg_.n_layers; i++) {
@@ -3007,6 +3047,10 @@ void AvDiT::forward_refs(const float* x_v, const float* x_a, i64 T, i64 H, i64 W
 			// is a stable decision.
 			auto prefetch_next = [&](i64 j) {
 				if (j < im->res_n || j >= cfg_.n_layers) return;   // resident or past the end
+				// Already in system memory: the loader DMAs it straight out of the pinned
+				// copy, so a look-ahead read would be a memcpy of bytes nobody will take
+				// off the slot (the same gate `AceDiT::forward` uses).
+				if (im->wr.state().unit_pinned(j)) return;
 				im->st.prefetch_ranges(im->block_ranges[(size_t)j]);
 			};
 			// Block i's bytes are in the slot iff the previous iteration issued the read

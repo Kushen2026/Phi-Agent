@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "graph/graph.hpp"
+#include "models/lora.hpp"
 
 namespace phi::media {
 
@@ -70,8 +71,11 @@ struct ImageWorkflowParams {
 	std::string tokenizer_config;
 	// LoRA files (names under models/, or paths), applied in order through one
 	// MediaLoraLoader node wired into the model and CLIP loaders. Empty = no LoRA
-	// node at all, so a plain chain is byte-for-byte the graph it was.
-	std::vector<std::string> loras;
+	// node at all, so a plain chain is byte-for-byte the graph it was. Each entry
+	// carries the user's strength for that file (ComfyUI's `strength_model` /
+	// `strength_clip`, default 1.0); the entry is the pair, not a bare path, so a
+	// strength cannot be paired with the wrong file.
+	std::vector<LoraRef> loras;
 };
 
 struct VideoWorkflowParams {
@@ -109,7 +113,7 @@ struct VideoWorkflowParams {
 	std::string tokenizer_vocab;
 	std::string tokenizer_merges;
 	std::string tokenizer_config;
-	std::vector<std::string> loras;  // see ImageWorkflowParams::loras
+	std::vector<LoraRef> loras;  // see ImageWorkflowParams::loras
 };
 
 // Builds the default image graph (prompt -> PNG) from the parameters.
@@ -201,6 +205,8 @@ Graph build_music_workflow(const MusicWorkflowParams& p);
 // the tool, the workflow and the report cannot disagree about the rate. A TTS
 // length is a *cap*: the model stops on its own EOS token, which is usually well
 // before the cap, and the report gives the length that was actually produced.
+// When a caller names no cap at all, the *text* sizes it - see
+// `BreezeTts::estimate_frames` - so the only fixed ceiling is the context.
 inline constexpr double kTtsFramesPerSecond = 12.5;
 
 // Seconds -> the sampler's frame budget (rounded, at least one frame).
@@ -209,23 +215,40 @@ i64 tts_frames_for_seconds(double seconds);
 double tts_seconds_for_frames(i64 frames);
 
 struct TtsWorkflowParams {
+	// The two strings, and which one is which: `text` is read aloud, `instruction`
+	// describes the voice and is *not* read. The reference builds the prompt as
+	// `design_segments(text, instruction)` -> "[S0]<ins_bos>{instruction}<ins_eos>{text}",
+	// so this order is the whole request - swapping the two asks the model to read
+	// the description in some invented voice. (And that is *not* what "the audio
+	// reads the instruction" usually means: that symptom comes from the text
+	// encoder's attention scale, not from these two fields. See
+	// `BreezeTts::open`.)
 	std::string text;              // the words to speak (required)
 	std::string instruction;       // the timbre description (required for voice design)
 	double cfg_scale = 4.0;        // the voice-design default
 	// The cap on generated *acoustic code frames*, which is the sampler's own unit.
 	// A caller that thinks in seconds sets `duration_seconds` instead and leaves
 	// this 0; `build_tts_workflow` derives the budget with `tts_frames_for_seconds`.
-	// 0 (with `duration_seconds` 0 too) means the model's own default of 1500
-	// frames, i.e. 120 s, still subject to EOS.
+	// 0 with both of those unset means *the text decides*: the prompt sizes the
+	// budget from `BreezeTts::estimate_frames(text)` (the checkpoint's own
+	// calibration) and only the context caps it, so a long sentence is not cut at
+	// some fixed duration. The model stops at its own EOS token either way.
 	i64 max_new_tokens = 0;
-	// The requested length in seconds. 0 = let the model decide from the text.
+	// The requested length in seconds, for a caller that wants to bound the
+	// utterance explicitly. 0 = let the text decide.
 	double duration_seconds = 0.0;
-	double temperature = 0.7;
-	i64 top_k = 0;
+	// The released Voice-Design node's own generation controls (nodes.py's
+	// `_generation_controls`, i.e. the values its example workflow ships). They are
+	// what every caller that does not name its own gets, so a run here reproduces
+	// the reference's sampling and not something merely similar: sampling either
+	// loop looser (top-k off, depth temperature 1.0) makes the frames drift, which
+	// is heard as an early stop and a noisy tail.
+	double temperature = 0.9;
+	i64 top_k = 50;
 	double top_p = 1.0;
-	double repetition_penalty = 1.0;
-	double depth_temperature = 1.0;
-	i64 depth_top_k = 0;
+	double repetition_penalty = 1.1;
+	double depth_temperature = 0.9;
+	i64 depth_top_k = 50;
 	double depth_top_p = 1.0;
 	u64 seed = 0;
 	std::string output;            // required
@@ -239,7 +262,8 @@ struct TtsWorkflowParams {
 	std::string codec_config;      // codec config.json
 };
 
-// Builds the default TTS graph (instruction + text -> wav).
+// Builds the default TTS graph (instruction + text -> wav; the *instruction*
+// describes the voice, the *text* is what is spoken).
 Graph build_tts_workflow(const TtsWorkflowParams& p);
 
 }  // namespace phi::media

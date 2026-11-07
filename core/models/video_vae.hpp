@@ -31,6 +31,12 @@ struct VideoVaeConfig {
 
 class VideoVae {
 public:
+	// Destruction drops the implementation this class keeps in a side table keyed
+	// by `this` (see video_vae.cpp's `g_impl`): every allocation it holds lives in
+	// `warena_`, so the entry cannot outlive the object, and one that did would
+	// hand a later `VideoVae` at the same address another model's decoder. The
+	// `SafeTensors` mapping and the activation arena go with it.
+	~VideoVae();
 	void open(const std::string& path, GpuCtx* gpu);
 	const VideoVaeConfig& config() const { return cfg_; }
 
@@ -104,5 +110,10 @@ private:
 	i64 last_tile_ = 0;
 	bool open_ = false;
 };
+
+
+// How many decoder implementations the H3 video VAE is holding (the `Impl` side
+// table keyed by `this`). Meant to be empty between generations.
+size_t video_vae_state_entries();
 
 }  // namespace phi::media

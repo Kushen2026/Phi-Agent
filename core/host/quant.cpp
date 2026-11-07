@@ -289,59 +289,143 @@ float scale_at(const void* p, DType dtype, i64 i) {
 		case DType::BF16: return bf16_to_f32(((const u16*)p)[(size_t)i]);
 		case DType::F8_E4M3: return f8_e4m3_to_f32(((const u8*)p)[(size_t)i]);
 		case DType::F8_E5M2: return f8_e5m2_to_f32(((const u8*)p)[(size_t)i]);
+		// A byte container holding fp8: the on-disk spelling every packer that wrote
+		// before safetensors had an fp8 dtype used, and what ComfyUI's loader still
+		// accepts ("v.view(torch.float8_e4m3fn)"). E4M3 is the only fp8 these tables
+		// are ever written in.
+		case DType::U8: return f8_e4m3_to_f32(((const u8*)p)[(size_t)i]);
 		default: throw MediaError("scale_at: unreadable scale dtype " + std::string(dtype_name(dtype)));
 	}
 }
 
+// The packer's rounding onto the INT8 grid: **round half to even**, clamped to
+// [-127, 127].
+//
+// This is the eager reference's "values.round().clamp_(-127, 127)" and its device
+// counterpart's "clamp(rint(v * s), -127, 127)": torch's `round` and IEEE `rint`
+// both resolve a .5 tie towards the even integer, and a level times a group scale
+// lands on .5 often enough (the levels are small integers and the scales are fp8)
+// that a half-away-from-zero rule shows up as a wrong code - one grid step, which
+// is one `s_channel`, on the affected elements only.
+//
+// Note this is *not* the rule the engine's own quantiser uses (`quantize_weight`,
+// which rounds half away from zero and whose output the shipped int8 checkpoints'
+// requantisation is pinned against): this one decodes what a packer wrote, that one
+// decides what the engine writes.
+static inline float int8_grid(float v) {
+	const double r0 = std::nearbyint((double)v);   // FE_TONEAREST: half to even
+	double r = r0;
+	if (r < -127.0) r = -127.0;
+	if (r > 127.0) r = 127.0;
+	return (float)r;
+}
+
+// One element of the grouped families: the code's *level*, scaled by its group's
+// relative scale onto the int8 grid, times the row's channel scale. `corr` is this
+// row's correction entry for the element's group (0 when the file has none).
+//
+// The level is a float, not an integer: a codebook holds real levels (the packer's
+// ALS fits them, and the fixed LUT's entries are fractional too), so truncating it
+// to a whole number throws the codebook away. Only the *uniform* form's level is
+// an integer, and it arrives here as one.
+static inline float grouped_value(float level, float s_rel, float s_channel, float corr) {
+	return int8_grid(level * s_rel) * s_channel + corr;
+}
+
 void dequant_codebook_int4_row(const u8* codes, i64 k, const float* codebook,
                                float s_channel, const void* s_rel_row, DType s_rel_dtype,
-                               i64 group, float* dst) {
-	if (!codebook) throw MediaError("asym_w4a8_int8: the weight has no codebook");
+                               i64 group, const float* corr_row, float* dst) {
 	if (group <= 0) group = k;
 	for (i64 c = 0; c < k; c += 2) {
 		const u8 b = codes[c / 2];
-		const float g0 = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, (c / group)) : 1.0f;
-		const long i0 = (long)(b & 0x0F);
-		const long i1 = (long)((b >> 4) & 0x0F);
-		dst[c] = codebook[i0] * g0 * s_channel;
+		const i64 i0 = (i64)(b & 0x0F);
+		const i64 i1 = (i64)((b >> 4) & 0x0F);
+		// A codebook stores the levels themselves; without one the family is the
+		// uniform symmetric form, whose zero point is the middle of the 4-bit range.
+		const float l0 = codebook ? codebook[i0] : (float)(i0 - 8);
+		const float l1 = codebook ? codebook[i1] : (float)(i1 - 8);
+		const i64 g0 = c / group;
+		const float rel0 = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, g0) : 1.0f;
+		dst[c] = grouped_value(l0, rel0, s_channel, corr_row ? corr_row[g0] : 0.0f);
 		if (c + 1 < k) {
-			const float g1 = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, ((c + 1) / group)) : 1.0f;
-			dst[c + 1] = codebook[i1] * g1 * s_channel;
+			const i64 g1 = (c + 1) / group;
+			const float rel1 = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, g1) : 1.0f;
+			dst[c + 1] = grouped_value(l1, rel1, s_channel, corr_row ? corr_row[g1] : 0.0f);
 		}
 	}
-}
-
-// Six-bit codes, four per three bytes, little-endian inside the triple.
-void unpack_6bit_triple(const u8* t, u8 out[4]) {
-	out[0] = (u8)(t[0] & 0x3F);
-	out[1] = (u8)(((t[0] >> 6) | (t[1] << 2)) & 0x3F);
-	out[2] = (u8)(((t[1] >> 4) | (t[2] << 4)) & 0x3F);
-	out[3] = (u8)(t[2] >> 2);
 }
 
 void dequant_packed6_row(const u8* codes, i64 k, float s_channel, const void* s_rel_row,
-                         DType s_rel_dtype, i64 group, float* dst) {
-	if ((k & 3) != 0)
-		throw MediaError("w6a8_int8: K=" + std::to_string(k) + " is not a multiple of 4");
+                         DType s_rel_dtype, i64 group, const float* corr_row, float* dst) {
+	if ((k & 1) != 0 || (k % 4) != 0)
+		throw MediaError("w6a8_int8: K=" + std::to_string(k) +
+		                 " is not a multiple of 4 (the six-bit pack has no row for it)");
 	if (group <= 0) group = k;
+	// The row is two planes: k/2 bytes of low nibbles, then k/4 bytes of top-2-bit
+	// codes (four per byte, at bit positions 0, 2, 4 and 6).
+	const u8* low_plane = codes;
+	const u8* hi_plane = codes + k / 2;
 	for (i64 c = 0; c < k; c += 4) {
-		u8 v[4];
-		unpack_6bit_triple(codes + (c / 4) * 3, v);
+		const u8 lo0 = low_plane[c / 2];
+		const u8 lo1 = low_plane[c / 2 + 1];
+		const u8 hb = hi_plane[c / 4];
+		const long code[4] = {
+		    (long)((u8)(lo0 & 0x0F) | (u8)(((hb >> 0) & 0x03) << 4)),
+		    (long)((u8)((lo0 >> 4) & 0x0F) | (u8)(((hb >> 2) & 0x03) << 4)),
+		    (long)((u8)(lo1 & 0x0F) | (u8)(((hb >> 4) & 0x03) << 4)),
+		    (long)((u8)((lo1 >> 4) & 0x0F) | (u8)(((hb >> 6) & 0x03) << 4)),
+		};
 		for (int j = 0; j < 4; j++) {
 			const i64 col = c + j;
-			const float g = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, col / group) : 1.0f;
-			dst[col] = (float)v[j] * g * s_channel;
+			if (col >= k) break;
+			const i64 g = col / group;
+			const float rel = s_rel_row ? scale_at(s_rel_row, s_rel_dtype, g) : 1.0f;
+			// Six-bit storage is uniform and symmetric: the level is the code minus
+			// the middle of the 6-bit range.
+			dst[col] =
+			    grouped_value((float)(code[j] - 32), rel, s_channel, corr_row ? corr_row[g] : 0.0f);
 		}
 	}
 }
 
-void dequant_nvfp4_row(const u8* codes, i64 k, const void* block_scale, DType scale_dtype,
-                       float global_scale, i64 block, float* dst) {
+// The inverse of the cuBLAS "blocked" (tiled) scale layout, for the (row, block)
+// pair a weight element belongs to.
+//
+// The packer pads the [rows, blocks] table to (roundup(rows,128), roundup(blocks,4)),
+// views it as (n_row_blocks, 128, n_col_blocks, 4), permutes to (n_row_blocks,
+// n_col_blocks, 128, 4) and re-groups each 128x4 tile as 32x(4x4). The element at
+// (row, block) therefore lands at flat index "chunk*512 + b*16 + a*4 + w" of the
+// stored 2-D table, with the variables below. ComfyUI's "from_blocked" is that walk
+// backwards, and tests/precision_coverage_test.cpp checks this against it.
+static inline i64 blocked_scale_index(i64 row, i64 block_col, i64 nb_c, i64 blocked_cols) {
+	const i64 i_r = row / 128;
+	const i64 h = row % 128;
+	const i64 i_c = block_col / 4;
+	const i64 w = block_col % 4;
+	const i64 a = h / 32;
+	const i64 b = h % 32;
+	const i64 chunk = i_r * nb_c + i_c;
+	const i64 flat = chunk * 512 + b * 16 + a * 4 + w;
+	return (flat / blocked_cols) * blocked_cols + (flat % blocked_cols);
+}
+
+void dequant_nvfp4_row(const u8* codes, i64 row, i64 k, const u8* blocked, i64 blocked_rows,
+                       i64 blocked_cols, DType scale_dtype, float global_scale, i64 block,
+                       float* dst) {
 	if (block <= 0) block = 16;
+	const i64 nb_c = blocked_cols > 0 ? blocked_cols / 4 : 0;
+	const bool have_scales = blocked != nullptr && nb_c > 0 && blocked_rows > 0;
+	const size_t esz = have_scales ? dtype_size(scale_dtype) : 0;
 	for (i64 c = 0; c < k; c++) {
 		const u8 b = codes[c / 2];
-		const u8 nib = (u8)((c & 1) ? (b >> 4) : (b & 0x0F));
-		const float s = block_scale ? scale_at(block_scale, scale_dtype, c / block) : 1.0f;
+		// The even column is in the *high* nibble (the packer's hi_first order), the
+		// opposite of the int4 families above.
+		const u8 nib = (u8)((c & 1) ? (b & 0x0F) : (b >> 4));
+		float s = 1.0f;
+		if (have_scales) {
+			const i64 idx = blocked_scale_index(row, c / block, nb_c, blocked_cols);
+			s = scale_at(blocked + (size_t)idx * esz, scale_dtype, 0);
+		}
 		dst[c] = e2m1_to_f32(nib) * s * global_scale;
 	}
 }

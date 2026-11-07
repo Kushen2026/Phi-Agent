@@ -39,6 +39,13 @@ struct AudioVocoderConfig {
 
 class AudioVae {
 public:
+	// Destruction releases the state this class cannot hold as a member (see the
+	// note on the registry in audio_vae.cpp): the decoded weights and the nets
+	// behind them live in a side table keyed by `this`, so the entry has to go with
+	// the object. Without the hook the entry - the whole fp32 audio VAE - stayed in
+	// system memory for the life of the process, and the next object the allocator
+	// placed at the same address would have read it as its own.
+	~AudioVae();
 	void open(const std::string& path, GpuCtx* gpu);
 	const AudioVaeConfig& config() const { return cfg_; }
 
@@ -62,6 +69,8 @@ private:
 // it a mel shaped by hand without a round trip through the latent.
 class AudioVocoder {
 public:
+	// Same hook as AudioVae's, for the same registry.
+	~AudioVocoder();
 	void open(const std::string& path, GpuCtx* gpu);
 	const AudioVocoderConfig& config() const { return cfg_; }
 	// mel: [num_mels, frames] fp32 -> mono PCM at the audio VAE's sample rate.
@@ -74,5 +83,11 @@ private:
 	GpuArena warena_, aarena_;
 	bool open_ = false;
 };
+
+
+// How many per-object entries the audio VAE's side table holds (the two classes
+// above share one registry, keyed by `this`). Meant to be empty between
+// generations; reported under PHI_MEDIA_STATE.
+size_t audio_vae_state_entries();
 
 }  // namespace phi::media

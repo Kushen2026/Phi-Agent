@@ -232,8 +232,8 @@ void dispatch_int8_gemm_v2(ComputeContext& ctx, const Int8GemmArgs& a, const Ker
 	std::string why;
 	if (!c.valid(&why)) throw MediaError("int8_gemm_v2: invalid config (" + why + ")");
 
-	// Variants live under their own PSO-cache key, so the shader cache keeps the
-	// winner across runs instead of recompiling every candidate.
+	// Each variant lives under its own kernel key, so the context's kernel set keeps
+	// the winner for the rest of the process instead of recompiling every candidate.
 	GpuKernel* pso =
 	    ctx.pipeline("int8_gemm_dp4a_" + c.key(), int8_gemm_hlsl_variant(c), "int8_gemm_dp4a",
 	                 ShaderModel::SM6_4);

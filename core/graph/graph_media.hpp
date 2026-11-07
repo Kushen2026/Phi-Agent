@@ -125,6 +125,10 @@ struct LoraData : NodeData {
 	const char* kind() const override { return "LORA"; }
 	std::shared_ptr<LoraSet> set;
 	std::vector<std::string> paths;
+	// The strength each loaded file was applied at, index-matched to `paths`. It
+	// is already folded into the set's factors; this list exists so a report or a
+	// cache key can say what the run used (`LoraSet::describe` prints it too).
+	std::vector<float> strengths;
 };
 
 struct ConditioningData : NodeData {
@@ -290,11 +294,12 @@ std::shared_ptr<VideoData> as_video(const Value& v);
 
 // ── engine-side state a run keeps ──────────────────────────────────────────
 
-// Loaded modules are cached for the life of a `GraphContext`, keyed on
-// (arch, path, loras): a graph that loads the same DiT twice — or a caller that
-// runs the same workflow again on the same context — reuses the weights instead
-// of re-reading the checkpoint. This is the node world's equivalent of the
-// process-wide `MediaEngine`, minus the pipelines.
+// Loaded modules are cached for the life of a *run*, keyed on (arch, path, loras):
+// a graph that loads the same DiT twice reuses the weights instead of re-reading
+// the checkpoint. It is not a cache between runs: the media tools drop the whole
+// bag when the generation ends (`release_media_memory`), because no request is
+// ever repeated, and a kept handle would hold the checkpoint's VRAM, its host-side
+// mappings and the caches derived from them for a run that will not come.
 struct GraphModelCache {
 	std::map<std::string, std::shared_ptr<ModelData>> models;
 	std::map<std::string, std::shared_ptr<ClipData>> clips;
@@ -314,11 +319,19 @@ std::shared_ptr<GraphModelCache> graph_state(GraphContext& ctx);
 
 // Hands back every byte the cached modules are holding in VRAM: the image / video
 // / audio VAEs' weights and scratch, and the two DiTs' resident windows and
-// streaming arenas. The *loaded* modules stay cached (their safetensors mappings
-// are host-side), so the next run re-streams from the page cache - which is what
-// the two media tools always did between calls (they shared one card and could
-// not use the other chain's weights). The caller is expected to hand the shared
-// wa/aa arenas back as well; see the media engine's release path.
+// streaming arenas. The *loaded* modules stay alive (their safetensors mappings
+// are host-side), which is what lets one run's phase boundary and its end share
+// this call; the caller then drops the bag itself - a generation keeps nothing
+// (see the media engine's `release_generation_state`), so the next call re-opens
+// and re-streams from the page cache. The caller is expected to hand the shared
+// wa/aa arenas back as well.
+//
+// The models' *system memory* tier - the weights each one pinned in RAM because
+// the card could not hold them (host/residency.hpp) - is released by the same
+// per-model hooks this calls, and `release_generation_state` resets the ledger
+// afterwards. Keeping them apart is what lets a phase boundary hand the device
+// back without also throwing away RAM that the next phase of the same generation
+// will re-read.
 void release_media_cache(GraphModelCache& cache);
 
 // The GpuCtx a run was handed, or a MediaError naming the missing context.
