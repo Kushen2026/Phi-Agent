@@ -90,6 +90,8 @@
       "compaction_role": "\u4E0A\u4E0B\u6587\u538B\u7F29",
       "compaction_tokens": (n) => `\u538B\u7F29\u524D\u4E0A\u4E0B\u6587 \u2248 ${formatTokens(n)} tokens`,
       "compaction_tokens_after": (n) => `\u538B\u7F29\u540E\u7EA6 ${formatTokens(n)} tokens`,
+      "status_tokens": (used, window) => `${used} / ${window} token`,
+      "status_tokens_title": (percent) => `\u4E0B\u6B21\u8BF7\u6C42\u5360\u7528\u7EA6 ${percent}% \u7684\u4E0A\u4E0B\u6587\u7A97\u53E3`,
       "subagent_role": "\u5B50\u4EE3\u7406",
       "subagent_finished": (name) => `\u5B50\u4EE3\u7406\u300C${name}\u300D\u5DF2\u5B8C\u6210`,
       "subagent_failed": (name) => `\u5B50\u4EE3\u7406\u300C${name}\u300D\u672A\u6B63\u5E38\u5B8C\u6210`,
@@ -115,6 +117,7 @@
       "no_skills_loaded": "\u672A\u52A0\u8F7D\u4EFB\u4F55\u6280\u80FD\u3002\u6280\u80FD\u4F1A\u81EA\u52A8\u4ECE data/skills \u52A0\u8F7D\u3002",
       "no_commands_available": "\u6682\u65E0\u53EF\u7528\u547D\u4EE4\u3002",
       "no_sessions": "\u5F53\u524D\u76EE\u5F55\u8FD8\u6CA1\u6709\u4FDD\u5B58\u7684\u4F1A\u8BDD\u3002",
+      "untitled_session": "\u672A\u547D\u540D\u4F1A\u8BDC",
       "reload_all": "\u91CD\u65B0\u52A0\u8F7D\u6280\u80FD\u3001\u6269\u5C55\u548C\u63D0\u793A\u8BCD",
       "refresh": "\u5237\u65B0",
       // Commands
@@ -330,9 +333,20 @@
     // ------------------------------------------------------------------------
     // Dropdown helpers
     // ------------------------------------------------------------------------
+    // 同一时刻只允许一个下拉菜单展开：底部这两个按钮挨着，两个菜单同时打开会
+    // 直接叠在一起（模型列表压住思考级别列表），既看不清也点不准。
+    // 打开之前先把其余的关掉；关掉时不做任何多余动作（再点一次同一按钮就是收起）。
     toggleMenu(menu) {
       const willOpen = menu.hidden;
+      this.closeMenus(menu);
       menu.hidden = !willOpen;
+      return !willOpen;
+    }
+    // 关掉除 keep 之外的所有下拉菜单（keep 为空 = 全部关掉）
+    closeMenus(keep) {
+      for (const open of [this.elements.thinkingMenu, this.elements.configMenu]) {
+        if (open && open !== keep) open.hidden = true;
+      }
     }
     updateHeaderLabels() {
       const levelIndex = ["off", "low", "medium", "high", "xhigh", "max"].indexOf(this.currentThinking);
@@ -486,12 +500,15 @@
         const open = el("button", "session-open");
         open.type = "button";
         const main = el("div", "session-main");
-        main.appendChild(el("div", "session-name-line", session.name ?? session.id.slice(0, 12)));
+        // 会话名就是文件名（默认会话是 "2026-11-07-9:23:40" 这样的时间戳，
+        // 命名过就是用户起的名字）。第二行只放「最近修改」，不再挂 uuid 尾巴 ——
+        // 那 8 个字符对用户没有信息量。
+        main.appendChild(el("div", "session-name-line", session.name || t("untitled_session")));
         main.appendChild(
           el(
             "div",
             "session-time",
-            `${session.updatedAt ? formatRelative(session.updatedAt, now) : ""} \xB7 ${session.id.slice(0, 8)}`
+            session.updatedAt ? formatRelative(session.updatedAt, now) : ""
           )
         );
         open.appendChild(main);
@@ -684,43 +701,29 @@
   // （settings.json → tools.media）。选项就是 models/ 目录里的文件，由服务端
   // 每次打开面板时实时列出，没有内置清单，也没有「默认」项——默认留空，
   // 留空时按该角色内置的默认文件名去 models/ 里找。
-  // 每个模型用到的 JSON / 文本配置也是它自己的角色，绝不共用，而且拆到「文件」
-  // 粒度：三条链各有自己的 vocab.json、merges.txt、tokenizer_config.json 三个下拉
-  // （分词器真的需要这三个文件，缺 vocab.json 或 merges.txt 会直接加载失败），
-  // TTS 的模型 config.json 与编解码器 config.json 也是两个不同的文件。
+  // TTS 的模型 config.json 与编解码器 config.json 是两个不同的文件。
+  // 分词器不在这些角色里：它内置在 data/tokenizers/ 下，不是可选模型文件。
   var MEDIA_ROLES = {
     image: [
       { key: "image_dit", label: "图像 DiT" },
       { key: "image_te", label: "图像文本编码器" },
-      { key: "image_vae", label: "图像 VAE" },
-      { key: "image_tokenizer_vocab", label: "分词器 vocab.json" },
-      { key: "image_tokenizer_merges", label: "分词器 merges.txt" },
-      { key: "image_tokenizer_config", label: "分词器 tokenizer_config.json" }
+      { key: "image_vae", label: "图像 VAE" }
     ],
     video: [
       { key: "video_dit", label: "视频 DiT" },
       { key: "video_te", label: "视频文本编码器" },
       { key: "video_vae", label: "视频 VAE" },
-      { key: "video_avae", label: "音频 VAE + 声码器" },
-      { key: "video_tokenizer_vocab", label: "分词器 vocab.json" },
-      { key: "video_tokenizer_merges", label: "分词器 merges.txt" },
-      { key: "video_tokenizer_config", label: "分词器 tokenizer_config.json" }
+      { key: "video_avae", label: "音频 VAE + 声码器" }
     ],
     music: [
       { key: "music_dit", label: "音乐 DiT" },
       { key: "music_te", label: "文本/语义码 tower（0.6B）" },
-      { key: "music_lm", label: "音频语义码 LM（4B）" },
-      { key: "music_vae", label: "音频 VAE" },
-      { key: "music_tokenizer_vocab", label: "分词器 vocab.json" },
-      { key: "music_tokenizer_merges", label: "分词器 merges.txt" },
-      { key: "music_tokenizer_config", label: "分词器 tokenizer_config.json" }
+      { key: "music_lm", label: "音频语义码 LM（1.7b/4b）" },
+      { key: "music_vae", label: "音频 VAE" }
     ],
     tts: [
       { key: "tts_model", label: "TTS 主模型" },
-      { key: "tts_codec", label: "音频编解码器" },
-      { key: "tts_tokenizer", label: "分词器 tokenizer.json" },
-      { key: "tts_config", label: "TTS config.json" },
-      { key: "tts_codec_config", label: "编解码器 config.json" }
+      { key: "tts_codec", label: "音频编解码器" }
     ]
   };
   // 采样步数：每组一个数字输入，图像链（qwen image 2.1）默认 25 步，视频链
@@ -801,7 +804,16 @@
   // LoRA 选择：ACE-Step / Breeze 的权重是整套加载的，引擎也还没有它们的
   // LoRA 合并路径，所以它们没有 LoRA 列表元素，渲染循环靠 if (loraList) 跳过。
   var MEDIA_LORA_CHAINS = ["image", "video"];
+  // LoRA 强度（settings.json → tools.media.<chain>_lora_strengths，与 <chain>_loras
+  // 逐项对应）。语义照搬 ComfyUI 的 LoraLoader：默认 1.0（按文件训练时的尺度），
+  // 范围 -100..100、步长 0.01；>1 放大、0..1 减弱、负值反向，恰好 0 表示该文件
+  // 不参与这条链（服务端直接把该槽位丢掉，不读文件）。每次生成都会重读，所以
+  // 保存后下一次生成就生效。
+  var MEDIA_LORA_STRENGTH = { def: 1.0, min: -100, max: 100, step: 0.01 };
   var MEDIA_CHAINS = ["image", "video", "music", "tts"];
+  // API 配置 → 多模态：模型能收到什么。键与服务端 webui-configs.json 的 vision
+  // 字段一致；值只用于配置卡片上的标签，下拉的选项文案在 index.html 里。
+  var VISION_LABELS = { none: "无多模态", image: "图片", image_video: "图片和视频" };
 
   var HOTKEY_META = [
     { id: "input.send", label: "发送消息", def: "Enter" },
@@ -1247,6 +1259,8 @@
     /** Populate the language + subagent fields of the edit form from a profile. */
     fillProfileExtras(profile) {
       this.el("config-lang").value = profile?.systemPromptLanguage ?? this.defaultLanguage();
+      // 多模态档位：老配置没有这个字段，按默认「图片」回填（与服务端的读取规则一致）
+      this.el("config-vision").value = profile?.vision ?? "image";
       const subagent = profile?.subagent;
       this.el("subagent-baseurl").value = subagent?.baseUrl ?? "";
       this.el("subagent-apiformat").value = subagent?.apiFormat ?? "anthropic-messages";
@@ -1377,6 +1391,8 @@
       if (profile.systemPromptLanguage) {
         meta.appendChild(el("span", "skill-tag", profile.systemPromptLanguage === "en" ? "EN" : "中文"));
       }
+      // 多模态档位也贴在卡片上：读不了图片的配置值得一眼看出来
+      meta.appendChild(el("span", "skill-tag", VISION_LABELS[profile.vision] ?? VISION_LABELS.image));
       card.appendChild(meta);
       if (profile.baseUrl) {
         const urlLine = el("div", "config-profile-key");
@@ -1445,6 +1461,7 @@
       this.el("config-key").value = "";
       this.el("config-key").placeholder = t("api_key_placeholder");
       this.el("config-key-hint").hidden = true;
+      this.el("config-vision").value = "image";
       this.el("subagent-baseurl").value = "";
       this.el("subagent-apiformat").value = "anthropic-messages";
       this.el("subagent-key").value = "";
@@ -1524,7 +1541,9 @@
           apiFormat: this.el("subagent-apiformat").value,
           apiKey: this.el("subagent-key").value.trim()
         },
-        systemPromptLanguage
+        systemPromptLanguage,
+        // 多模态档位（无多模态 / 图片 / 图片和视频），决定 read 与附件能送什么
+        vision: this.el("config-vision").value
       };
       const result = await this.api.saveConfig(draft);
       if (result) {
@@ -1718,6 +1737,17 @@
         }
         delete media.loras;
       }
+      // 强度列表与文件列表等长：旧版没有强度这一项，缺的槽位补默认值 1.0
+      // （也就是那些文件此前一直用的尺度）。补齐写成显式值，用户一眼能看到
+      // 每个槽位当前的实际强度，而不是靠「空 = 1.0」这种隐含约定。
+      for (const chain of MEDIA_LORA_CHAINS) {
+        const key = chain + "_loras";
+        const strengthKey = chain + "_lora_strengths";
+        if (!Array.isArray(media[strengthKey])) media[strengthKey] = [];
+        while (media[strengthKey].length < 2) media[strengthKey].push(MEDIA_LORA_STRENGTH.def);
+        media[strengthKey] = media[strengthKey].slice(0, 2);
+        if (!Array.isArray(media[key])) media[key] = [];
+      }
       const models = this.mediaModels;
       const files = (models && models.files) || [];
       for (const chain of MEDIA_CHAINS) {
@@ -1751,14 +1781,16 @@
         if (loraList) {
           clear(loraList);
           const key = chain + "_loras";
+          const strengthKey = chain + "_lora_strengths";
           if (!Array.isArray(media[key])) media[key] = [];
+          if (!Array.isArray(media[strengthKey])) media[strengthKey] = [];
           for (let i = 0; i < 2; i++) {
-            loraList.appendChild(this.mediaLoraRow(media, key, i, files));
+            loraList.appendChild(this.mediaLoraRow(media, key, strengthKey, i, files));
           }
         }
       }
     }
-    // 一个角色下拉：选项来自 models/ 的文件列表，默认空。
+    // 一个角色下拉：选项来自 models/ 的文件列表，默认空（空 = 用该角色的内置默认）。
     mediaRoleRow(media, role, files) {
       const row = el("div", "tool-row");
       const main = el("div", "switch-row-main");
@@ -1821,8 +1853,12 @@
       row.appendChild(select);
       return row;
     }
-    // 一个 LoRA 下拉：每链 2 个槽位（key = image_loras / video_loras）。
-    mediaLoraRow(media, key, i, files) {
+    // 一个 LoRA 槽位：文件下拉 + 强度输入（key = image_loras / video_loras，
+    // 强度在 image_lora_strengths / video_lora_strengths 的同一下标）。
+    // 强度语义照搬 ComfyUI 的 LoraLoader（默认 1.0，-100..100）：>1 放大、
+    // 0..1 减弱、负值反向、恰好 0 表示不使用该文件。它和文件一起构成一个槽位，
+    // 所以清空文件时强度保留（下次选回同一个文件还是原来的强度）。
+    mediaLoraRow(media, key, strengthKey, i, files) {
       const row = el("div", "tool-row");
       const main = el("div", "switch-row-main");
       main.appendChild(
@@ -1835,7 +1871,57 @@
         media[key] = media[key].slice(0, 2);
       });
       row.appendChild(select);
+      row.appendChild(this.mediaStrengthInput(media, strengthKey, i));
       return row;
+    }
+    // 一个强度输入：定宽数字框，默认 1.0，步长 0.01。非法输入回落到默认值，
+    // 越界夹到 -100..100（与服务端的读取规则一致）。
+    //
+    // 只有 change（失焦 / 回车）才规范化并回写输入框的文本；input（每次按键）只把
+    // 「这次输入已经是一个完整数字」的值记进 media 草稿，绝不重写 box.value。
+    // 原因：type=number 在半截输入时（"0" → "0." → "0.8"）box.value 会短暂变成
+    // 空串。若在 input 里提交，空串就会被当成非法输入折回默认值 1 并重排文本，
+    // 用户接着敲下的 "8" 于是落到 "0" 前面，0.8 就变成了 80。采样步数那个框没有
+    // 这个问题，因为它本来就只在 change 里提交。
+    mediaStrengthInput(media, strengthKey, i) {
+      const meta = MEDIA_LORA_STRENGTH;
+      const box = el("input", "inline-number lora-strength");
+      box.type = "number";
+      box.min = String(meta.min);
+      box.max = String(meta.max);
+      box.step = String(meta.step);
+      box.title = "LoRA 强度：默认 1.0，可负值；0 表示不使用该文件";
+      const stored = Number(media[strengthKey][i]);
+      const value = Number.isFinite(stored) && stored >= meta.min && stored <= meta.max
+        ? stored
+        : meta.def;
+      box.value = String(value);
+      // type=number 的 valueAsNumber 只在文本构成合法数字时才有值：半截的 ""、
+      // "-"、"0." 都是 NaN，正好用来区分「还没敲完」和「敲完了」。
+      const parse = () => (Number.isNaN(box.valueAsNumber) ? null : box.valueAsNumber);
+      const normalize = (raw) => {
+        let v = raw;
+        if (!Number.isFinite(v)) v = meta.def;
+        if (v < meta.min) v = meta.min;
+        if (v > meta.max) v = meta.max;
+        // 保留两位小数：步长是 0.01，显示成 0.6000000000000001 没有意义。
+        return Math.round(v * 100) / 100;
+      };
+      const track = () => {
+        const v = parse();
+        // 还没敲完的数字先不进草稿，等用户把数字敲完整。
+        if (v === null) return;
+        media[strengthKey][i] = normalize(v);
+      };
+      const commit = () => {
+        const parsed = parse();
+        const v = normalize(parsed === null ? meta.def : parsed);
+        box.value = String(v);
+        media[strengthKey][i] = v;
+      };
+      box.addEventListener("input", track);
+      box.addEventListener("change", commit);
+      return box;
     }
     // 共享的下拉构造：空选项 + models/ 的每个文件（含后缀）。
     mediaFileSelect(value, files, emptyLabel) {
@@ -3169,6 +3255,7 @@
             return;
           }
           if (this.settingsPanel.isOpen()) this.settingsPanel.close();
+          this.panels?.closeMenus();
           this.palette.close();
           this.hideSuggestions();
           this.hideCommandMenu();
@@ -3389,12 +3476,25 @@
       this.$.composerRow.classList.toggle("running", snapshot.phase !== "idle" || snapshot.isStreaming);
       this.$.cwdText.textContent = snapshot.cwd;
       this.$.cwd.title = t("cwd_title", snapshot.cwd);
-      let totalTokens = 0;
+      // Occupancy: what the NEXT request would cost, against the model's
+      // window. This used to sum every message's reported usage, which counts
+      // the shared history once per turn and therefore grows without bound no
+      // matter how much room is actually left. The host prices the real
+      // request (system prompt + tool schemas + the transformed history) and
+      // sends it as contextTokens; the summed figure remains only as a fallback
+      // for sessions restored from an older host.
+      let billedTokens = 0;
       for (const message of snapshot.messages) {
         if (message.usage) {
-          totalTokens += message.usage.totalTokens;
+          billedTokens += message.usage.totalTokens;
         }
       }
+      const totalTokens = Number(snapshot.contextTokens ?? 0) || billedTokens;
+      const contextWindow = Number(snapshot.contextWindow ?? 0);
+      const hasWindow = contextWindow > 0;
+      const occupancyText = hasWindow
+        ? t("status_tokens", formatTokens(totalTokens), formatTokens(contextWindow))
+        : `${formatTokens(totalTokens)} token`;
       const statusModel = snapshot.modelName ?? (snapshot.model && snapshot.model.provider !== "unknown" && snapshot.model.id !== "unknown" ? `${snapshot.model.provider}/${snapshot.model.id}` : t("no_model"));
       this.$.statusModel.textContent = statusModel;
       const levelIndex = ["off", "low", "medium", "high", "xhigh", "max"].indexOf(snapshot.thinkingLevel);
@@ -3405,7 +3505,10 @@
       this.$.statusPhase.dataset.phase = snapshot.phase;
       this.$.statusTokens.hidden = totalTokens === 0 || !Prefs.data.statusTokens;
       this.$.statusTokensSep.hidden = totalTokens === 0 || !Prefs.data.statusTokens;
-      this.$.statusTokens.textContent = `${formatTokens(totalTokens)} token`;
+      this.$.statusTokens.textContent = occupancyText;
+      this.$.statusTokens.title = hasWindow
+        ? t("status_tokens_title", Math.round(Math.min(100, totalTokens / contextWindow * 100)))
+        : "";
       this.panels.setSession(snapshot.thinkingLevel);
       this.panels.setConfig(snapshot.activeConfig || this.state.configs?.active || "", this.state.configs?.profiles || []);
       this.panels.setSessions(this.state.sessions, snapshot.id);

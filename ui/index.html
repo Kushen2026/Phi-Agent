@@ -149,7 +149,7 @@
 									</label>
 									<label class="config-field">
 										<span>请求地址</span>
-										<input id="config-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="https://api.deepseek.com/anthropic" required />
+										<input id="config-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="请求地址" required />
 									</label>
 									<label class="config-field">
 										<span>API 格式</span>
@@ -187,11 +187,20 @@
 											<option value="en">English</option>
 										</select>
 									</label>
+									<label class="config-field">
+										<span>多模态</span>
+										<select id="config-vision">
+											<option value="none">无多模态</option>
+											<option value="image">图片</option>
+											<option value="image_video">图片和视频</option>
+										</select>
+										<small class="config-key-hint">「无多模态」的模型只能读文本，read 不会读取图片和视频；「图片和视频」可直接读取整段 mp4。</small>
+									</label>
 
 									<div class="config-section-title">子代理模型（可选）</div>
 									<label class="config-field">
 										<span>子代理请求地址</span>
-										<input id="subagent-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="https://apihub.agnes-ai.com/v1" />
+										<input id="subagent-baseurl" type="url" autocomplete="off" spellcheck="false" placeholder="请求地址" />
 									</label>
 									<label class="config-field">
 										<span>子代理 API 格式</span>
@@ -263,7 +272,7 @@
 
 								<div class="settings-group">
 									<div class="settings-group-title">图像生成模型（qwen image 2.1）</div>
-									<p class="settings-group-desc">image_generate 使用的模型（safetensors，精度自适应）。选项是 <code>models/</code> 目录里的所有文件（含后缀），实时读取；留空表示不指定。LoRA 最多 2 个，按顺序应用（后一个叠加在前一个之上）。采样步数默认 25 步，采样器/调度器默认 euler + simple（与 released workflow 一致）。</p>
+									<p class="settings-group-desc">image_generate 使用的模型（safetensors，精度自适应）。选项是 <code>models/</code> 目录里的所有文件（含后缀），实时读取；留空表示不指定。LoRA 最多 2 个，按顺序应用（后一个叠加在前一个之上）；每个 LoRA 后面是它的强度，默认 1.0，>1 放大、0..1 减弱、负值反向、0 表示不使用该文件。采样步数默认 25 步，采样器/调度器默认 euler + simple（与 released workflow 一致）</p>
 									<div class="tool-rows" id="media-image-models-list"></div>
 									<div class="tool-rows" id="media-image-steps-list"></div>
 									<div class="tool-rows" id="media-image-sampler-list"></div>
@@ -273,7 +282,7 @@
 
 								<div class="settings-group">
 									<div class="settings-group-title">视频生成模型（minimax h3）</div>
-									<p class="settings-group-desc">video_generate 使用的模型（safetensors，精度自适应）。选项同样来自 <code>models/</code> 目录。图像与视频的模型、LoRA 各自独立，互不混用。LoRA 最多 2 个，按顺序应用。采样步数默认 20 步，采样器/调度器默认 res_multistep + beta（H3 联合音视频）。</p>
+									<p class="settings-group-desc">video_generate 使用的模型（safetensors，精度自适应）。选项同样来自 <code>models/</code> 目录。图像与视频的模型、LoRA 各自独立，互不混用。LoRA 最多 2 个，按顺序应用；每个 LoRA 后面是它的强度，默认 1.0，可负值，0 表示不使用该文件。采样步数默认 20 步，采样器/调度器默认 res_multistep + beta（H3 联合音视频）</p>
 									<div class="tool-rows" id="media-video-models-list"></div>
 									<div class="tool-rows" id="media-video-steps-list"></div>
 									<div class="tool-rows" id="media-video-sampler-list"></div>
@@ -283,7 +292,7 @@
 
 								<div class="settings-group">
 									<div class="settings-group-title">音乐生成模型（ace-step 1.5）</div>
-									<p class="settings-group-desc">music_generate 使用的模型：DiT、文本/语义码 tower、音频 VAE，各自选择。选项同样是 <code>models/</code> 目录里的所有文件。采样步数默认 50 步（与 ACE-Step-音乐生成.json 一致），采样器/调度器默认 euler + simple。</p>
+									<p class="settings-group-desc">music_generate 使用的模型：DiT、文本/语义码 tower、音频 VAE，各自选择。选项同样是 <code>models/</code> 目录里的所有文件。采样步数默认 50 步（与 ACE-Step-音乐生成.json 一致），采样器/调度器默认 euler + simple</p>
 									<div class="tool-rows" id="media-music-models-list"></div>
 									<div class="tool-rows" id="media-music-steps-list"></div>
 									<div class="tool-rows" id="media-music-sampler-list"></div>
@@ -292,7 +301,7 @@
 
 								<div class="settings-group">
 									<div class="settings-group-title">语音合成模型（breeze tts 2）</div>
-									<p class="settings-group-desc">tts_speak 使用的模型：主检查点、音频编解码器、分词器 tokenizer.json，以及主模型与编解码器的 config.json（留空则读取权重旁边的 config.json）。只做「音色描述 → 语音」，不含声音克隆。</p>
+									<p class="settings-group-desc">tts_speak 使用的模型：主检查点与音频编解码器（各自的 config.json 自动读取权重旁边的那一份）。只做「音色描述 → 语音」，不含声音克隆。</p>
 									<div class="tool-rows" id="media-tts-models-list"></div>
 								</div>
 

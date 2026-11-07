@@ -37,7 +37,7 @@
 	--shadow-pop: 0 8px 32px rgba(0, 0, 0, 0.55);
 	--focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--cyan);
 
-	--topbar-h: 52px;
+	--topbar-h: 60px;
 	--composer-w: 1200px;
 }
 
@@ -125,24 +125,26 @@ a:focus-visible {
 }
 
 .logo {
-	width: 28px;
-	height: 28px;
+	/* 左上角是一块识别区：logo、会话名、工作目录三层，放大后层次才立得住 */
+	width: 36px;
+	height: 36px;
 	flex: none;
 }
 
 .brand-meta {
 	display: flex;
 	flex-direction: column;
+	gap: 2px;
 	min-width: 0;
-	line-height: 1.2;
+	line-height: 1.25;
 }
 
 .session-name {
 	font-family: var(--font-ui);
-	font-size: 13px;
+	font-size: 16px;
 	font-weight: 600;
 	color: var(--text);
-	max-width: 320px;
+	max-width: 420px;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -165,17 +167,22 @@ a:focus-visible {
 .cwd {
 	display: inline-flex;
 	align-items: center;
-	gap: 6px;
-	max-width: 380px;
+	gap: 7px;
+	max-width: 460px;
 	font-family: var(--font-ui);
-	font-size: 11px;
-	color: var(--text-faint);
+	/* 这一行是「当前在哪工作」的唯一指示，也是可点的目标：字号与内边距都要够大，
+	   否则夹在 16px 会话名下面像一行灰掉的注释，看不出是个按钮。 */
+	font-size: 15px;
+	line-height: 1.2;
+	color: var(--text-dim);
 	background: transparent;
 	border: 1px solid transparent;
 	border-radius: 6px;
-	padding: 2px 6px;
+	padding: 4px 8px;
+	margin-left: -8px;
 	cursor: pointer;
 	white-space: nowrap;
+	transition: background 150ms, color 150ms, border-color 150ms;
 }
 
 .cwd:hover {
@@ -186,8 +193,9 @@ a:focus-visible {
 
 .cwd .icon {
 	flex: none;
-	width: 13px;
-	height: 13px;
+	width: 18px;
+	height: 18px;
+	opacity: 0.85;
 }
 
 .cwd #cwd-text {
@@ -3552,6 +3560,13 @@ body[data-density="compact"] .msg-subagentSummary .msg-body {
 
 .inline-number:focus {
 	border-color: var(--accent);
+}
+
+/* LoRA 强度：和采样步数同一个数字框，但窄一些（它是一个 0.01 步长的系数），
+   并且紧跟在同行的 LoRA 下拉右边，顺序读起来就是「文件 → 强度」。 */
+.inline-number.lora-strength {
+	width: 72px;
+	font-variant-numeric: tabular-nums;
 }
 
 .inline-btn {
